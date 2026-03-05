@@ -13,6 +13,7 @@ import {
   loadWallet,
   getWalletAddress,
 } from "./wallet.js";
+import { getCurrentPrice } from "./price.js";
 import { createMcpServer } from "./server.js";
 import { sellBase, sellBaseForQuoteAmount, buyBase, buyBaseWithQuoteAmount } from "./swap.js";
 import { prompt, promptPassword } from "./cli.js";
@@ -175,9 +176,17 @@ async function walletView(flags: Record<string, string>) {
     transport: http(rpcUrl),
   });
 
+  const logger = createLogger();
+  let totalUsd = 0;
+
   const ethBalance = await publicClient.getBalance({ address });
+  const ethAmount = Number(formatEther(ethBalance));
+  const ethPrice = await getCurrentPrice(chainConfig.weth, logger).catch(() => null);
+  const ethUsd = ethPrice != null ? ethAmount * ethPrice : null;
+  if (ethUsd != null) totalUsd += ethUsd;
+
   console.log(`Chain:   ${chainName}`);
-  console.log(`ETH:     ${formatEther(ethBalance)}`);
+  console.log(`ETH:     ${formatEther(ethBalance)}${ethUsd != null ? ` ($${ethUsd.toFixed(2)})` : ""}`);
 
   // Base token balance
   const baseArg = flags["base"] ?? userChainOverride?.base ?? "ETH";
@@ -189,7 +198,11 @@ async function walletView(flags: Record<string, string>) {
       publicClient.readContract({ address: baseToken, abi: ERC20_ABI, functionName: "symbol" }),
       publicClient.readContract({ address: baseToken, abi: ERC20_ABI, functionName: "decimals" }),
     ]);
-    console.log(`${baseSym}:  ${formatUnits(baseBal as bigint, baseDec as number)}`);
+    const baseAmount = Number(formatUnits(baseBal as bigint, baseDec as number));
+    const basePrice = await getCurrentPrice(baseToken, logger).catch(() => null);
+    const baseUsd = basePrice != null ? baseAmount * basePrice : null;
+    if (baseUsd != null) totalUsd += baseUsd;
+    console.log(`${baseSym}:  ${formatUnits(baseBal as bigint, baseDec as number)}${baseUsd != null ? ` ($${baseUsd.toFixed(2)})` : ""}`);
   }
 
   // Quote token balance
@@ -199,7 +212,14 @@ async function walletView(flags: Record<string, string>) {
     publicClient.readContract({ address: quoteToken, abi: ERC20_ABI, functionName: "symbol" }),
     publicClient.readContract({ address: quoteToken, abi: ERC20_ABI, functionName: "decimals" }),
   ]);
-  console.log(`${quoteSym}:  ${formatUnits(quoteBal as bigint, quoteDec as number)}`);
+  const quoteAmount = Number(formatUnits(quoteBal as bigint, quoteDec as number));
+  const quotePrice = await getCurrentPrice(quoteToken, logger).catch(() => null);
+  const quoteUsd = quotePrice != null ? quoteAmount * quotePrice : null;
+  if (quoteUsd != null) totalUsd += quoteUsd;
+  console.log(`${quoteSym}:  ${formatUnits(quoteBal as bigint, quoteDec as number)}${quoteUsd != null ? ` ($${quoteUsd.toFixed(2)})` : ""}`);
+
+  console.log(`Total:   $${totalUsd.toFixed(2)}`);
+  logger.close();
 }
 
 // ── trade commands ───────────────────────────────────────────
