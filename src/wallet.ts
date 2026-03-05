@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { create, decrypt } from "web3-eth-accounts";
+import { create, decrypt, privateKeyToAccount as web3PrivateKeyToAccount } from "web3-eth-accounts";
 import {
   createPublicClient,
   createWalletClient,
@@ -44,15 +44,8 @@ export async function importWallet(
 ): Promise<Address> {
   mkdirSync(DATA_DIR, { recursive: true });
   const account = privateKeyToAccount(privateKey as `0x${string}`);
-  // web3-eth-accounts create() returns an object with encrypt(); we need to build one from the key
-  const tempAccount = create();
-  // Overwrite with the imported key by creating a proper account object
-  const importedAccount = {
-    ...tempAccount,
-    address: account.address,
-    privateKey: privateKey,
-  };
-  const keystore = await importedAccount.encrypt(pass);
+  const web3Account = web3PrivateKeyToAccount(privateKey);
+  const keystore = await web3Account.encrypt(pass);
   writeFileSync(WALLET_PATH, JSON.stringify(keystore, null, 2));
   logger.info("Wallet saved to " + WALLET_PATH);
   return account.address;
