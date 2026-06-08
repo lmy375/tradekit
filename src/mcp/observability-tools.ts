@@ -1,0 +1,443 @@
+// MCP observability tools: status (right-now dashboard), digest
+// (windowed activity report), order_replay (forensic decision
+// timeline), backtest_list / backtest_show (historical backtest
+// retrieval).
+//
+// These compose the iter23 / iter24 / iter25 read-only surfaces into
+// an agent-callable interface. Zero RPC, sub-100ms responses.
+
+import { z } from "zod";
+import { toToolError, ToolError } from "../errors.js";
+import { ok, fail, runTool, type RegisterFn } from "./runtime.js";
+import {
+  gatherStatusReport,
+  ALL_SECTIONS,
+  type SectionName,
+} from "../status.js";
+import {
+  gatherDigest,
+  parseWindowMs,
+} from "../digest.js";
+import {
+  replayOrder,
+} from "../orderJournal.js";
+import {
+  getOrderById,
+  listBacktestRuns,
+  getBacktestRunById,
+  listBacktestComparisons,
+  getBacktestComparisonById,
+} from "../db.js";
+
+// ── tool registration ────────────────────────────────────────
+
+export const registerObservabilityTools: RegisterFn = (server, rt) => {
+  // ── status_dashboard ───────────────────────────────────────
+  server.tool(
+    "status_dashboard",
+    "Operational status across engine workers + active orders / schedules / rebalance plans + playbooks + drawdown breaker + strategy budgets + 24h audit. Composes ~10 read-side queries into one situational-awareness view. Different from the `status` admin tool (which is process-status only) — this is the iter23 multi-section dashboard. Optional section filter: pass `sections` to limit (e.g. [\"orders\",\"drawdown\"]). Sub-100ms, zero RPC.",
+    {
+      sections: z
+        .array(z.enum(["engine", "orders", "schedules", "rebalance", "playbooks", "drawdown", "budgets", "activity"]))
+        .optional()
+        .describe("Section filter; default = all 8 sections."),
+    },
+    async ({ sections }) => {
+      try {
+        return ok(
+          await runTool("status_dashboard", rt.opts, { sections }, undefined, async () => {
+            const report = gatherStatusReport({
+              sections: sections as SectionName[] | undefined,
+            });
+            return { ok: true, report, sections: sections ?? ALL_SECTIONS };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── digest_summary ─────────────────────────────────────────
+  server.tool(
+    "digest_summary",
+    "Windowed activity digest: trades + strategy fires + safety events + top errors over the last N hours/days. Computes a 3-tier health verdict (healthy/attention/critical) with cumulative reasons. Optional `compare` adds prior-window deltas (trades, USD volume, fills, errors). Window range [1min, 90d]. Pairs with status_dashboard (right-now vs windowed). Errors: INVALID_PARAMS (bad window format).",
+    {
+      window: z.string().default("24h").describe("Window — '1h', '24h', '7d', '30d' (m/h/d units; min 1 minute, max 90 days)."),
+      compare: z.boolean().optional().describe("Include immediately-prior window of same length with delta math; default false."),
+    },
+    async ({ window, compare }) => {
+      try {
+        return ok(
+          await runTool("digest_summary", rt.opts, { window, compare }, undefined, async () => {
+            const windowMs = parseWindowMs(window);
+            const report = gatherDigest({
+              windowLabel: window,
+              windowMs,
+              compare: compare ?? false,
+            });
+            return { ok: true, report };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── order_replay ───────────────────────────────────────────
+  server.tool(
+    "order_replay",
+    "Forensic decision timeline for an order — every state-changing engine tick (activation, HWM advances, proximity crossings, fires, errors). Requires `engine.orderJournal.enabled=true` (default off). Answers \"why did this trail fire HERE and not earlier?\" from the persistent journal. Errors: INVALID_PARAMS (id not found).",
+    {
+      id: z.number().int().positive().describe("Order id."),
+      limit: z.number().int().min(1).max(10_000).optional().describe("Max entries; default unlimited."),
+    },
+    async ({ id, limit }) => {
+      try {
+        return ok(
+          await runTool("order_replay", rt.opts, { id, limit }, undefined, async () => {
+            const order = getOrderById(id);
+            if (!order) throw new ToolError("INVALID_PARAMS", `Order #${id} not found.`);
+            const { loadConfig } = await import("../config.js");
+            const config = loadConfig();
+            const timeline = replayOrder(id, limit);
+            return {
+              ok: true,
+              orderId: id,
+              order: {
+                id: order.id, status: order.status, side: order.side,
+                trigger: order.trigger_type, targetPriceUsd: order.target_price_usd,
+                trailPct: order.trail_pct, waterMarkUsd: order.water_mark_usd,
+                chain: order.chain, account: order.account,
+                base: order.base_symbol, quote: order.quote_symbol,
+                baseAmount: order.base_amount, quoteAmount: order.quote_amount,
+                createdAt: order.created_at, filledAt: order.filled_at,
+              },
+              journalEnabled: config.engine.orderJournal.enabled,
+              totalEntries: timeline.totalEntries,
+              entries: timeline.entries,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── backtest_list ──────────────────────────────────────────
+  server.tool(
+    "backtest_list",
+    "Recent backtest runs (newest first). Each row has spec, balance, fire timeline, PnL, vs-hold counterfactual. Use to find prior runs to re-render via `backtest_show` without re-fetching CoinGecko data.",
+    {
+      strategy_type: z.enum(["order", "schedule", "playbook"]).optional().describe("Filter by strategy type."),
+      chain: z.string().optional().describe("Filter by chain."),
+      limit: z.number().int().min(1).max(1000).optional().describe("Max rows; default 50."),
+    },
+    async ({ strategy_type, chain, limit }) => {
+      try {
+        return ok(
+          await runTool("backtest_list", rt.opts, { strategy_type, chain, limit }, chain, async () => {
+            const rows = listBacktestRuns({
+              strategyType: strategy_type,
+              chain,
+              limit: limit ?? 50,
+            });
+            return { ok: true, runs: rows };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── backtest_show ──────────────────────────────────────────
+  server.tool(
+    "backtest_show",
+    "Full detail for a backtest run by id. Returns the persisted spec, balances, fire timeline, PnL, and vs-hold counterfactual without re-running the simulation. Errors: INVALID_PARAMS (id not found).",
+    {
+      id: z.number().int().positive().describe("Backtest run id from backtest_list."),
+    },
+    async ({ id }) => {
+      try {
+        return ok(
+          await runTool("backtest_show", rt.opts, { id }, undefined, async () => {
+            const row = getBacktestRunById(id);
+            if (!row) throw new ToolError("INVALID_PARAMS", `No backtest run with id ${id}.`);
+            return {
+              ok: true,
+              run: {
+                ...row,
+                spec: JSON.parse(row.spec_json),
+                initial_balance: JSON.parse(row.initial_balance_json),
+                final_balance: JSON.parse(row.final_balance_json),
+                fires: JSON.parse(row.fires_json),
+              },
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── backtest_compare_list ──────────────────────────────────
+  server.tool(
+    "backtest_compare_list",
+    "Recent backtest comparison runs (multi-scenario parameter sweeps). Each row groups N backtest_runs by a comparison name with a winner index.",
+    {
+      chain: z.string().optional().describe("Filter by chain."),
+      limit: z.number().int().min(1).max(1000).optional().describe("Max rows; default 50."),
+    },
+    async ({ chain, limit }) => {
+      try {
+        return ok(
+          await runTool("backtest_compare_list", rt.opts, { chain, limit }, chain, async () => {
+            const rows = listBacktestComparisons({
+              chain,
+              limit: limit ?? 50,
+            });
+            return { ok: true, comparisons: rows };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── backtest_compare_show ──────────────────────────────────
+  server.tool(
+    "backtest_compare_show",
+    "Full detail for a backtest comparison by id — per-scenario results + winner index + linked run ids for individual scenario inspection via backtest_show. Errors: INVALID_PARAMS (id not found).",
+    {
+      id: z.number().int().positive().describe("Comparison id."),
+    },
+    async ({ id }) => {
+      try {
+        return ok(
+          await runTool("backtest_compare_show", rt.opts, { id }, undefined, async () => {
+            const row = getBacktestComparisonById(id);
+            if (!row) throw new ToolError("INVALID_PARAMS", `No comparison with id ${id}.`);
+            return {
+              ok: true,
+              comparison: {
+                ...row,
+                scenarios_spec: JSON.parse(row.scenarios_json),
+                results: JSON.parse(row.results_json),
+              },
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── timeline_query (iter36) ─────────────────────────────────
+  //
+  // Unified chronological event view across trades / paper /
+  // audit / order journal / strategy alerts. Pre-iter36 an agent
+  // investigating an incident had to make 6+ separate MCP calls
+  // (recent_trades, audit, order_replay-per-order, etc.) + merge
+  // by timestamp client-side. This tool collapses that into one
+  // call returning the same typed TimelineEvent[] the CLI uses.
+  server.tool(
+    "timeline_query",
+    "Forensic timeline: merged chronological events from trades, paper_trades, audit_log, order_check_log, strategy_alert_state. Newest-first. Use for incident investigation ('what happened between 13:55 and 14:05?'). Filters: chain/account/strategy narrow the cross-source scope; kinds[] restricts to specific event types; minSeverity floors to warn or critical; --no-paper (i.e. includePaper=false) hides paper.fill events. Default window: last 4h. Default limit: 100. ZERO RPC, sub-100ms. Errors: INVALID_PARAMS (bad kind name, bad ISO timestamp).",
+    {
+      since: z
+        .string()
+        .optional()
+        .describe("Lower bound for the window. Accepts a duration shorthand (4h, 30m, 2d, 1w) or ISO-8601 timestamp. Default: 4 hours before now."),
+      until: z
+        .string()
+        .optional()
+        .describe("Upper bound — ISO-8601 timestamp. Default: now."),
+      chain: z.string().optional().describe("Restrict to one chain."),
+      account: z.string().optional().describe("Restrict to one account label."),
+      strategy: z.string().optional().describe("Restrict to one strategy tag."),
+      kinds: z
+        .array(
+          z.enum([
+            "trade.fill", "trade.failure", "trade.pending",
+            "paper.fill",
+            "order.journal", "order.edited",
+            "audit.tool", "audit.error",
+            "alert.fired", "alert.resolved",
+          ]),
+        )
+        .optional()
+        .describe("Subset of event kinds. Omit for all kinds."),
+      minSeverity: z
+        .enum(["info", "warn", "critical"])
+        .optional()
+        .describe("Severity floor; events below are dropped."),
+      includePaper: z
+        .boolean()
+        .default(true)
+        .describe("Include paper.fill events. Pass false for a 'real trades only' forensic view."),
+      limit: z.number().int().min(1).max(5000).default(100).describe("Cap on returned events. Applied after global merge + sort."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("timeline_query", rt.opts, input, input.chain, async () => {
+            const { collectTimeline, parseSinceDuration } = await import("../timeline.js");
+            let sinceIso: string | undefined;
+            if (input.since) {
+              const parsed = parseSinceDuration(input.since);
+              if (!parsed) {
+                throw new ToolError(
+                  "INVALID_PARAMS",
+                  `'since' must be a duration (4h, 30m, 2d) or ISO-8601 timestamp; got "${input.since}".`,
+                );
+              }
+              sinceIso = parsed;
+            }
+            let untilIso: string | undefined;
+            if (input.until) {
+              const t = Date.parse(input.until);
+              if (!Number.isFinite(t)) {
+                throw new ToolError("INVALID_PARAMS", `'until' must be a valid ISO-8601 timestamp; got "${input.until}".`);
+              }
+              untilIso = new Date(t).toISOString();
+            }
+            const events = collectTimeline({
+              sinceIso,
+              untilIso,
+              chain: input.chain,
+              account: input.account,
+              strategy: input.strategy,
+              kinds: input.kinds,
+              minSeverity: input.minSeverity,
+              includePaper: input.includePaper,
+              limit: input.limit,
+            });
+            return {
+              count: events.length,
+              since: sinceIso ?? null,
+              until: untilIso ?? null,
+              events,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── engine_events (iter39) ──────────────────────────────────
+  //
+  // Read-only forensic view of the v26 engine_events table.
+  // Durable engine lifecycle (started/stopped) + worker
+  // resilience (degraded/recovered) + config reload events.
+  // Survives process restart (vs notifications). Agents
+  // investigating "what happened to my engine yesterday?" call
+  // this once instead of grepping rotated Slack logs.
+  server.tool(
+    "engine_events",
+    "Forensic engine state transitions: engine.started/stopped, engine.lock/unlock, worker.degraded/recovered, config.reloaded/config.reload_failed. Durable across process restarts (writes to v26 engine_events table alongside the iter28+ notification path). Filter by event_type[], minSeverity, worker_name, pid, time window. Use for incident investigation across runs. Errors: INVALID_PARAMS (bad event_type, bad ISO timestamp).",
+    {
+      since: z
+        .string()
+        .optional()
+        .describe("Lower bound — duration shorthand (4h, 1d, 7d) or ISO timestamp. Default: 24h ago."),
+      until: z.string().optional().describe("Upper bound — ISO timestamp. Default: now."),
+      types: z
+        .array(
+          z.enum([
+            "engine.started", "engine.stopped",
+            "engine.lock", "engine.unlock",
+            "worker.degraded", "worker.recovered",
+            "config.reloaded", "config.reload_failed",
+          ]),
+        )
+        .optional()
+        .describe("Subset of event types."),
+      minSeverity: z.enum(["info", "warn", "critical"]).optional(),
+      workerName: z.string().optional().describe("Restrict to worker.* events for one worker."),
+      pid: z.number().int().optional().describe("Restrict to events from a specific process."),
+      limit: z.number().int().min(1).max(10_000).default(200),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("engine_events", rt.opts, input, undefined, async () => {
+            const { listEngineEvents } = await import("../db.js");
+            const { parseSinceDuration } = await import("../timeline.js");
+            let sinceIso: string | undefined;
+            if (input.since) {
+              const parsed = parseSinceDuration(input.since);
+              if (!parsed) {
+                throw new ToolError(
+                  "INVALID_PARAMS",
+                  `'since' must be a duration (4h, 30m, 2d) or ISO timestamp; got "${input.since}".`,
+                );
+              }
+              sinceIso = parsed;
+            } else {
+              sinceIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+            }
+            let untilIso: string | undefined;
+            if (input.until) {
+              const t = Date.parse(input.until);
+              if (!Number.isFinite(t)) {
+                throw new ToolError("INVALID_PARAMS", `'until' must be valid ISO-8601; got "${input.until}".`);
+              }
+              untilIso = new Date(t).toISOString();
+            }
+            let rows = listEngineEvents({
+              sinceIso,
+              untilIso,
+              minSeverity: input.minSeverity,
+              workerName: input.workerName,
+              pid: input.pid,
+              limit: Math.max(input.limit, input.types ? input.limit * 4 : input.limit),
+            });
+            if (input.types && input.types.length > 0) {
+              const set = new Set(input.types);
+              rows = rows.filter((r) => set.has(r.event_type as never));
+            }
+            return {
+              count: rows.length,
+              since: sinceIso,
+              until: untilIso ?? null,
+              events: rows,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── price_stats (iter38) ────────────────────────────────────
+  server.tool(
+    "price_stats",
+    "Per-provider price-fetch observability. Returns calls/successes/failures/last-error/timing-percentiles for each price provider (CoinGecko, DexScreener) touched since process start. In-memory only — resets on engine restart. Use for debugging 'why am I getting rate-limited?' or for periodic scrapes to a dashboard. Optional `reset: true` clears the in-memory counters.",
+    {
+      reset: z.boolean().default(false).describe("When true, clear all provider stats after returning the current snapshot. Useful for monitoring scripts that want delta-since-last-scrape semantics."),
+    },
+    async ({ reset }) => {
+      try {
+        return ok(
+          await runTool("price_stats", rt.opts, { reset }, undefined, async () => {
+            const { getProviderStats, resetProviderStats } = await import("../priceStats.js");
+            const snapshot = getProviderStats();
+            if (reset) resetProviderStats();
+            return { providers: snapshot };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+};

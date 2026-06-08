@@ -1,44 +1,30 @@
-import { base, mainnet, arbitrum } from "viem/chains";
-import type { ChainConfig } from "./types.js";
 import type { Address } from "viem";
 
-export const CHAIN_CONFIGS: Record<string, ChainConfig> = {
-  base: {
-    chainId: 8453,
-    rpc: "https://mainnet.base.org",
-    weth: "0x4200000000000000000000000000000000000006",
-    usdc: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    swapRouter02: "0x2626664c2603336E57B271c5C0b26F421741e481",
-    quoterV2: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
-    viemChain: base,
-  },
-  ethereum: {
-    chainId: 1,
-    rpc: "https://eth.llamarpc.com",
-    weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    usdc: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    swapRouter02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
-    quoterV2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-    viemChain: mainnet,
-  },
-  arbitrum: {
-    chainId: 42161,
-    rpc: "https://arb1.arbitrum.io/rpc",
-    weth: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
-    usdc: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
-    swapRouter02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
-    quoterV2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-    viemChain: arbitrum,
-  },
-};
-
-export const DATA_DIR = `${process.env.HOME}/.tradekit`;
+// TRADEKIT_DATA_DIR lets users (and tests) relocate the data directory. Useful for
+// multi-instance setups, sandbox-style testing, or users whose $HOME is shared.
+export const DATA_DIR = process.env.TRADEKIT_DATA_DIR || `${process.env.HOME}/.tradekit`;
 export const WALLET_PATH = `${DATA_DIR}/wallet.json`;
+export const MNEMONIC_PATH = `${DATA_DIR}/mnemonic.json`;
+export const ACCOUNTS_PATH = `${DATA_DIR}/accounts.json`;
 export const TRADE_CSV_PATH = `${DATA_DIR}/trade.csv`;
 export const SERVER_LOG_PATH = `${DATA_DIR}/server.log`;
 export const CONFIG_PATH = `${DATA_DIR}/config.json`;
+export const DB_PATH = `${DATA_DIR}/tradekit.db`;
+// Iter614: address book — named recipient aliases. Same 0600 mode as wallet.json
+// since malicious overwrite of this file can redirect transfers to attacker-
+// controlled addresses (clipboard-hijack equivalent at the file level).
+export const ADDRESS_BOOK_PATH = `${DATA_DIR}/address-book.json`;
 
 export const FEE_TIERS = [500, 3000, 10000] as const;
+
+/**
+ * Synthetic account label for the single-key keystore wallet. Used by `accounts list`
+ * (CLI / MCP) when no HD mnemonic exists, by trade.ts when recording rows from a
+ * keystore-only signer, by the audit-log attribution, and by holdings/pnl `--account`
+ * lookups (iter234/284). Centralized here as a constant so the string is one identifier
+ * across all surfaces, not 14 magic-string copies that can silently drift apart.
+ */
+export const KEYSTORE_LABEL = "keystore" as const;
 
 export const NATIVE_ETH: Address = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
@@ -217,6 +203,16 @@ export const ERC20_ABI = [
       { name: "account", type: "address" },
     ],
     outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    name: "transfer",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
   },
 ] as const;
 

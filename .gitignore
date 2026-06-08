@@ -1,2 +1,17 @@
 node_modules
 dist
+.env
+
+# TypeScript incremental compilation cache (per-tsconfig, regenerated on each build)
+*.tsbuildinfo
+
+# AI tooling local state — settings.local.json + scheduled tasks etc.
+# The iter589 invariant test's file walk already skips this dir; this just
+# keeps `git status` clean too.
+.claude/
+
+# Editor + refactor leftovers
+*.bak
+*.orig
+*~
+.DS_Store

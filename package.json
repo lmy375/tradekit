@@ -1,10 +1,40 @@
 {
   "name": "tradekit",
   "version": "1.1.1",
+  "description": "Production-grade CLI / MCP / Web framework for AI agents trading ERC-20 tokens on EVM DEXes — aggregator-first routing, multi-chain, structured errors with nextActions, safety guardrails, SQLite-backed PnL + audit log.",
+  "keywords": [
+    "ethereum",
+    "evm",
+    "dex",
+    "trading",
+    "swap",
+    "aggregator",
+    "mcp",
+    "ai-agent",
+    "kyberswap",
+    "openocean",
+    "1inch",
+    "0x",
+    "cli",
+    "base",
+    "arbitrum",
+    "optimism",
+    "polygon",
+    "bnb",
+    "defi",
+    "wallet"
+  ],
+  "author": "Moon <lmy375@139.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/lmy375/tradekit#readme",
+  "bugs": {
+    "url": "https://github.com/lmy375/tradekit/issues"
+  },
   "packageManager": "pnpm@10.12.1",
   "type": "module",
   "repository": {
-    "url": "https://github.com/lmy375/tradekit"
+    "type": "git",
+    "url": "git+https://github.com/lmy375/tradekit.git"
   },
   "bin": {
     "tradekit": "dist/index.js"
@@ -13,17 +43,29 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch"
+    "build": "tsc && pnpm -C webui install --prefer-offline && pnpm -C webui build",
+    "build:server": "tsc",
+    "build:webui": "pnpm -C webui build",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "engines": {
+    "node": ">=22.5.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^5.2.1",
     "viem": "^2.23.2",
     "web3-eth-accounts": "^4.3.1",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.13.9",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.7"
   }
 }
