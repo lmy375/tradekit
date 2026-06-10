@@ -231,6 +231,13 @@ function renderErrorsText(e: ErrorsSection): string {
  * double), backticks for code, and a code block for the section
  * details. Operators pipe the output directly into a webhook payload.
  */
+/** Exported for the v31 digest-push engine worker — one renderer,
+ *  identical output whether the digest is piped from cron or pushed
+ *  by the engine through the notify channels. */
+export function renderDigestMarkdown(r: DigestReport): string {
+  return renderSlack(r);
+}
+
 function renderSlack(r: DigestReport): string {
   const lines: string[] = [];
   const header = `${verdictEmoji(r.verdict)} *Tradekit digest* · ${r.windowLabel} · ${verdictLabel(r.verdict)}`;

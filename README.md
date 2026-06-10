@@ -318,6 +318,7 @@ tradekit engine status --json | jq  # for monitoring scripts
 | `schedules` | 60s | yes (unless dry-run) | Cron-driven DCA / recurring trades |
 | `reconcile` | 60s | **no** (read-only) | Pending-tx receipt sweep |
 | `rebalance` | 300s | yes (unless dry-run) | Portfolio drift correction (target-weight plans) |
+| `digest` | 300s | **no** (read-only) | v31: pushes the daily digest through the notify channels (no-op until `notifications.digest.enabled`) |
 
 **Process lock.** The supervisor takes a file-system advisory lock (`~/.tradekit/.lock.engine`) at boot. A second `engine run` invocation immediately fails with `WALLET_LOCKED` + the holder's pid + uptime. Stale-lock cleanup handles a previous crashed run. Pairs with the existing wallet/account locks so the engine plays nicely with one-shot `wallet create` / `account add` commands.
 
@@ -1717,6 +1718,7 @@ tradekit notify test --channel ops-slack
 | `schedule.fired` | info | Recurring schedule fired a trade successfully |
 | `schedule.on_fill_created` | info | Post-fill hook auto-created a follow-up order (iter27) |
 | `schedule.on_fill_failed` | warn | Post-fill hook errored AFTER the fill landed — manual follow-up may be needed |
+| `digest.daily` | verdict-mapped (healthy=info, attention=warn, critical=critical) | v31 engine-pushed daily digest (notifications.digest) |
 | `schedule.failed` | warn (revert) / critical (terminal) | Schedule's trade failed; schedule stays active for the next slot |
 | `schedule.completed` | info | Schedule reached `max_runs` or `end_at` |
 | `trade.failed` | warn | Any direct swap reverted on-chain |
@@ -1885,6 +1887,15 @@ tradekit digest --window 24h --strict              # exit 2 on 🔴 critical ver
 0 9 * * * tradekit digest --window 24h --format slack | \
   curl -X POST -H 'Content-Type: text/plain' --data-binary @- $SLACK_WEBHOOK
 ```
+
+**…or skip the cron entirely (v31).** The engine's `digest` worker pushes the same markdown through the configured notify channels (Slack / Discord / Telegram / webhook) once per UTC day:
+
+```bash
+tradekit config set notifications.digest '{"enabled":true,"hourUtc":9,"window":"24h","minVerdict":"healthy"}'
+# engine restart not needed — SIGHUP hot-reload picks it up
+```
+
+At most one send per UTC day at (or after) `hourUtc`, deduped across restarts via a marker file. `minVerdict: "attention"` turns the digest into a *page-only-when-something's-wrong* report — a below-gate day isn't marked sent, so the digest goes out the moment health degrades past the gate. Same `renderDigestMarkdown` renderer as `--format slack`, so channel formatting is identical to the cron path.
 
 The slack format uses Slack's mrkdwn (`*bold*`, `_italic_`, `\`code\``) for direct rendering in a channel — no JSON-wrapping required.
 

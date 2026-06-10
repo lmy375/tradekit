@@ -449,9 +449,27 @@ const notificationsSchema = z
      *  (an order failing every tick, an RPC outage flapping) without losing
      *  unique signal. */
     dedupWindowMs: z.number().int().min(0).max(86_400_000).default(60_000),
+    /** v31: engine-pushed daily digest. When enabled, the engine's
+     *  digest worker sends the windowed digest through the configured
+     *  channels once per UTC day at (or after) hourUtc — no external
+     *  cron needed. minVerdict gates on health: "attention" means
+     *  "only page me when something needs attention". */
+    digest: z
+      .object({
+        enabled: z.boolean().default(false),
+        hourUtc: z.number().int().min(0).max(23).default(9),
+        window: z.string().default("24h"),
+        minVerdict: z.enum(["healthy", "attention", "critical"]).default("healthy"),
+      })
+      .strict()
+      .default({ enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" }),
   })
   .strict()
-  .default({ channels: [], dedupWindowMs: 60_000 });
+  .default({
+    channels: [],
+    dedupWindowMs: 60_000,
+    digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" },
+  });
 
 // ── engine (unified supervisor) ──────────────────────────────
 //
@@ -545,6 +563,10 @@ const engineSchema = z
         // operational cadences (hourly check, daily backup gated by
         // its own intervalHours).
         db_maintenance: engineWorkerSchema.default({ enabled: false, intervalMs: 3_600_000 }),
+        /** v31: digest-push worker. Enabled by default but a no-op
+         *  until notifications.digest.enabled=true — same gating
+         *  pattern as the alerts worker. */
+        digest: engineWorkerSchema.default({ enabled: true, intervalMs: 300_000 }),
       })
       .strict()
       .default({}),
@@ -608,6 +630,7 @@ const engineSchema = z
       rebalance: { enabled: true, intervalMs: 300_000 },
       alerts: { enabled: true, intervalMs: 300_000 },
       db_maintenance: { enabled: false, intervalMs: 3_600_000 },
+      digest: { enabled: true, intervalMs: 300_000 },
     },
     resilience: {
       enabled: true,
@@ -623,7 +646,7 @@ const engineSchema = z
   });
 
 export type EngineConfig = z.infer<typeof engineSchema>;
-export type EngineWorkerName = "orders" | "schedules" | "reconcile" | "rebalance" | "alerts" | "db_maintenance";
+export type EngineWorkerName = "orders" | "schedules" | "reconcile" | "rebalance" | "alerts" | "db_maintenance" | "digest";
 
 // ── mev / private-mempool submission ─────────────────────────
 //

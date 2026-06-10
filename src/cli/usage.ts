@@ -93,7 +93,7 @@ NOTIFICATIONS (push-delivered alerts)
         (default 60s) suppresses identical events so a stuck order doesn't spam the channel.
 
 ENGINE (unified supervisor — production deployment unit)
-  engine run [--once] [--workers orders,schedules,reconcile,rebalance,alerts] [--dry-run]
+  engine run [--once] [--workers orders,schedules,reconcile,rebalance,alerts,digest,db_maintenance] [--dry-run]
              [--pass <pw>] [--strict] [--json]
              [--metrics-port N] [--metrics-host 127.0.0.1]
         Single-process daemon that ticks orders + schedules + reconcile + rebalance + alerts on
@@ -369,6 +369,10 @@ DB LIFECYCLE (iter40 — integrity check + retention + auto-backup)
         Apply rotation to the configured backup dir — keep most recent N (default from
         db.backup.retainCount).
   Background worker:
+    Engine-pushed daily digest: notifications.digest {"enabled":true,"hourUtc":9,
+    "window":"24h","minVerdict":"healthy|attention|critical"} — the digest worker
+    sends the slack-format digest through the notify channels once per UTC day
+    (no external cron). minVerdict=attention = only when something needs attention.
     Set engine.workers.db_maintenance.enabled=true to run integrity check + retention +
     auto-backup on internally-tracked cadences (db.integrityCheck.intervalHours,
     db.backup.intervalHours). Read-only (no password). Subtask success/failure surfaces in

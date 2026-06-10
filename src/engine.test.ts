@@ -114,9 +114,9 @@ describe("readEngineStatus", () => {
 // ── buildBuiltinWorkers respects config.enabled ─────────────
 
 describe("buildBuiltinWorkers", () => {
-  it("emits workers in canonical order: orders, schedules, reconcile, rebalance, alerts", () => {
+  it("emits workers in canonical order: orders, schedules, reconcile, rebalance, alerts, digest", () => {
     const workers = buildBuiltinWorkers(loadConfig());
-    expect(workers.map((w) => w.name)).toEqual(["orders", "schedules", "reconcile", "rebalance", "alerts"]);
+    expect(workers.map((w) => w.name)).toEqual(["orders", "schedules", "reconcile", "rebalance", "alerts", "digest"]);
   });
 
   it("omits workers whose config.enabled=false", async () => {
@@ -131,6 +131,7 @@ describe("buildBuiltinWorkers", () => {
           reconcile: { enabled: true, intervalMs: 60_000 },
           rebalance: { enabled: false, intervalMs: 300_000 },
           alerts: { enabled: false, intervalMs: 300_000 },
+          digest: { enabled: false, intervalMs: 300_000 },
         },
       },
     });

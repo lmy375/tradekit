@@ -163,7 +163,7 @@ describe("auditAllowanceList (iter606)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
-    notifications: { channels: [], dedupWindowMs: 60_000 },
+    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const } },
     engine: {
       workers: {
         orders: { enabled: true, intervalMs: 30_000 },
@@ -172,6 +172,7 @@ describe("auditAllowanceList (iter606)", () => {
         rebalance: { enabled: true, intervalMs: 300_000 },
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
+          digest: { enabled: true, intervalMs: 300_000 },
       },
       resilience: { enabled: true, thresholdFailures: 3, backoffMultiplier: 2, maxBackoffMs: 600_000, tickTimingWindow: 20 },
       heartbeatIntervalMs: 3_600_000,
@@ -315,7 +316,7 @@ describe("approval freshness signal (iter617)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
-    notifications: { channels: [], dedupWindowMs: 60_000 },
+    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const } },
     engine: {
       workers: {
         orders: { enabled: true, intervalMs: 30_000 },
@@ -324,6 +325,7 @@ describe("approval freshness signal (iter617)", () => {
         rebalance: { enabled: true, intervalMs: 300_000 },
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
+          digest: { enabled: true, intervalMs: 300_000 },
       },
       resilience: { enabled: true, thresholdFailures: 3, backoffMultiplier: 2, maxBackoffMs: 600_000, tickTimingWindow: 20 },
       heartbeatIntervalMs: 3_600_000,

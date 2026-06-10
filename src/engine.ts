@@ -277,6 +277,25 @@ export function buildBuiltinWorkers(config: Config): Worker[] {
       },
     });
   }
+  if (cfg.digest.enabled) {
+    // v31: digest-push worker — sends the daily digest through the
+    // notify channels once per UTC day. Read-side (no wallet); a
+    // no-op until notifications.digest.enabled=true, mirroring the
+    // alerts worker's gating pattern.
+    out.push({
+      name: "digest",
+      intervalMs: cfg.digest.intervalMs,
+      async tick(ctx) {
+        try {
+          const { runDigestPushTick } = await import("./digestPush.js");
+          const report = await runDigestPushTick({ config: ctx.config, logger: ctx.logger });
+          return { ok: true, data: report };
+        } catch (e) {
+          return { ok: false, error: (e as Error).message ?? String(e) };
+        }
+      },
+    });
+  }
   if (cfg.db_maintenance.enabled) {
     // Iter40: db_maintenance worker — runs integrity check +
     // retention prune + auto-backup on internally-tracked cadences
@@ -385,7 +404,7 @@ export async function runEngineSupervisor(opts: SupervisorOptions): Promise<Supe
 
   // Refuse to start a signing worker without a password (unless dry-run).
   // reconcile + alerts are read-only — both safe without a password.
-  const READ_ONLY_WORKERS = new Set<EngineWorkerName>(["reconcile", "alerts", "db_maintenance"]);
+  const READ_ONLY_WORKERS = new Set<EngineWorkerName>(["reconcile", "alerts", "db_maintenance", "digest"]);
   const requiresPassword = !opts.dryRun && workers.some((w) => !READ_ONLY_WORKERS.has(w.name));
   if (requiresPassword && !opts.password) {
     lock.release();

@@ -320,6 +320,7 @@ describe("computeConfigImpact — engine workers", () => {
         rebalance: { enabled: true, intervalMs: 300_000 },
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
+          digest: { enabled: true, intervalMs: 300_000 },
       },
     });
     const r = computeConfigImpact({ oldConfig: oldC, newConfig: newC });
@@ -336,6 +337,7 @@ describe("computeConfigImpact — engine workers", () => {
         rebalance: { enabled: true, intervalMs: 300_000 },
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
+          digest: { enabled: true, intervalMs: 300_000 },
       },
     });
     const r = computeConfigImpact({ oldConfig: oldC, newConfig: newC });
