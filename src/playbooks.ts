@@ -361,7 +361,12 @@ export function hashSpec(spec: PlaybookSpec): string {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-function canonicalJSON(v: unknown): string {
+/** Exported for playbookReplace's field-change detection: a deployed
+ *  spec round-trips through canonicalJSON (key-sorted) while the
+ *  incoming spec is in author key order — comparing with plain
+ *  JSON.stringify produces phantom "changed" flags on nested-object
+ *  fields (rebalance targets). Canonical comparison is order-blind. */
+export function canonicalJSON(v: unknown): string {
   if (v === undefined) return "null"; // JSON has no undefined; coerce to null
   if (v === null || typeof v !== "object") {
     return JSON.stringify(v);

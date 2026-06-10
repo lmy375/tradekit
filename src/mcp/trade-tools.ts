@@ -1287,6 +1287,62 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // rebalance_edit — in-place mutation, completing the primitive-edit
+  // triangle (order_edit preserves trailing HWM, schedule_edit
+  // preserves run counters, rebalance_edit preserves run_count +
+  // last-run telemetry).
+  server.tool(
+    "rebalance_edit",
+    "Edit an active OR paused rebalance plan in-place. State-preserving: run_count / max_runs accounting + last-run telemetry stay (vs cancel+create, which resets them). Editable: targets (re-weighting — same validation as create: sum exactly 100, no dupes; token set changes allowed, the next tick evaluates the new composition), driftThresholdPct, minTradeUsd, cron/every (recomputes next_run_at from now), endAt, maxRuns (>= current run_count), slippageBps, autoSlippage, strategy, note, name, paper. Frozen: chain, account, quote token (the routing anchor — every leg prices through it), startAt. Terminal states (completed/cancelled) reject. Returns { planId, changed, diff: [{field, oldValue, newValue}], plan }. Errors: INVALID_PARAMS (terminal, bad targets, maxRuns < run_count, bad cron, past endAt), SLIPPAGE_TOO_HIGH (exceeds safety.maxSlippageBps).",
+    {
+      id: z.number().int().positive().describe("Rebalance plan id to edit."),
+      targets: z
+        .array(z.object({ token: z.string(), targetPct: z.number().positive() }))
+        .optional()
+        .describe("Replacement target list — must sum to exactly 100."),
+      driftThresholdPct: z.number().optional().describe("New drift threshold in percent, (0, 100)."),
+      minTradeUsd: z.number().optional().describe("New per-leg minimum trade size in USD (>= 0)."),
+      cron: z.string().optional().describe("New cron expression. Mutually exclusive with every."),
+      every: z.string().optional().describe("New duration shorthand (6h, 1d, 7d)."),
+      endAt: z.string().nullable().optional().describe("New ISO-8601 end-at (future). Pass null to clear."),
+      maxRuns: z.number().int().min(1).nullable().optional().describe("New lifetime cap on EXECUTED rebalances. Must be >= current run_count. Pass null to clear."),
+      slippageBps: z.number().int().min(1).max(10_000).optional(),
+      autoSlippage: z.boolean().optional(),
+      strategy: z.string().optional(),
+      note: z.string().optional(),
+      name: z.string().optional(),
+      paper: z.boolean().optional().describe("Flip the plan between paper (virtual book) and real trading."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("rebalance_edit", rt.opts, input, undefined, async () => {
+            const { editRebalancePlan } = await import("../rebalanceEdit.js");
+            const changes: Record<string, unknown> = {};
+            for (const k of [
+              "targets", "driftThresholdPct", "minTradeUsd", "cron", "every",
+              "endAt", "maxRuns", "slippageBps", "autoSlippage", "strategy",
+              "note", "name", "paper",
+            ] as const) {
+              if (k in input && (input as Record<string, unknown>)[k] !== undefined) {
+                changes[k] = (input as Record<string, unknown>)[k];
+              }
+            }
+            const result = editRebalancePlan({ id: input.id, changes });
+            return {
+              planId: input.id,
+              changed: result.diff.length > 0,
+              diff: result.diff,
+              plan: result.plan,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   server.tool(
     "rebalance_pause",
     "Pause an active rebalance plan. The engine ignores paused plans; resume via rebalance_resume. Errors: INVALID_PARAMS (unknown id, not active).",

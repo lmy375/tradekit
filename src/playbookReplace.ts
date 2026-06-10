@@ -57,6 +57,7 @@ import {
   createOnePrimitive,
   cancelByType,
   hashSpec,
+  canonicalJSON,
   type PlaybookSpec,
   type StrategySpec,
   type OrderSpec,
@@ -79,6 +80,7 @@ import {
 } from "./db.js";
 import { editOrder, validateOrderEdit, type OrderEditChanges } from "./orderEdit.js";
 import { editSchedule, validateScheduleEdit, type ScheduleEditChanges } from "./scheduleEdit.js";
+import { editRebalancePlan, validateRebalanceEdit, type RebalanceEditChanges } from "./rebalanceEdit.js";
 import { loadConfig, resolveProfile, type Config } from "./config.js";
 import { resolveTradePair } from "./chains.js";
 import {
@@ -220,9 +222,12 @@ function detectFieldChanges(
   for (const key of keys) {
     const oldVal = oldObj[key];
     const newVal = newObj[key];
-    // Compare via JSON equality — handles primitives, arrays, nested
-    // objects (rebalance targets) without writing a deep-eq helper.
-    if (JSON.stringify(oldVal) !== JSON.stringify(newVal)) {
+    // Compare via CANONICAL JSON equality (key-sorted) — the old spec
+    // round-tripped through canonicalJSON when it was persisted, so a
+    // plain JSON.stringify comparison flags phantom changes on nested
+    // objects whose key order differs (rebalance targets were reported
+    // "modified" on every replace even when identical).
+    if (canonicalJSON(oldVal) !== canonicalJSON(newVal)) {
       changes.push({ path: key, oldValue: oldVal, newValue: newVal });
     }
   }
@@ -262,6 +267,23 @@ const SCHEDULE_EDITABLE_SPEC_FIELDS = new Set([
   "note",
 ]);
 
+/** Rebalance gained in-place edit too (rebalanceEdit.ts) — frozen
+ *  spec fields are quoteToken (the routing anchor), startAt, chain,
+ *  account. `name` and the target TOKEN SET are part of the
+ *  structural key, so they never appear in a modified entry's
+ *  fieldChanges; targetPct re-weights DO and are editable. */
+const REBALANCE_EDITABLE_SPEC_FIELDS = new Set([
+  "targets",
+  "driftThresholdPct",
+  "minTradeUsd",
+  "cron",
+  "endAt",
+  "maxRuns",
+  "slippageBps",
+  "autoSlippage",
+  "note",
+]);
+
 /** Classify a modified entry: can its field changes be applied
  *  in-place, or must it be recreated? Returns the frozen fields that
  *  forced a recreate so the diff can explain itself. */
@@ -269,13 +291,10 @@ function classifyModifiedEntry(
   type: StrategySpec["type"],
   fieldChanges: Array<{ path: string }>,
 ): { applyMode: "edit" | "recreate"; recreateReason?: string } {
-  if (type === "rebalance") {
-    return {
-      applyMode: "recreate",
-      recreateReason: "rebalance plans have no in-place edit; run counters carry to the new row",
-    };
-  }
-  const editable = type === "order" ? ORDER_EDITABLE_SPEC_FIELDS : SCHEDULE_EDITABLE_SPEC_FIELDS;
+  const editable =
+    type === "order" ? ORDER_EDITABLE_SPEC_FIELDS :
+    type === "schedule" ? SCHEDULE_EDITABLE_SPEC_FIELDS :
+    REBALANCE_EDITABLE_SPEC_FIELDS;
   const frozen = fieldChanges.map((c) => c.path).filter((p) => !editable.has(p));
   if (frozen.length === 0) return { applyMode: "edit" };
   return {
@@ -436,7 +455,7 @@ export interface ReplaceResult {
    *  continuity; they appear in neither `created` nor `cancelled`.
    *  Empty when preserveState:false or nothing was edit-routable. */
   edited: Array<{
-    type: "order" | "schedule";
+    type: "order" | "schedule" | "rebalance";
     rowId: number;
     localId: string;
     /** Spec field names that changed. */
@@ -552,10 +571,10 @@ export function replacePlaybook(args: {
   //   toCreate  — added + modified-recreate new entries; recreates
   //               capture the old row's run counters for carry-over.
   const toEdit: Array<{
-    type: "order" | "schedule";
+    type: "order" | "schedule" | "rebalance";
     rowId: number;
     localId: string;
-    changes: OrderEditChanges | ScheduleEditChanges;
+    changes: OrderEditChanges | ScheduleEditChanges | RebalanceEditChanges;
     fields: string[];
   }> = [];
   const toCancel: Array<{ type: StrategySpec["type"]; rowId: number }> = [];
@@ -606,10 +625,17 @@ export function replacePlaybook(args: {
       toEdit.push({ type: "schedule", rowId, localId, changes, fields });
       continue;
     }
+    if (preserveState && e.applyMode === "edit" && rowId != null && e.type === "rebalance") {
+      const row = ownedRebalances.find((r) => r.id === rowId)!;
+      const changes = rebalanceEditChangesFromSpec(e.newEntry as RebalanceSpec, fields);
+      validateRebalanceEdit({ plan: row, changes, config, now });
+      toEdit.push({ type: "rebalance", rowId, localId, changes, fields });
+      continue;
+    }
 
-    // Recreate path (frozen field changed, rebalance, edit-target row
-    // missing, or preserveState:false). Capture run counters for
-    // carry-over while the old row is still readable.
+    // Recreate path (frozen field changed, edit-target row missing,
+    // or preserveState:false). Capture run counters for carry-over
+    // while the old row is still readable.
     if (rowId != null) toCancel.push({ type: e.oldEntry!.type, rowId });
     let carry: (typeof toCreate)[number]["carry"];
     if (preserveState && rowId != null && e.type === "schedule") {
@@ -675,8 +701,10 @@ export function replacePlaybook(args: {
     try {
       if (ed.type === "order") {
         editOrder({ id: ed.rowId, changes: ed.changes as OrderEditChanges, config });
-      } else {
+      } else if (ed.type === "schedule") {
         editSchedule({ id: ed.rowId, changes: ed.changes as ScheduleEditChanges, config });
+      } else {
+        editRebalancePlan({ id: ed.rowId, changes: ed.changes as RebalanceEditChanges, config });
       }
       edited.push({ type: ed.type, rowId: ed.rowId, localId: ed.localId, fields: ed.fields });
     } catch (e) {
@@ -768,6 +796,46 @@ function orderEditChangesFromSpec(entry: OrderSpec, changedFields: string[]): Or
         break;
       case "expiresAt":
         ch.expiresAt = entry.expiresAt ?? null;
+        break;
+      case "note":
+        ch.note = entry.note ?? null;
+        break;
+    }
+  }
+  return ch;
+}
+
+/** Same mapping for rebalance plans. The structural key pins name +
+ *  target token set, so a modified entry's `targets` change is a
+ *  re-weight of the SAME tokens — exactly what the edit validator
+ *  accepts. */
+function rebalanceEditChangesFromSpec(entry: RebalanceSpec, changedFields: string[]): RebalanceEditChanges {
+  const ch: RebalanceEditChanges = {};
+  for (const f of changedFields) {
+    switch (f) {
+      case "targets":
+        ch.targets = entry.targets;
+        break;
+      case "driftThresholdPct":
+        if (entry.driftThresholdPct != null) ch.driftThresholdPct = entry.driftThresholdPct;
+        break;
+      case "minTradeUsd":
+        if (entry.minTradeUsd != null) ch.minTradeUsd = entry.minTradeUsd;
+        break;
+      case "cron":
+        if (entry.cron) ch.cron = entry.cron;
+        break;
+      case "endAt":
+        ch.endAt = entry.endAt ?? null;
+        break;
+      case "maxRuns":
+        ch.maxRuns = entry.maxRuns ?? null;
+        break;
+      case "slippageBps":
+        ch.slippageBps = entry.slippageBps ?? null;
+        break;
+      case "autoSlippage":
+        ch.autoSlippage = entry.autoSlippage === true;
         break;
       case "note":
         ch.note = entry.note ?? null;

@@ -387,6 +387,69 @@ export async function rebalanceRunCommand(flags: Record<string, string>) {
   await withWatch(flags, work);
 }
 
+// ── edit ─────────────────────────────────────────────────────
+//
+// In-place edit. State-preserving: run_count / max_runs accounting
+// + last-run telemetry survive (vs cancel + create, which resets
+// them). Frozen: chain, account, quote-token (routing anchor),
+// start-at. Cron/every change recomputes next_run_at from now.
+
+export async function rebalanceEditCommand(flags: Record<string, string>, positional: string[]) {
+  const id = parsePlanId(positional[2]);
+  const { editRebalancePlan } = await import("../rebalanceEdit.js");
+
+  const changes: import("../rebalanceEdit.js").RebalanceEditChanges = {};
+  if (flags["targets"]) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(flags["targets"]);
+    } catch {
+      throw new ToolError(
+        "INVALID_PARAMS",
+        `--targets must be a JSON array, e.g.  --targets '[{"token":"ETH","targetPct":70},{"token":"USDC","targetPct":30}]'`,
+      );
+    }
+    if (!Array.isArray(parsed)) {
+      throw new ToolError("INVALID_PARAMS", "--targets must be a JSON ARRAY of { token, targetPct }.");
+    }
+    changes.targets = parsed as RebalanceTarget[];
+  }
+  if (flags["drift-threshold"]) changes.driftThresholdPct = parseFloat(flags["drift-threshold"]);
+  if (flags["min-trade-usd"]) changes.minTradeUsd = parseFloat(flags["min-trade-usd"]);
+  if (flags["cron"]) changes.cron = flags["cron"];
+  if (flags["every"]) changes.every = flags["every"];
+  if ("end-at" in flags) changes.endAt = flags["end-at"] === "null" ? null : flags["end-at"];
+  if ("max-runs" in flags) changes.maxRuns = flags["max-runs"] === "null" ? null : parseInt(flags["max-runs"], 10);
+  if (flags["slippage"]) changes.slippageBps = parseInt(flags["slippage"], 10);
+  if ("auto-slippage" in flags) changes.autoSlippage = flags["auto-slippage"] === "true";
+  if ("strategy" in flags) changes.strategy = flags["strategy"];
+  if ("note" in flags) changes.note = flags["note"];
+  if ("name" in flags) changes.name = flags["name"];
+  if ("paper" in flags) changes.paper = flags["paper"] === "true";
+
+  if (Object.keys(changes).length === 0) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      "No changes supplied. Editable: --targets, --drift-threshold, --min-trade-usd, --cron/--every, --end-at, --max-runs, --slippage, --auto-slippage, --strategy, --note, --name, --paper.",
+    );
+  }
+
+  const result = editRebalancePlan({ id, changes });
+  if (flags["json"] === "true") {
+    printJson({ ok: true, planId: id, changed: result.diff.length > 0, diff: result.diff, plan: result.plan });
+    return;
+  }
+  if (result.diff.length === 0) {
+    console.log(`No changes — plan #${id} already matches the supplied values.`);
+    return;
+  }
+  console.log(`Edited rebalance plan #${id}${(result.plan.paper ?? 0) === 1 ? "  [PAPER]" : ""}:`);
+  for (const d of result.diff) {
+    console.log(`  ${String(d.field).padEnd(18)} ${JSON.stringify(d.oldValue)} → ${JSON.stringify(d.newValue)}`);
+  }
+  console.log(`  (run_count ${result.plan.run_count} + last-run telemetry preserved)`);
+}
+
 // ── dispatch ─────────────────────────────────────────────────
 
 export async function rebalanceCommand(
@@ -398,11 +461,12 @@ export async function rebalanceCommand(
     case "create": await rebalanceCreateCommand(flags); break;
     case "list":   await rebalanceListCommand(flags); break;
     case "show":   await rebalanceShowCommand(flags, positional); break;
+    case "edit":   await rebalanceEditCommand(flags, positional); break;
     case "pause":  await rebalancePauseCommand(flags, positional); break;
     case "resume": await rebalanceResumeCommand(flags, positional); break;
     case "cancel": await rebalanceCancelCommand(flags, positional); break;
     case "run":    await rebalanceRunCommand(flags); break;
     default:
-      throw subcommandError("rebalance", action, ["create", "list", "show", "pause", "resume", "cancel", "run"]);
+      throw subcommandError("rebalance", action, ["create", "list", "show", "edit", "pause", "resume", "cancel", "run"]);
   }
 }

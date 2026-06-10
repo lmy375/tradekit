@@ -164,6 +164,15 @@ PORTFOLIO REBALANCING
   rebalance list [--status all|active|paused|completed|cancelled] [--chain X] [--account L]
                  [--strategy TAG] [--limit N] [--json]
   rebalance show <id> [--json]                 Full detail incl. last-run telemetry
+  rebalance edit <id> [--targets '[{"token":"ETH","targetPct":70},...]'] [--drift-threshold N]
+                 [--min-trade-usd N] [--cron "..."|--every 6h] [--end-at <ISO>|null]
+                 [--max-runs N|null] [--slippage <bps>] [--auto-slippage true|false]
+                 [--strategy TAG] [--note "..."] [--name X] [--paper true|false] [--json]
+        In-place edit — run_count / max_runs accounting + last-run telemetry are
+        PRESERVED (vs cancel+create, which resets them). Targets re-weighting uses
+        the same validation as create (sum exactly 100). Frozen: chain, account,
+        quote token (routing anchor), start-at. Cron/every change recomputes
+        next_run_at from now. maxRuns cannot drop below the current run_count.
   rebalance pause <id> [--json]                Pause (engine ignores until resumed)
   rebalance resume <id> [--json]               Resume (next_run_at recomputed)
   rebalance cancel <id> [--yes] [--json]       Cancel (terminal — use pause for temporary)

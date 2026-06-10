@@ -3726,6 +3726,96 @@ export function insertRebalancePlan(args: InsertRebalancePlanArgs): number {
   return Number(result.lastInsertRowid);
 }
 
+/** Editable column set for in-place rebalance-plan edits. Same
+ *  pattern as OrderEditableFields / ScheduleEditableFields — the
+ *  validation lives in rebalanceEdit.ts; this layer only writes. */
+export interface RebalanceEditableFields {
+  targets_json?: string;
+  drift_threshold_pct?: number;
+  min_trade_usd?: number;
+  cron_expr?: string;
+  next_run_at?: string;
+  end_at?: string | null;
+  max_runs?: number | null;
+  slippage_bps?: number | null;
+  auto_slippage?: boolean;
+  strategy?: string | null;
+  note?: string | null;
+  name?: string | null;
+  paper?: boolean;
+}
+
+export function updateRebalanceEditable(
+  id: number,
+  changes: RebalanceEditableFields,
+): number {
+  const db = openDb();
+  const sets: string[] = [];
+  const args: (string | number | null)[] = [];
+  if ("targets_json" in changes && changes.targets_json != null) {
+    sets.push("targets_json = ?");
+    args.push(changes.targets_json);
+  }
+  if ("drift_threshold_pct" in changes && changes.drift_threshold_pct != null) {
+    sets.push("drift_threshold_pct = ?");
+    args.push(changes.drift_threshold_pct);
+  }
+  if ("min_trade_usd" in changes && changes.min_trade_usd != null) {
+    sets.push("min_trade_usd = ?");
+    args.push(changes.min_trade_usd);
+  }
+  if ("cron_expr" in changes && changes.cron_expr != null) {
+    sets.push("cron_expr = ?");
+    args.push(changes.cron_expr);
+  }
+  if ("next_run_at" in changes && changes.next_run_at != null) {
+    sets.push("next_run_at = ?");
+    args.push(changes.next_run_at);
+  }
+  if ("end_at" in changes) {
+    sets.push("end_at = ?");
+    args.push(changes.end_at ?? null);
+  }
+  if ("max_runs" in changes) {
+    sets.push("max_runs = ?");
+    args.push(changes.max_runs ?? null);
+  }
+  if ("slippage_bps" in changes) {
+    sets.push("slippage_bps = ?");
+    args.push(changes.slippage_bps ?? null);
+  }
+  if ("auto_slippage" in changes) {
+    sets.push("auto_slippage = ?");
+    args.push(changes.auto_slippage ? 1 : 0);
+  }
+  if ("strategy" in changes) {
+    sets.push("strategy = ?");
+    args.push(changes.strategy ?? null);
+  }
+  if ("note" in changes) {
+    sets.push("note = ?");
+    args.push(changes.note ?? null);
+  }
+  if ("name" in changes) {
+    sets.push("name = ?");
+    args.push(changes.name ?? null);
+  }
+  if ("paper" in changes) {
+    sets.push("paper = ?");
+    args.push(changes.paper ? 1 : 0);
+  }
+  if (sets.length === 0) return 0;
+  const now = new Date().toISOString();
+  sets.push("updated_at = ?");
+  args.push(now);
+  args.push(id);
+  // Guard on active/paused — same rationale as schedules: paused
+  // plans are legitimate edit targets; terminal states are not.
+  const sql = `UPDATE rebalance_plans SET ${sets.join(", ")} WHERE id = ? AND status IN ('active', 'paused')`;
+  const r = db.prepare(sql).run(...args);
+  return Number(r.changes ?? 0);
+}
+
 export function getRebalancePlanById(id: number): RebalanceRow | null {
   const db = openDb();
   const row = db.prepare(`SELECT * FROM rebalance_plans WHERE id = ?`).get(id) as RebalanceRow | undefined;

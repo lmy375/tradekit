@@ -178,17 +178,30 @@ describe("computePlaybookDiff", () => {
     expect(d.willResetTrailingHwm).toBe(true);
   });
 
-  it("v2: modified rebalance is always applyMode=recreate (no edit machinery)", () => {
+  it("v3: modified rebalance with editable changes is applyMode=edit (rebalanceEdit.ts)", () => {
     const oldSpec = mkSpec([
       { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 5 },
     ]);
     const newSpec = mkSpec([
-      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 8 },
+      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 70 }, { token: "USDC", targetPct: 30 }], driftThresholdPct: 8 },
+    ]);
+    const d = computePlaybookDiff({ oldSpec, newSpec, playbookId: 1 });
+    const modified = d.entries.find((e) => e.status === "modified");
+    expect(modified?.applyMode).toBe("edit"); // re-weight + threshold are both editable
+    expect(d.willResetTrailingHwm).toBe(false); // not a trailing order
+  });
+
+  it("v3: rebalance quoteToken change is frozen → applyMode=recreate", () => {
+    const oldSpec = mkSpec([
+      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], quoteToken: "USDC" },
+    ]);
+    const newSpec = mkSpec([
+      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], quoteToken: "WETH" },
     ]);
     const d = computePlaybookDiff({ oldSpec, newSpec, playbookId: 1 });
     const modified = d.entries.find((e) => e.status === "modified");
     expect(modified?.applyMode).toBe("recreate");
-    expect(d.willResetTrailingHwm).toBe(false); // not a trailing order
+    expect(modified?.recreateReason).toContain("quoteToken");
   });
 
   it("modified non-trailing order does NOT set willResetTrailingHwm", () => {
@@ -580,7 +593,7 @@ describe("replacePlaybook v2 — state-preserving modify", () => {
     expect(active.last_run_at).toBe("2026-06-02T00:00:00.000Z");
   });
 
-  it("rebalance modify recreates but carries run_count + last_run_at", () => {
+  it("rebalance modify edits IN PLACE — same row, run_count + telemetry native", () => {
     const spec = parsePlaybookSpec({
       name: "v2-reb",
       chain: "base",
@@ -604,13 +617,48 @@ describe("replacePlaybook v2 — state-preserving modify", () => {
     });
     const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
 
+    // v3: driftThresholdPct is in-place editable — no recreate at all.
+    expect(result.edited).toEqual([{ type: "rebalance", rowId: planId, localId: "folio", fields: ["driftThresholdPct"] }]);
+    expect(result.cancelled).toEqual([]);
+    expect(result.created).toEqual([]);
+    const active = getPlaybookDetail(deploy.playbookId).rebalances.find((r) => r.status === "active")!;
+    expect(active.id).toBe(planId); // SAME row
+    expect(active.drift_threshold_pct).toBe(8);
+    expect(active.run_count).toBe(2); // native, not carried
+    expect(active.last_run_at).toBe("2026-06-03T00:00:00.000Z");
+  });
+
+  it("rebalance recreate (frozen quoteToken changed) still carries run counters", () => {
+    const spec = parsePlaybookSpec({
+      name: "v3-reb-frozen",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], quoteToken: "USDC" },
+      ],
+    });
+    const deploy = deployPlaybook({ spec, sourcePath: null });
+    const db = openDb();
+    const planId = getPlaybookDetail(deploy.playbookId).rebalances[0].id!;
+    db.prepare(`UPDATE rebalance_plans SET run_count = 3, last_run_at = '2026-06-04T00:00:00.000Z' WHERE id = ?`).run(planId);
+
+    const updated = parsePlaybookSpec({
+      name: "v3-reb-frozen",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], quoteToken: "WETH" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.edited).toEqual([]);
     expect(result.cancelled).toEqual([planId]);
     expect(result.created.length).toBe(1);
     const active = getPlaybookDetail(deploy.playbookId).rebalances.find((r) => r.status === "active")!;
     expect(active.id).not.toBe(planId);
-    expect(active.drift_threshold_pct).toBe(8);
-    expect(active.run_count).toBe(2); // carried
-    expect(active.last_run_at).toBe("2026-06-03T00:00:00.000Z");
+    expect(active.run_count).toBe(3); // carried across the recreate
+    expect(active.last_run_at).toBe("2026-06-04T00:00:00.000Z");
   });
 
   it("preserveState:false restores v1 behavior — recreate everything, fresh state", () => {

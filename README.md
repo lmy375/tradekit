@@ -392,6 +392,12 @@ tradekit rebalance show 1                      # detail incl. last-run telemetry
 tradekit rebalance run --once --dry-run        # evaluate without firing
 tradekit rebalance pause 1                     # engine ignores while paused
 
+# Re-weight IN PLACE — run_count / max_runs accounting + last-run telemetry
+# survive (cancel+create would reset them). Same edit discipline as
+# `order edit` / `schedule edit`; frozen: chain, account, quote token, start-at.
+tradekit rebalance edit 1 --targets '[{"token":"ETH","targetPct":70},{"token":"USDC","targetPct":30}]' \
+  --drift-threshold 8
+
 # Paper variant: drift is measured against the VIRTUAL book and corrective
 # legs fill it — no chain reads, no keystore, no real trades. Seed first.
 tradekit paper deposit --chain base --token ETH  --amount 0.5
@@ -510,7 +516,7 @@ tradekit playbook replace 1 ./eth-strategy-v2.json --yes
 
 **Failure semantics.** Pre-validation catches the most common failures (chain resolution, token resolution, missing fields) BEFORE any cancellation, so a defective new spec can't leave the playbook in partial state. Mid-apply DB errors bubble with diagnostic context pointing operators at `tradekit playbook show <id>` for state inspection.
 
-**State preservation (v2).** A `modified` primitive whose changes are all in-place editable (price, trailPct, amounts, slippage, expiry/endAt, maxRuns, cadence, note) routes through the SAME edit machinery as `tradekit order edit` / `schedule edit`: it keeps its row id, its trailing **HWM water mark**, its `run_count` / `max_runs` accounting, and gains an `edited_by_operator` journal row — full forensic continuity. Only changes to frozen identity fields (OCO `group`, `chain`, `account`, schedule `startAt`/`name`) force cancel+recreate — and even then, recreated schedules and rebalance plans **carry their run counters** (`run_count`, `last_run_at`, fill totals) to the new row so `max_runs` accounting survives. Rebalance plans always recreate (no in-place edit machinery) but carry counters. The diff preview shows the apply mode per entry; `willResetTrailingHwm` now fires only when a trailing order genuinely must be recreated. `--fresh-state` opts out of all preservation (v1 behavior: recreate everything, reset HWM + counters) — useful when the operator *wants* tracking to restart.
+**State preservation (v2).** A `modified` primitive whose changes are all in-place editable (price, trailPct, amounts, slippage, expiry/endAt, maxRuns, cadence, note) routes through the SAME edit machinery as `tradekit order edit` / `schedule edit`: it keeps its row id, its trailing **HWM water mark**, its `run_count` / `max_runs` accounting, and gains an `edited_by_operator` journal row — full forensic continuity. Only changes to frozen identity fields (OCO `group`, `chain`, `account`, schedule `startAt`/`name`) force cancel+recreate — and even then, recreated schedules and rebalance plans **carry their run counters** (`run_count`, `last_run_at`, fill totals) to the new row so `max_runs` accounting survives. Rebalance plans gained in-place edit too (`rebalance edit`): target re-weights, drift threshold, min-trade, cadence, caps all edit in place; only quote-token / startAt changes force recreate (with counter carry). The diff preview shows the apply mode per entry; `willResetTrailingHwm` now fires only when a trailing order genuinely must be recreated. `--fresh-state` opts out of all preservation (v1 behavior: recreate everything, reset HWM + counters) — useful when the operator *wants* tracking to restart.
 
 **Paper preservation (v2).** `deploy --paper` isn't recorded in the spec, so replace **infers** paper-ness from the playbook's owned rows: if every owned primitive is paper, recreated + added primitives are created paper too. Pre-v2 this was a real hole — replacing a paper playbook silently created the new primitives as REAL-trading ones. An explicit `paper` arg on the API overrides the inference.
 
@@ -1939,10 +1945,10 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 107 tools across six groups:
+Starts an MCP stdio server exposing 108 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
-- **Trade & automation** (29) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
+- **Trade & automation** (30) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_edit`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
 - **Strategy & backtest** (11) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
