@@ -1481,3 +1481,59 @@ describe("runAlertTick — dry-run", () => {
     }
   }
 });
+
+// ── position_cap_approach (v38) ──────────────────────────────
+
+describe("evaluatePositionCapApproach", () => {
+  const rule = { type: "position_cap_approach", warnPct: 0.8 } as never;
+  const NOW4 = new Date("2026-06-11T00:00:00Z");
+
+  function reportWithCaps(positionCaps: unknown[]) {
+    return {
+      tag: "t", mode: "paper", window: "30d", generatedAt: NOW4.toISOString(),
+      risk: { budgets: [], drawdown: null, positionCaps },
+    } as never;
+  }
+  const capUtil = (over: Record<string, unknown> = {}) => ({
+    pattern: "t", token: "WETH",
+    currentBaseAmount: 1.7, maxBaseAmount: 2, basePctUsed: 85,
+    currentCostQuote: 3400, maxCostQuote: null, costPctUsed: null,
+    ...over,
+  });
+
+  it("fires when the hottest cap utilization crosses warnPct", async () => {
+    const { evaluatePositionCapApproach } = await import("./strategyAlerts.js");
+    const ev = evaluatePositionCapApproach({ tag: "t", rule, report: reportWithCaps([capUtil()]), now: NOW4 });
+    expect(ev.applicable).toBe(true);
+    expect(ev.violated).toBe(true);
+    expect(ev.message).toMatch(/WETH at 85% of its base cap/);
+    expect(ev.value.axis).toBe("base");
+  });
+
+  it("cost axis competes for hottest", async () => {
+    const { evaluatePositionCapApproach } = await import("./strategyAlerts.js");
+    const ev = evaluatePositionCapApproach({
+      tag: "t", rule,
+      report: reportWithCaps([capUtil({ basePctUsed: 40, costPctUsed: 92, maxCostQuote: 5000 })]),
+      now: NOW4,
+    });
+    expect(ev.violated).toBe(true);
+    expect(ev.value.axis).toBe("cost");
+    expect(ev.value.pctUsed).toBe(92);
+  });
+
+  it("below threshold → applicable, not violated; no caps → inapplicable", async () => {
+    const { evaluatePositionCapApproach } = await import("./strategyAlerts.js");
+    const ok2 = evaluatePositionCapApproach({
+      tag: "t", rule, report: reportWithCaps([capUtil({ basePctUsed: 50 })]), now: NOW4,
+    });
+    expect(ok2.applicable).toBe(true);
+    expect(ok2.violated).toBe(false);
+    const none = evaluatePositionCapApproach({ tag: "t", rule, report: reportWithCaps([]), now: NOW4 });
+    expect(none.applicable).toBe(false);
+  });
+
+  it("sectionsForRules maps it to risk", () => {
+    expect(sectionsForRules([rule]).has("risk")).toBe(true);
+  });
+});

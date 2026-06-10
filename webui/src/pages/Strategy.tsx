@@ -25,8 +25,10 @@ import {
   Tooltip,
 } from "@mantine/core";
 import {
+  getGains,
   getStrategies,
   getStrategyReport,
+  type GainsResp,
   type PageProps,
   type StrategyReportResp,
   type StrategyTag,
@@ -59,12 +61,34 @@ const STATUS_COLORS: Record<string, string> = {
   failed: "red", expired: "gray", cancelled: "gray",
 };
 
+function RealizedSvg({ records }: { records: GainsResp["records"] }) {
+  if (records.length < 2) return null;
+  const w = 640, h = 80, pad = 4;
+  let cum = 0;
+  const points = records.map((r) => (cum += r.gainQuote));
+  const min = Math.min(0, ...points), max = Math.max(0, ...points);
+  const span = max - min || 1;
+  const xy = points.map((v, i) => {
+    const x = pad + (i / (points.length - 1)) * (w - 2 * pad);
+    const y = h - pad - ((v - min) / span) * (h - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const up = points[points.length - 1] >= 0;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: 80 }} preserveAspectRatio="none">
+      <polyline points={xy.join(" ")} fill="none"
+        stroke={up ? "var(--mantine-color-teal-5)" : "var(--mantine-color-red-5)"} strokeWidth={1.5} />
+    </svg>
+  );
+}
+
 export function Strategy(_props: PageProps) {
   const [tags, setTags] = useState<StrategyTag[] | null>(null);
   const [tag, setTag] = useState<string | null>(null);
   const [windowSel, setWindowSel] = useState("30d");
   const [mode, setMode] = useState("auto");
   const [report, setReport] = useState<StrategyReportResp["report"] | null>(null);
+  const [gains, setGains] = useState<GainsResp | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -83,6 +107,11 @@ export function Strategy(_props: PageProps) {
     try {
       const r = await getStrategyReport(tag, windowSel, mode);
       setReport(r.report);
+      // Realized gains ride along — deterministic (pure fill walk), so
+      // a failure here never blocks the report.
+      getGains({ strategy: tag, mode: r.report.mode })
+        .then(setGains)
+        .catch(() => setGains(null));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -302,6 +331,33 @@ export function Strategy(_props: PageProps) {
                 </Text>
               </Group>
             ))}
+          </Stack>
+        </Card>
+      )}
+
+      {gains && gains.records.length > 0 && (
+        <Card withBorder padding="sm">
+          <Group justify="space-between" mb={4}>
+            <Title order={6}>Realized P&L (cost-basis, {gains.mode})</Title>
+            <Text size="xs" ff="monospace" c={gains.totalGainQuote >= 0 ? "teal" : "red"}>
+              {gains.totalGainQuote >= 0 ? "+" : ""}{gains.totalGainQuote.toFixed(2)} · {gains.records.length} realizations
+            </Text>
+          </Group>
+          <RealizedSvg records={gains.records} />
+          <Stack gap={2} mt={4}>
+            {gains.records.slice(-5).reverse().map((r, i) => (
+              <Text key={i} size="xs" ff="monospace" lineClamp={1}>
+                {r.at.slice(0, 10)}  {r.symbol ?? "?"}  sold {r.soldAmount.toFixed(6)}  →{" "}
+                <Text span c={r.gainQuote >= 0 ? "teal" : "red"} inherit>
+                  {r.gainQuote >= 0 ? "+" : ""}{r.gainQuote.toFixed(2)}
+                </Text>
+              </Text>
+            ))}
+            {gains.totalUntrackedProceedsQuote > 0 && (
+              <Text size="xs" c="dimmed">
+                ⚠ {gains.totalUntrackedProceedsQuote.toFixed(2)} untracked-sell proceeds (no basis — excluded from the total)
+              </Text>
+            )}
           </Stack>
         </Card>
       )}

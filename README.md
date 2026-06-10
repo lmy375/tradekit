@@ -627,7 +627,7 @@ tradekit strategy report 1 --mtm
 }
 ```
 
-**Nine rule types**:
+**Ten rule types**:
 
 | Rule                  | Triggers when…                                                              |
 |-----------------------|------------------------------------------------------------------------------|
@@ -640,6 +640,7 @@ tradekit strategy report 1 --mtm
 | `trigger_proximity`   | Any active order within `alertDistancePct` of firing (heads-up)             |
 | `drift_proximity`     | Any owned rebalance plan's last drift ≥ `alertPctOfThreshold`% of its threshold |
 | `funding_runway`      | The strategy's spend-token balance runs out within `thresholdDays` (forecast)  |
+| `position_cap_approach` | Net exposure reaches ≥ `warnPct` of a position cap (hear it BEFORE buys bounce) |
 
 Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) to scope thresholds per strategy, `note` for free-text rationale that ships in the notification body, and `action` to choose what a fire DOES (see the circuit breaker below).
 
@@ -678,7 +679,7 @@ The safety stack had two axes: the **drawdown breaker** (portfolio value falls X
 ] } }
 ```
 
-Position caps count **NET exposure** with the same weighted-average model every P&L surface uses (the cap can never disagree with what `strategy report` shows): buys add, sells subtract with proportional cost release — reduce the position and room comes back. Enforcement runs post-quote in BOTH execution paths (real `executeTrade` and `executePaperTrade` — the dry-run rejects exactly where real would) and throws `POSITION_CAP_EXCEEDED` with current/adding/cap numbers. Three deliberate rules: **sells are never blocked** (refusing an exit because exposure is "too high" would be actively dangerous), untagged manual trades bypass (they answer to the operator-wide USD limits), and scope is per (tag, token) **across chains** — you cap your exposure to an asset, not per-chain bookkeeping. The strategy report's risk section shows cap utilization next to budgets.
+Position caps count **NET exposure** with the same weighted-average model every P&L surface uses (the cap can never disagree with what `strategy report` shows): buys add, sells subtract with proportional cost release — reduce the position and room comes back. Enforcement runs post-quote in BOTH execution paths (real `executeTrade` and `executePaperTrade` — the dry-run rejects exactly where real would) and throws `POSITION_CAP_EXCEEDED` with current/adding/cap numbers. Three deliberate rules: **sells are never blocked** (refusing an exit because exposure is "too high" would be actively dangerous), untagged manual trades bypass (they answer to the operator-wide USD limits), and scope is per (tag, token) **across chains** — you cap your exposure to an asset, not per-chain bookkeeping. The strategy report's risk section shows cap utilization next to budgets, the `position_cap_approach` alert rule pages **before** buys start bouncing (`warnPct: 0.8` = warn at 80% utilization — the proactive twin of the hard rejection), and the web Strategy tab renders a deterministic realized-P&L card (cumulative cost-basis gains from `GET /api/gains` — a pure fill walk, so it fits the web surface's zero-oracle discipline).
 
 #### Circuit breaker — alerts that act, not just notify
 

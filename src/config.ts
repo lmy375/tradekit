@@ -154,6 +154,17 @@ function strategyAlertRuleSchema() {
       .strict(),
     z
       .object({
+        type: z.literal("position_cap_approach"),
+        warnPct: z
+          .number()
+          .min(0)
+          .max(1)
+          .describe("Alert when ANY matching positionCaps rule's NET exposure reaches ≥ this fraction of its cap (0.8 = 80%). The proactive twin of the hard POSITION_CAP_EXCEEDED rejection — hear about the ceiling BEFORE a buy bounces off it."),
+        ...common,
+      })
+      .strict(),
+    z
+      .object({
         type: z.literal("funding_runway"),
         thresholdDays: z
           .number()

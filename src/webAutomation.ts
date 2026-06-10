@@ -348,6 +348,35 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── realized gains (deterministic) ────────────────────────
+  // Pure fill-journal walk, no oracle — fits this surface's
+  // zero-network discipline exactly (unlike valuation/runway).
+  app.get(
+    "/api/gains",
+    wrap(async (req, res) => {
+      const { gatherRealizedGains } = await import("./gains.js");
+      const mode = (qStr(req, "mode") as "real" | "paper" | undefined) ?? "real";
+      if (mode !== "real" && mode !== "paper") {
+        throw new ToolError("INVALID_PARAMS", `"mode" must be real | paper.`);
+      }
+      let sinceIso: string | undefined;
+      const since = qStr(req, "since");
+      if (since) {
+        const parsed = parseSinceDuration(since);
+        if (!parsed) throw new ToolError("INVALID_PARAMS", `"since" must be a duration (90d) or ISO timestamp.`);
+        sinceIso = parsed;
+      }
+      const report = await gatherRealizedGains({
+        mode,
+        account: qStr(req, "account"),
+        chain: qStr(req, "chain"),
+        strategy: qStr(req, "strategy"),
+        sinceIso,
+      });
+      res.json({ ok: true, ...report });
+    }),
+  );
+
   // ── signal inbox ──────────────────────────────────────────
   app.get(
     "/api/signals",

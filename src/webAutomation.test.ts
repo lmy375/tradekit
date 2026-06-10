@@ -529,3 +529,33 @@ describe("GET /api/signals", () => {
     openDb().exec("DELETE FROM signal_events");
   });
 });
+
+describe("GET /api/gains", () => {
+  it("serves deterministic per-strategy realizations", async () => {
+    const db = await import("./db.js");
+    db.recordPaperTrade({
+      timestamp: "2026-06-01T00:00:00Z", source_type: "manual", source_id: null,
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "ETH", base_amount: "1",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "2000",
+      price: "2000", slippage_bps: null, strategy: "web-gains", notes: null,
+    });
+    db.recordPaperTrade({
+      timestamp: "2026-06-02T00:00:00Z", source_type: "manual", source_id: null,
+      chain: "base", account: "default", direction: "sell",
+      base_token: WETH, base_symbol: "ETH", base_amount: "1",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "2400",
+      price: "2400", slippage_bps: null, strategy: "web-gains", notes: null,
+    });
+    const r = await get("/api/gains?mode=paper&strategy=web-gains");
+    expect(r.status).toBe(200);
+    expect(r.body.totalGainQuote).toBeCloseTo(400, 6);
+    expect((r.body.records as unknown[]).length).toBe(1);
+    db.openDb().exec("DELETE FROM paper_trades");
+  });
+
+  it("rejects a bad mode", async () => {
+    const r = await get("/api/gains?mode=fantasy");
+    expect(r.status).toBe(400);
+  });
+});

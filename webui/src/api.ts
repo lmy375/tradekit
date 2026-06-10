@@ -500,3 +500,31 @@ export interface EquityCurveResp {
 }
 export const getEquity = (since?: string) =>
   api.get<EquityCurveResp>(`/api/equity${since ? `?since=${since}` : ""}`);
+
+// ── realized gains (deterministic) ───────────────────────────
+
+export interface GainsResp {
+  ok: true;
+  mode: "real" | "paper";
+  records: Array<{
+    at: string;
+    strategy: string;
+    symbol: string | null;
+    soldAmount: number;
+    proceedsQuote: number;
+    costBasisQuote: number;
+    gainQuote: number;
+    txHash: string | null;
+  }>;
+  totalGainQuote: number;
+  totalProceedsQuote: number;
+  totalCostBasisQuote: number;
+  totalUntrackedProceedsQuote: number;
+}
+export const getGains = (params: { strategy?: string; mode?: string; since?: string }) => {
+  const qs = new URLSearchParams();
+  if (params.strategy) qs.set("strategy", params.strategy);
+  if (params.mode) qs.set("mode", params.mode);
+  if (params.since) qs.set("since", params.since);
+  return api.get<GainsResp>(`/api/gains?${qs}`);
+};

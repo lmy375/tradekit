@@ -617,6 +617,56 @@ export const evaluateFundingRunway: EvaluateFn<
   });
 };
 
+/** position_cap_approach — the strategy's net exposure is nearing a
+ *  configured position cap. The proactive twin of the hard
+ *  POSITION_CAP_EXCEEDED rejection: without it the operator learns
+ *  about the ceiling only when a buy bounces off it. Reads the risk
+ *  section's positionCaps utilization (same matcher + walk as the
+ *  enforcement layer — the alert can't disagree with what
+ *  executeTrade will do). */
+export const evaluatePositionCapApproach: EvaluateFn<
+  Extract<StrategyAlertRule, { type: "position_cap_approach" }>
+> = ({ tag, rule, report }) => {
+  const evaluation = (over: Partial<AlertEvaluation>): AlertEvaluation => ({
+    tag,
+    ruleType: rule.type,
+    rule,
+    applicable: false,
+    violated: false,
+    message: "",
+    value: {},
+    ...over,
+  });
+  const caps = report.risk?.positionCaps;
+  if (!caps || caps.length === 0) {
+    return evaluation({ message: "no matching position caps configured" });
+  }
+  let hottest: { token: string; pct: number; axis: "base" | "cost" } | null = null;
+  for (const c of caps) {
+    if (c.basePctUsed != null && (!hottest || c.basePctUsed > hottest.pct)) {
+      hottest = { token: c.token, pct: c.basePctUsed, axis: "base" };
+    }
+    if (c.costPctUsed != null && (!hottest || c.costPctUsed > hottest.pct)) {
+      hottest = { token: c.token, pct: c.costPctUsed, axis: "cost" };
+    }
+  }
+  if (!hottest) return evaluation({ message: "caps configured but no utilization computable" });
+  const violated = hottest.pct >= rule.warnPct * 100;
+  return evaluation({
+    applicable: true,
+    violated,
+    message: violated
+      ? `Position in ${hottest.token} at ${hottest.pct.toFixed(0)}% of its ${hottest.axis} cap — the next buys will start bouncing`
+      : `hottest position ${hottest.token} at ${hottest.pct.toFixed(0)}% of cap (< ${(rule.warnPct * 100).toFixed(0)}%)`,
+    value: {
+      token: hottest.token,
+      pctUsed: hottest.pct,
+      axis: hottest.axis,
+      warnPct: rule.warnPct * 100,
+    },
+  });
+};
+
 const EVALUATORS = {
   staleness: evaluateStaleness,
   slippage_trend: evaluateSlippageTrend,
@@ -627,6 +677,7 @@ const EVALUATORS = {
   trigger_proximity: evaluateTriggerProximity,
   drift_proximity: evaluateDriftProximity,
   funding_runway: evaluateFundingRunway,
+  position_cap_approach: evaluatePositionCapApproach,
 } as const;
 
 /** Evaluate every applicable rule against a single strategy's
@@ -755,6 +806,7 @@ const SEVERITY_BY_RULE: Record<StrategyAlertRule["type"], NotificationEvent["sev
   trigger_proximity: "info",
   drift_proximity: "info",
   funding_runway: "warn",
+  position_cap_approach: "warn",
 };
 
 // ── runner ──────────────────────────────────────────────────
@@ -1113,6 +1165,7 @@ export function sectionsForRules(rules: StrategyAlertRule[]) {
         break;
       case "budget_approach":
       case "drawdown_threshold":
+      case "position_cap_approach":
         needed.add("risk");
         break;
       case "trigger_proximity":
