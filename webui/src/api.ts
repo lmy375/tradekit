@@ -206,3 +206,133 @@ export const postQuote = (body: Record<string, unknown>) =>
   api.post<{ ok: true; result: QuoteResult }>("/api/quote", body);
 export const postTrade = (body: Record<string, unknown>) =>
   api.post<{ ok: true; result: QuoteResult }>("/api/trade", body);
+
+// ── automation API (read-only; src/webAutomation.ts) ─────────
+
+export interface EngineResp {
+  ok: true;
+  running: boolean;
+  status: {
+    pid: number;
+    startedAt: string;
+    updatedAt: string;
+    stopping?: boolean;
+    workers: { name: string; lastTickAt: string | null; ticks: number; failures: number }[];
+  } | null;
+  lock: { active: boolean; reason: string | null; lockedAt: string | null; lockedBy: string | null };
+}
+export const getEngine = () => api.get<EngineResp>("/api/engine");
+
+export interface AutoOrderRow {
+  id: number;
+  status: string;
+  side: string;
+  trigger_type: string;
+  target_price_usd: number | null;
+  trail_pct: number | null;
+  water_mark_usd: number | null;
+  chain: string;
+  account: string;
+  base_symbol: string | null;
+  quote_symbol: string | null;
+  base_amount: string | null;
+  quote_amount: string | null;
+  strategy: string | null;
+  paper: number;
+  created_at: string;
+  expires_at: string | null;
+  on_fill_json: string | null;
+}
+export interface OrderJournalRow {
+  checked_at: string;
+  decision: string;
+  price_usd: number | null;
+  water_mark_usd: number | null;
+  notes: string | null;
+}
+export const getAutoOrders = (status: string) =>
+  api.get<{ ok: true; orders: AutoOrderRow[] }>(`/api/orders?status=${encodeURIComponent(status)}`);
+export const getAutoOrderDetail = (id: number) =>
+  api.get<{ ok: true; order: AutoOrderRow; journal: OrderJournalRow[] }>(`/api/orders/${id}`);
+
+export interface AutoScheduleRow {
+  id: number;
+  status: string;
+  name: string | null;
+  side: string;
+  cron_expr: string;
+  next_run_at: string;
+  run_count: number;
+  max_runs: number | null;
+  base_symbol: string | null;
+  quote_symbol: string | null;
+  base_amount: string | null;
+  quote_amount: string | null;
+  strategy: string | null;
+  paper: number;
+  last_run_at: string | null;
+  last_run_status: string | null;
+  on_fill_json: string | null;
+}
+export interface ScheduleJournalRow {
+  checked_at: string;
+  decision: string;
+  run_number: number | null;
+  tx_hash: string | null;
+  error_code: string | null;
+  notes: string | null;
+}
+export const getAutoSchedules = (status: string) =>
+  api.get<{ ok: true; schedules: AutoScheduleRow[] }>(`/api/schedules?status=${encodeURIComponent(status)}`);
+export const getAutoScheduleDetail = (id: number) =>
+  api.get<{ ok: true; schedule: AutoScheduleRow; journal: ScheduleJournalRow[] }>(`/api/schedules/${id}`);
+
+export interface AutoRebalanceRow {
+  id: number;
+  status: string;
+  name: string | null;
+  targets_json: string;
+  drift_threshold_pct: number;
+  min_trade_usd: number;
+  next_run_at: string;
+  run_count: number;
+  strategy: string | null;
+  paper: number;
+  last_run_at: string | null;
+  last_run_max_drift_pct: number | null;
+}
+export interface RebalanceJournalRow {
+  checked_at: string;
+  decision: string;
+  max_drift_pct: number | null;
+  threshold_pct: number | null;
+  executed_count: number | null;
+  skipped_count: number | null;
+  error_code: string | null;
+}
+export const getAutoRebalance = (status: string) =>
+  api.get<{ ok: true; plans: AutoRebalanceRow[] }>(`/api/rebalance?status=${encodeURIComponent(status)}`);
+export const getAutoRebalanceDetail = (id: number) =>
+  api.get<{ ok: true; plan: AutoRebalanceRow; journal: RebalanceJournalRow[] }>(`/api/rebalance/${id}`);
+
+export interface AutoPlaybookRow {
+  id: number;
+  name: string;
+  status: string;
+  deployed_at: string | null;
+}
+export const getAutoPlaybooks = () => api.get<{ ok: true; playbooks: AutoPlaybookRow[] }>("/api/playbooks");
+
+export interface AlertsResp {
+  ok: true;
+  active: { tag: string; rule_type: string; first_triggered_at: string | null }[];
+  history: { at: string; tag: string; rule_type: string; event: string; severity: string }[];
+}
+export const getAlerts = () => api.get<AlertsResp>("/api/alerts?limit=10");
+
+export interface PaperResp {
+  ok: true;
+  balances: { account: string; chain: string; token: string; balance: string }[];
+  pnl: { strategy: string; fills: number; netQuote: number }[];
+}
+export const getPaper = () => api.get<PaperResp>("/api/paper");

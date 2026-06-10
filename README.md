@@ -2031,6 +2031,7 @@ The server prints a one-time URL with an embedded per-session auth token; open i
 - **Overview** — wallet status + quick info
 - **Holdings** — multi-chain balances with USD
 - **Trade** — execute or simulate from the browser, with size-fraction safety hints
+- **Automation** — the engine's situational view: liveness + lock + per-worker health, currently-firing alerts, orders/schedules/rebalance tables with decision-journal drill-in (rebalance rows render drift as a progress bar toward the threshold), deployed playbooks, the paper book; 15s auto-refresh, read-only by construction
 - **Chart** — TradingView Lightweight Charts driven by OKX public candles
 - **Trades / PnL / Audit** — history tables backed by SQLite
 - **Approvals** — per-row revoke and bulk **Revoke ALL**
