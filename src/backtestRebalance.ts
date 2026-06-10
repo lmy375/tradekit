@@ -456,3 +456,99 @@ export function defaultInitialBalance(args: {
   }
   return out;
 }
+
+// ── parameter sweep ──────────────────────────────────────────
+//
+// The natural question after one backtest is "which threshold /
+// cadence is best for this pair?". The simulator is pure, so sweeping
+// a parameter grid over the SAME fetched series costs zero extra API
+// calls — only CPU. The CLI/MCP layer fetches once and fans out here.
+
+export interface RebalanceSweepVariant {
+  /** Human label, e.g. "drift 5% / every 6h / min $10". */
+  label: string;
+  driftThresholdPct: number;
+  cron: string;
+  minTradeUsd: number;
+  result: RebalanceBacktestResult;
+}
+
+export interface RebalanceSweepOutcome {
+  variants: RebalanceSweepVariant[];
+  /** Index of the highest-PnL variant (ties → first, which is the
+   *  lowest-threshold / tightest-cadence combination by construction).
+   *  Null only when the grid is empty. */
+  winnerIdx: number | null;
+}
+
+/** Grid cap — 3 axes × generous lists can explode; 60 variants of a
+ *  multi-year daily series is already seconds of CPU. The error names
+ *  the fix (trim a list) rather than silently truncating. */
+const MAX_SWEEP_VARIANTS = 60;
+
+export function sweepRebalance(args: {
+  /** Base spec — targets/quoteSymbol/slippage/maxRuns come from here;
+   *  threshold/cron/minTrade are overridden per variant. */
+  spec: RebalanceBacktestSpec;
+  /** Threshold axis. Default: [the spec's threshold]. */
+  thresholds?: number[];
+  /** Cadence axis (cron expressions). Default: [the spec's cron]. */
+  crons?: string[];
+  /** Min-trade axis. Default: [the spec's minTradeUsd]. */
+  minTrades?: number[];
+  initialBalance: SymbolBalance;
+  series: Record<string, PriceSeries>;
+}): RebalanceSweepOutcome {
+  const thresholds = args.thresholds?.length ? args.thresholds : [args.spec.driftThresholdPct ?? 5];
+  const crons = args.crons?.length ? args.crons : [args.spec.cron ?? "0 */6 * * *"];
+  const minTrades = args.minTrades?.length ? args.minTrades : [args.spec.minTradeUsd ?? 10];
+
+  const total = thresholds.length * crons.length * minTrades.length;
+  if (total > MAX_SWEEP_VARIANTS) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `sweep grid has ${total} variants (max ${MAX_SWEEP_VARIANTS}) — trim the threshold/cadence/min-trade lists.`,
+    );
+  }
+  if (total === 0) return { variants: [], winnerIdx: null };
+
+  const variants: RebalanceSweepVariant[] = [];
+  for (const threshold of thresholds) {
+    for (const cron of crons) {
+      for (const minTradeUsd of minTrades) {
+        const spec: RebalanceBacktestSpec = {
+          ...args.spec,
+          driftThresholdPct: threshold,
+          cron,
+          minTradeUsd,
+        };
+        // Validate per-variant so a bad axis value names the variant.
+        const result = simulateRebalance({
+          spec,
+          // simulateRebalance never mutates the input map, but be
+          // explicit: each variant starts from the SAME book.
+          initialBalance: { ...args.initialBalance },
+          series: args.series,
+        });
+        const labelParts = [`drift ${threshold}%`];
+        if (crons.length > 1 || cron !== (args.spec.cron ?? "0 */6 * * *")) labelParts.push(`cron "${cron}"`);
+        if (minTrades.length > 1 || minTradeUsd !== (args.spec.minTradeUsd ?? 10)) labelParts.push(`min $${minTradeUsd}`);
+        variants.push({
+          label: labelParts.join(" / "),
+          driftThresholdPct: threshold,
+          cron,
+          minTradeUsd,
+          result,
+        });
+      }
+    }
+  }
+
+  let winnerIdx: number | null = null;
+  for (let i = 0; i < variants.length; i++) {
+    if (winnerIdx === null || variants[i].result.pnlUsd > variants[winnerIdx].result.pnlUsd) {
+      winnerIdx = i;
+    }
+  }
+  return { variants, winnerIdx };
+}

@@ -503,12 +503,18 @@ BACKTESTING (historical strategy simulation)
                      [--quote-token USDC] [--slippage-bps N] [--max-runs N]
                      [--balance '{"ETH":1,"USDC":2000}' | --initial-usd 10000]
                      [--since 90d] [--chain X] [--json]
+                     [--sweep-thresholds 1,3,5,10] [--sweep-cadences 1h,6h,1d]
+                     [--sweep-min-trades 10,100]
         Multi-asset rebalance backtest — one CoinGecko series per target (stablecoins
         synthesize a flat $1 series). Walks the cron's occurrences across the window,
         fires corrective legs with the live engine's mechanics (sells fund the quote
         anchor, buys draw from it, per-leg min-trade skip, shortfall clamps). Default
         starting book: --initial-usd split at target weights at window-start prices,
         so PnL − hold-PnL is the pure REBALANCING ALPHA vs HODL of the same book.
+        Any --sweep-* flag flips to GRID mode: every threshold×cadence×min-trade
+        combination re-runs over the same fetched series (zero extra API calls),
+        ranked by PnL with a ★ winner; persists one backtest_comparisons row so
+        'backtest compare show <id>' re-renders the table later. Max 60 variants.
   backtest compare <scenarios.json>
                     --balance '{"ETH":1,"USDC":3000}'
                     --since 60d [--chain X] [--json]

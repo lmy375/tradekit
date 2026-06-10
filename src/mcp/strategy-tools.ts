@@ -414,12 +414,15 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
       initial_usd: z.number().positive().optional().describe("Total USD for the default starting book. Default 10000."),
       since: z.string().default("90d").describe("Window — '90d', '6m', or bare days. Max 3650."),
       chain: z.string().optional().describe("Chain (default: active chain)."),
+      sweep_thresholds: z.array(z.number()).optional().describe("SWEEP MODE: drift-threshold axis. Any sweep_* param flips to grid mode — every threshold×cadence×min-trade combination re-runs over the SAME fetched series (no extra API calls). Returns a ranked variant table + persists one backtest_comparisons row (re-render via backtest_compare_show)."),
+      sweep_cadences: z.array(z.string()).optional().describe("SWEEP MODE: cadence axis as duration shorthands (1h, 6h, 1d)."),
+      sweep_min_trades: z.array(z.number()).optional().describe("SWEEP MODE: per-leg min-trade-USD axis."),
     },
     async (input) => {
       try {
         return ok(
           await runTool("backtest_rebalance", rt.opts, input, input.chain, async () => {
-            const { simulateRebalance, validateRebalanceBacktestSpec, constantSeries, defaultInitialBalance } =
+            const { simulateRebalance, validateRebalanceBacktestSpec, constantSeries, defaultInitialBalance, sweepRebalance } =
               await import("../backtestRebalance.js");
             const { fetchPriceSeries: fetchSeries, parseSinceDuration: parseSince } = await import("../backtest.js");
             const config = rt.getConfig();
@@ -471,6 +474,78 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
             const initialBalance = input.balance
               ? Object.fromEntries(Object.entries(input.balance).map(([k, v]) => [k.toUpperCase(), v]))
               : defaultInitialBalance({ spec, series, totalUsd: input.initial_usd });
+
+            // Sweep mode: grid over the same series, persist each
+            // variant + one comparison row, return ranked variants.
+            if (input.sweep_thresholds?.length || input.sweep_cadences?.length || input.sweep_min_trades?.length) {
+              const outcome = sweepRebalance({
+                spec,
+                thresholds: input.sweep_thresholds,
+                crons: input.sweep_cadences?.map((c) => durationToCron(c)),
+                minTrades: input.sweep_min_trades,
+                initialBalance,
+                series,
+              });
+              const { insertBacktestComparison } = await import("../db.js");
+              const baseSym = targets.map((t) => t.symbol).join("+");
+              const runIds: number[] = [];
+              const variants = outcome.variants.map((v) => {
+                const runId = insertBacktestRun({
+                  strategyType: "rebalance",
+                  chain: profile.name,
+                  baseSymbol: baseSym,
+                  quoteSymbol,
+                  specJson: JSON.stringify({ ...spec, driftThresholdPct: v.driftThresholdPct, cron: v.cron, minTradeUsd: v.minTradeUsd }),
+                  initialBalanceJson: JSON.stringify(initialBalance),
+                  finalBalanceJson: JSON.stringify(v.result.finalBalance),
+                  windowStart: v.result.windowStart,
+                  windowEnd: v.result.windowEnd,
+                  points: totalPoints,
+                  firesJson: JSON.stringify(v.result.fires),
+                  fireCount: v.result.fires.length,
+                  pnlUsd: v.result.pnlUsd,
+                  holdPnlUsd: v.result.holdPnlUsd,
+                  notes: v.result.notes.join("; ") || null,
+                });
+                runIds.push(runId);
+                return {
+                  scenarioName: v.label,
+                  runId,
+                  pnlUsd: v.result.pnlUsd,
+                  holdPnlUsd: v.result.holdPnlUsd,
+                  vsHoldUsd: v.result.pnlUsd - v.result.holdPnlUsd,
+                  fireCount: v.result.fires.length,
+                  cascadeCount: 0,
+                  finalUsd: v.result.finalUsd,
+                  initialUsd: v.result.initialUsd,
+                  perStrategy: [],
+                  hadAnyFill: v.result.fires.length > 0,
+                };
+              });
+              const first = outcome.variants[0]?.result;
+              const comparisonId = insertBacktestComparison({
+                name: `rebalance-sweep-${baseSym}`,
+                scenariosJson: JSON.stringify(outcome.variants.map((v) => ({ name: v.label, driftThresholdPct: v.driftThresholdPct, cron: v.cron, minTradeUsd: v.minTradeUsd }))),
+                resultsJson: JSON.stringify(variants),
+                runIds,
+                baseSymbol: baseSym,
+                quoteSymbol,
+                chain: profile.name,
+                windowStart: first?.windowStart ?? new Date().toISOString(),
+                windowEnd: first?.windowEnd ?? new Date().toISOString(),
+                winnerIdx: outcome.winnerIdx,
+              });
+              return {
+                ok: true,
+                sweep: true,
+                comparison_id: comparisonId,
+                targets,
+                quote_symbol: quoteSymbol,
+                winner_idx: outcome.winnerIdx,
+                winner: outcome.winnerIdx != null ? variants[outcome.winnerIdx].scenarioName : null,
+                variants,
+              };
+            }
 
             const result = simulateRebalance({ spec, initialBalance, series });
 

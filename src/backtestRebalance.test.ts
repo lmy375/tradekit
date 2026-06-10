@@ -281,3 +281,81 @@ describe("validation + helpers", () => {
     expect(bal["USDC"]).toBeCloseTo(4000, 9);
   });
 });
+
+// ── parameter sweep ──────────────────────────────────────────
+
+describe("sweepRebalance", () => {
+  it("runs the cartesian grid over the same series + picks the max-PnL winner", async () => {
+    const { sweepRebalance } = await import("./backtestRebalance.js");
+    // Mean-reverting chop: tight thresholds harvest the swings, a
+    // loose threshold never fires.
+    const eth = series([2000, 2400, 2000, 2400, 2000, 2400, 2000]);
+    const out = sweepRebalance({
+      spec: { ...SPEC_60_40 },
+      thresholds: [3, 50],
+      crons: ["0 0 * * *"],
+      minTrades: [1, 10],
+      initialBalance: { ETH: 3, USDC: 4000 },
+      series: { ETH: eth, USDC: usdcFlat(7) },
+    });
+    expect(out.variants).toHaveLength(4); // 2 thresholds × 1 cron × 2 minTrades
+    const tight = out.variants.find((v) => v.driftThresholdPct === 3 && v.minTradeUsd === 1)!;
+    const loose = out.variants.find((v) => v.driftThresholdPct === 50 && v.minTradeUsd === 1)!;
+    expect(tight.result.fires.length).toBeGreaterThan(0);
+    expect(loose.result.fires.length).toBe(0);
+    // Chop favors rebalancing: the tight variant beats never-firing.
+    expect(tight.result.pnlUsd).toBeGreaterThan(loose.result.pnlUsd);
+    expect(out.winnerIdx).not.toBeNull();
+    expect(out.variants[out.winnerIdx!].driftThresholdPct).toBe(3);
+  });
+
+  it("each variant starts from the SAME initial book (no cross-variant bleed)", async () => {
+    const { sweepRebalance } = await import("./backtestRebalance.js");
+    const out = sweepRebalance({
+      spec: { ...SPEC_60_40 },
+      thresholds: [5, 5.000001], // near-identical variants must produce identical results
+      initialBalance: { ETH: 3, USDC: 4000 },
+      series: { ETH: series([2000, 4000, 2000]), USDC: usdcFlat(3) },
+    });
+    expect(out.variants[0].result.pnlUsd).toBeCloseTo(out.variants[1].result.pnlUsd, 6);
+    expect(out.variants[0].result.fires.length).toBe(out.variants[1].result.fires.length);
+  });
+
+  it("defaults each missing axis to the base spec's value (single variant)", async () => {
+    const { sweepRebalance } = await import("./backtestRebalance.js");
+    const out = sweepRebalance({
+      spec: { ...SPEC_60_40, driftThresholdPct: 7 },
+      initialBalance: { ETH: 3, USDC: 4000 },
+      series: { ETH: series([2000, 2000]), USDC: usdcFlat(2) },
+    });
+    expect(out.variants).toHaveLength(1);
+    expect(out.variants[0].driftThresholdPct).toBe(7);
+    expect(out.variants[0].label).toContain("drift 7%");
+  });
+
+  it("rejects grids beyond the variant cap with an actionable error", async () => {
+    const { sweepRebalance } = await import("./backtestRebalance.js");
+    expect(() =>
+      sweepRebalance({
+        spec: { ...SPEC_60_40 },
+        thresholds: Array.from({ length: 10 }, (_, i) => i + 1),
+        crons: ["0 0 * * *", "0 */6 * * *", "0 */2 * * *"],
+        minTrades: [1, 10, 100],
+        initialBalance: {},
+        series: {},
+      }),
+    ).toThrow(/90 variants \(max 60\)/);
+  });
+
+  it("a bad axis value fails with the variant's threshold named", async () => {
+    const { sweepRebalance } = await import("./backtestRebalance.js");
+    expect(() =>
+      sweepRebalance({
+        spec: { ...SPEC_60_40 },
+        thresholds: [5, 0],
+        initialBalance: { ETH: 3, USDC: 4000 },
+        series: { ETH: series([2000]), USDC: usdcFlat(1) },
+      }),
+    ).toThrow(/driftThresholdPct/);
+  });
+});

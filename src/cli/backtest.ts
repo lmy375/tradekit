@@ -83,6 +83,19 @@ function parseBalance(raw: string | undefined): SymbolBalance {
   return out;
 }
 
+function parseNumberList(raw: string | undefined, flagName: string): number[] | undefined {
+  if (!raw) return undefined;
+  const parts = raw.split(",").map((x) => x.trim()).filter(Boolean);
+  const out = parts.map((x) => {
+    const n = parseFloat(x);
+    if (!Number.isFinite(n)) {
+      throw new ToolError("INVALID_PARAMS", `${flagName} entry "${x}" is not a number.`);
+    }
+    return n;
+  });
+  return out.length > 0 ? out : undefined;
+}
+
 function fmt(n: number, fractionDigits = 4): string {
   if (!Number.isFinite(n)) return "?";
   if (Math.abs(n) >= 1) return n.toFixed(fractionDigits);
@@ -999,9 +1012,126 @@ export async function backtestRebalanceCommand(flags: Record<string, string>) {
         totalUsd: parseFloatFlag(flags["initial-usd"], "--initial-usd", { min: 0 }) ?? undefined,
       });
 
+  const baseSymbol = targets.map((t) => t.symbol).join("+");
+
+  // ── sweep mode ─────────────────────────────────────────────
+  // Any --sweep-* axis flips to grid mode: every variant re-runs the
+  // pure simulator over the SAME fetched series (zero extra CoinGecko
+  // calls), each variant persists as a backtest_runs row, and the
+  // grid persists as ONE backtest_comparisons row — so the existing
+  // `backtest compare show/list` render sweeps for free.
+  const sweepThresholds = parseNumberList(flags["sweep-thresholds"], "--sweep-thresholds");
+  const sweepCadences = flags["sweep-cadences"]
+    ? flags["sweep-cadences"].split(",").map((c) => durationToCron(c.trim()))
+    : undefined;
+  const sweepMinTrades = parseNumberList(flags["sweep-min-trades"], "--sweep-min-trades");
+  if (sweepThresholds || sweepCadences || sweepMinTrades) {
+    const { sweepRebalance } = await import("../backtestRebalance.js");
+    const outcome = sweepRebalance({
+      spec,
+      thresholds: sweepThresholds,
+      crons: sweepCadences,
+      minTrades: sweepMinTrades,
+      initialBalance,
+      series,
+    });
+
+    const runIds: number[] = [];
+    const results = outcome.variants.map((v) => {
+      const runId = insertBacktestRun({
+        strategyType: "rebalance",
+        chain: profile.name,
+        baseSymbol,
+        quoteSymbol,
+        specJson: JSON.stringify({ ...spec, driftThresholdPct: v.driftThresholdPct, cron: v.cron, minTradeUsd: v.minTradeUsd }),
+        initialBalanceJson: JSON.stringify(initialBalance),
+        finalBalanceJson: JSON.stringify(v.result.finalBalance),
+        windowStart: v.result.windowStart,
+        windowEnd: v.result.windowEnd,
+        points: totalPoints,
+        firesJson: JSON.stringify(v.result.fires),
+        fireCount: v.result.fires.length,
+        pnlUsd: v.result.pnlUsd,
+        holdPnlUsd: v.result.holdPnlUsd,
+        notes: v.result.notes.join("; ") || null,
+      });
+      runIds.push(runId);
+      // ScenarioResult shape — keeps `backtest compare show` rendering
+      // sweep rows without a special case.
+      return {
+        scenarioName: v.label,
+        runId,
+        pnlUsd: v.result.pnlUsd,
+        holdPnlUsd: v.result.holdPnlUsd,
+        vsHoldUsd: v.result.pnlUsd - v.result.holdPnlUsd,
+        fireCount: v.result.fires.length,
+        cascadeCount: 0,
+        finalUsd: v.result.finalUsd,
+        initialUsd: v.result.initialUsd,
+        perStrategy: [],
+        hadAnyFill: v.result.fires.length > 0,
+      };
+    });
+
+    const first = outcome.variants[0]?.result;
+    const { insertBacktestComparison } = await import("../db.js");
+    const comparisonId = insertBacktestComparison({
+      name: `rebalance-sweep-${baseSymbol}`,
+      scenariosJson: JSON.stringify(
+        outcome.variants.map((v) => ({
+          name: v.label,
+          driftThresholdPct: v.driftThresholdPct,
+          cron: v.cron,
+          minTradeUsd: v.minTradeUsd,
+        })),
+      ),
+      resultsJson: JSON.stringify(results),
+      runIds,
+      baseSymbol,
+      quoteSymbol,
+      chain: profile.name,
+      windowStart: first?.windowStart ?? new Date().toISOString(),
+      windowEnd: first?.windowEnd ?? new Date().toISOString(),
+      winnerIdx: outcome.winnerIdx,
+    });
+
+    if (flags["json"] != null) {
+      printJson({
+        ok: true,
+        comparison_id: comparisonId,
+        strategy_type: "rebalance",
+        sweep: true,
+        chain: profile.name,
+        targets,
+        quote_symbol: quoteSymbol,
+        winner_idx: outcome.winnerIdx,
+        winner: outcome.winnerIdx != null ? results[outcome.winnerIdx].scenarioName : null,
+        variants: results,
+      });
+      return;
+    }
+    const { renderComparison } = await import("../backtestCompare.js");
+    console.log(
+      renderComparison({
+        comparisonId,
+        name: `rebalance-sweep-${baseSymbol}`,
+        chain: profile.name,
+        baseSymbol,
+        quoteSymbol,
+        windowStart: first?.windowStart ?? "?",
+        windowEnd: first?.windowEnd ?? "?",
+        points: totalPoints,
+        scenarios: results,
+        winnerIdx: outcome.winnerIdx,
+      }),
+    );
+    console.log("");
+    console.log(`Re-render later: tradekit backtest compare show ${comparisonId}`);
+    return;
+  }
+
   const result = simulateRebalance({ spec, initialBalance, series });
 
-  const baseSymbol = targets.map((t) => t.symbol).join("+");
   const rowId = insertBacktestRun({
     strategyType: "rebalance",
     chain: profile.name,
