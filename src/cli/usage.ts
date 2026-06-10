@@ -463,10 +463,14 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy alerts show-rules [--json]
         Print the configured rules + which active strategy tags each one matches.
         Validates a fresh config change before running the watcher.
-  strategy alerts run [--once | --watch N] [--tag X] [--json]
+  strategy alerts run [--once | --watch N] [--tag X] [--dry-run] [--json]
         Run the watcher: enumerate strategies, evaluate every applicable rule,
         emit notifications on OK↔active transitions. --once is the default;
         --watch N runs forever at N-second cadence (N ≥ 5).
+        v37 --dry-run: the threshold-tuning loop — evaluate + print per-rule
+        verdicts (✓ ok / ✗ would fire / · inapplicable) with ZERO side
+        effects: no notifications, no state writes, no journal, no circuit
+        breaker. The next real run still sees the fresh ok→active edge.
         CIRCUIT BREAKER: a rule with "action": "pause" doesn't just notify on
         fire — it bulk-pauses every primitive the strategy owns (same machinery
         as 'strategy pause') and emits a critical *.circuit_breaker notification

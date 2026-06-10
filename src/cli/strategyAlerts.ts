@@ -203,12 +203,21 @@ export async function strategyAlertsRunCommand(flags: Record<string, string>) {
   const watchSecs = parseWatch(flags);
   const logger = createLogger({ stderrLevel: flags["json"] === "true" ? "silent" : "info" });
 
+  const dryRun = flags["dry-run"] === "true";
   const runOnce = async () => {
-    const r = await runAlertTick({ config, logger, onlyTags });
+    const r = await runAlertTick({ config, logger, onlyTags, dryRun });
     if (flags["json"] === "true") {
-      printJson({ ok: true, tick: serializeTick(r) });
+      printJson({ ok: true, dryRun, tick: serializeTick(r) });
     } else {
+      if (dryRun) console.log("DRY-RUN — evaluations only; no notifications, no state writes, no breaker.\n");
       renderTickSummary(r);
+      if (dryRun) {
+        // The tuning loop's payload: per-rule verdicts right now.
+        for (const ev of r.evaluations) {
+          const mark = !ev.applicable ? "·" : ev.violated ? "✗" : "✓";
+          console.log(`  ${mark} ${ev.tag} / ${ev.ruleType}${ev.message ? ` — ${ev.message}` : ""}`);
+        }
+      }
     }
     return r;
   };

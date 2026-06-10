@@ -1425,3 +1425,59 @@ describe("evaluateFundingRunway — gas buckets", () => {
     expect(ev.value.kind).toBe("gas"); // 4d < 20d
   });
 });
+
+// ── v37: dry-run ─────────────────────────────────────────────
+
+describe("runAlertTick — dry-run", () => {
+  it("counts would-be fires with ZERO side effects (no notify, no state, no journal, no breaker)", async () => {
+    seedBreakerFixture2("dry-test");
+    const { getOrderById, listAlertEvents: lae } = await import("./db.js");
+    const config = baseConfig({
+      enabled: true,
+      rules: [{ type: "slippage_trend", baselineBps: 50, alertMultiplier: 1.5, minSampleSize: 5, action: "pause" } as never],
+    });
+    const notifyFn = vi.fn();
+    const dry = await runAlertTick({
+      config: config as never, logger: silentLogger(), notifyFn, onlyTags: ["dry-test"], dryRun: true,
+    });
+    expect(dry.fired).toBe(1); // the would-be fire is visible…
+    expect(notifyFn).not.toHaveBeenCalled(); // …but nothing was sent
+    expect(getStrategyAlertState("dry-test", "slippage_trend")).toBeNull(); // no state row
+    expect(lae({ tag: "dry-test" })).toHaveLength(0); // no journal
+    expect(dry.breakers).toHaveLength(0); // breaker never engaged
+    // The armed order is still ACTIVE — pause never ran.
+    const orders = (await import("./db.js")).listOrders({ status: "active", strategy: "dry-test" });
+    expect(orders).toHaveLength(1);
+
+    // The REAL run afterwards still sees the fresh ok→active edge.
+    const real = await runAlertTick({
+      config: config as never, logger: silentLogger(), notifyFn, onlyTags: ["dry-test"],
+    });
+    expect(real.fired).toBe(1);
+    expect(notifyFn).toHaveBeenCalled();
+  });
+
+  function seedBreakerFixture2(tag: string) {
+    const ETH2 = "0x4200000000000000000000000000000000000006";
+    const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    insertOrder({
+      side: "sell", trigger_type: "price_below", target_price_usd: 1900, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: ETH2, base_symbol: "ETH", quote_token: USDC2, quote_symbol: "USDC",
+      base_amount: "1", quote_amount: null, slippage_bps: 50, auto_slippage: false,
+      expires_at: null, strategy: tag, note: null, group_id: null,
+    });
+    for (let i = 0; i < 6; i++) {
+      insertTrade({
+        timestamp: `2026-05-${20 + i}T00:00:00Z`,
+        chain: "base", account: "default", direction: "buy",
+        base_token: ETH2, base_symbol: "ETH", base_amount: "0.1",
+        quote_token: USDC2, quote_symbol: "USDC", quote_amount: "250",
+        price: "2500", tx_hash: `0xdry${i}`, status: "success",
+        gas_used: null, gas_price_wei: null, gas_cost_native: null,
+        aggregator: "kyberswap", fee_tier: null, notes: null,
+        strategy: tag, realized_slippage_bps: 200,
+      });
+    }
+  }
+});

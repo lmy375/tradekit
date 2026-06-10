@@ -649,6 +649,8 @@ Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) 
 
 **Operational pattern.** Run `strategy alerts run --watch 60` as a sidecar to the engine supervisor. The watcher is a read-side process — it builds cheap section-filtered `StrategyReport`s, evaluates rules, dispatches notifications, and writes the dedup state. It never submits trades; the only engine state it can touch is the non-destructive pause flip when a circuit-breaker rule fires. Failure modes stay bounded: a watcher crash never affects the trading engine, and vice versa.
 
+**Threshold tuning without consequences (v37).** `strategy alerts run --dry-run` evaluates every applicable rule and prints per-rule verdicts (`✗ dca-test / slippage_trend — avg 200bps ≥ 75bps`) with **zero side effects** — no notifications, no state rows, no journal entries, and critically no circuit breaker. Change a rule in config, dry-run, see exactly what would fire right now; the next real run still sees the fresh ok→active edge because nothing was recorded.
+
 **Resetting after acknowledgment.** When the operator has investigated + addressed an alert, `tradekit strategy alerts reset --tag X --rule Y` clears the state row so the rule re-arms. The next violation emits a fresh fire notification — useful when the underlying issue gets re-triggered later.
 
 #### Emergency stop — `tradekit panic`

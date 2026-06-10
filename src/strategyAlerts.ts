@@ -771,6 +771,11 @@ export interface RunAlertTickArgs {
   notifyFn?: typeof tryNotify;
   /** Inject "now" — defaults to new Date(). */
   nowFn?: () => Date;
+  /** v37: evaluate + classify transitions WITHOUT side effects — no
+   *  notifications, no state writes, no journal rows, no circuit
+   *  breaker. The threshold-tuning loop: change a rule, dry-run, see
+   *  what WOULD fire right now. */
+  dryRun?: boolean;
   /** Inject the report builder — defaults to the real
    *  buildStrategyReport. Tests override to skip the live price
    *  lookup. */
@@ -874,6 +879,16 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
       const ev = t.evaluation;
       const lastValueJson = ev.applicable ? JSON.stringify(ev.value) : null;
       const lastEvaluatedAt = now.toISOString();
+      // v37 dry-run: count the WOULD-BE transitions, touch nothing —
+      // no notify, no state row (so the real run still sees the same
+      // ok→active edge), no journal, no breaker.
+      if (args.dryRun) {
+        if (t.kind === "fire") report.fired += 1;
+        else if (t.kind === "resolve") report.resolved += 1;
+        else if (t.kind === "still_active") report.stillActive += 1;
+        else if (t.kind === "skip") report.skipped += 1;
+        continue;
+      }
       switch (t.kind) {
         case "fire": {
           report.fired += 1;
