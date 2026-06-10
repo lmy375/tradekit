@@ -81,6 +81,7 @@ import {
 import { editOrder, validateOrderEdit, type OrderEditChanges } from "./orderEdit.js";
 import { editSchedule, validateScheduleEdit, type ScheduleEditChanges } from "./scheduleEdit.js";
 import { editRebalancePlan, validateRebalanceEdit, type RebalanceEditChanges } from "./rebalanceEdit.js";
+import { parseOnFillSpec } from "./scheduleHooks.js";
 import { loadConfig, resolveProfile, type Config } from "./config.js";
 import { resolveTradePair } from "./chains.js";
 import {
@@ -265,6 +266,7 @@ const SCHEDULE_EDITABLE_SPEC_FIELDS = new Set([
   "endAt",
   "maxRuns",
   "note",
+  "onFill", // scheduleEdit revalidates the hook against the live pair
 ]);
 
 /** Rebalance gained in-place edit too (rebalanceEdit.ts) — frozen
@@ -880,6 +882,12 @@ function scheduleEditChangesFromSpec(entry: ScheduleSpec, changedFields: string[
       case "note":
         ch.note = entry.note ?? null;
         break;
+      case "onFill":
+        // null removes an existing hook; an object replaces it (the
+        // edit validator re-renders fake fill data through the order
+        // validators before accepting).
+        ch.onFill = entry.onFill ?? null;
+        break;
     }
   }
   return ch;
@@ -929,6 +937,16 @@ function preValidate(args: {
       resolveTradePair(profile, s.base, s.quote);
       if (!s.cron && !s.every) {
         throw new ToolError("INVALID_PARAMS", `${item.localId}: schedule requires cron or every`);
+      }
+      if (s.onFill != null) {
+        // Full chain-aware validation (fake-fill render) happens in
+        // createScheduleRow during apply; the structural gate here
+        // keeps a malformed hook from failing AFTER cancellations.
+        try {
+          parseOnFillSpec(s.onFill);
+        } catch (e) {
+          throw new ToolError("INVALID_PARAMS", `${item.localId}: onFill — ${(e as Error).message}`);
+        }
       }
     } else if (entry.type === "rebalance") {
       const r = entry as RebalanceSpec;

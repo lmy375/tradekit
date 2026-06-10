@@ -457,10 +457,14 @@ tradekit playbook destroy 1                       # cancel every owned primitive
     { "id": "trail", "type": "order", "side": "sell", "trigger": "trailing", "trailPct": 5, "baseAmount": 1, "base": "ETH", "quote": "USDC" },
     { "id": "sl",    "type": "order", "side": "sell", "trigger": "price_below", "price": 2700, "baseAmount": 1, "base": "ETH", "quote": "USDC", "group": "bracket" },
     { "id": "tp",    "type": "order", "side": "sell", "trigger": "price_above", "price": 4000, "baseAmount": 1, "base": "ETH", "quote": "USDC", "group": "bracket" },
-    { "id": "dca",   "type": "schedule", "side": "buy", "every": "7d", "quoteAmount": 100, "base": "ETH", "quote": "USDC" }
+    { "id": "dca",   "type": "schedule", "side": "buy", "every": "7d", "quoteAmount": 100, "base": "ETH", "quote": "USDC",
+      "onFill": { "type": "createOrder", "spec": { "side": "sell", "trigger": "trailing", "trailPct": 5,
+                  "base": "ETH", "quote": "USDC", "baseAmount": "{{filled.baseAmount}}" } } }
   ]
 }
 ```
+
+**Post-fill hooks are first-class spec fields.** The `dca` entry above declares the iter27 `on_fill` hook inline: every weekly fire auto-creates a trailing-stop on exactly the slice just bought. Pre-this, the declarative format couldn't express "DCA + auto-bracket" — the single most common composite strategy — and operators had to deploy, then hand-edit each schedule with `schedule edit --on-fill`. Hook `{{filled.X}}` placeholders are lowercase-dotted, so they pass through the (uppercase-only) playbook template renderer untouched — a template can parameterize the hook's `trailPct` with `{{TRAIL}}` while leaving `{{filled.baseAmount}}` for the engine. `playbook replace` treats `onFill` as an in-place-editable field (run counters survive a hook change); `backtest playbook` notes that hook-created follow-up orders are not simulated.
 
 **Atomic deploy in 4 phases.**
 1. *Validate*: parse the JSON, structurally validate every strategy entry, resolve chain/account/token symbols against the live config. No DB writes — failures surface every error in one message so the operator fixes the file once.

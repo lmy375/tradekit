@@ -439,6 +439,9 @@ PLAYBOOKS (declarative strategy bundles)
         order/schedule/rebalance list --strategy playbook:N.
         OCO group names are namespaced to pb<id>-<localname> so two playbooks with the
         same local group don't cross-cancel.
+        Schedule entries can declare post-fill hooks inline ("onFill": {"type":"createOrder",
+        "spec": {...}} — same shape as schedule create --on-fill, {{filled.X}} placeholders
+        supported); validated structurally at parse + chain-aware at deploy.
         For templates: declare {{vars}} in the JSON, supply via --var NAME=VALUE (repeatable)
         or --vars-file PATH (JSON object). --var overrides --vars-file on conflict.
   playbook list [--status all|deploying|deployed|destroyed|failed] [--limit N] [--json]
@@ -456,7 +459,7 @@ PLAYBOOKS (declarative strategy bundles)
                    [--fresh-state] [--yes] [--json]
         Atomically apply a new playbook spec. Modified primitives whose changes are all
         in-place editable (price, trailPct, amounts, slippage, expiry/end, maxRuns, note,
-        cadence) are EDITED via the same machinery as 'order edit' / 'schedule edit' —
+        cadence, onFill hook) are EDITED via the same machinery as 'order edit' / 'schedule edit' —
         trailing HWM, run counters, and journal continuity survive. Changes to frozen
         fields (OCO group, chain, account, schedule startAt/name) force cancel+recreate;
         recreated schedules/rebalance plans still carry run_count so max_runs accounting

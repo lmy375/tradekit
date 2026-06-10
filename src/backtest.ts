@@ -705,6 +705,15 @@ export function simulatePlaybook(args: {
   const fires: PlaybookBacktestFire[] = [];
   const notes: string[] = [];
 
+  // Post-fill hooks fire follow-up orders in the LIVE engine, but the
+  // simulator doesn't model them (the hook's child order depends on
+  // fill data the sim doesn't fabricate). Surface that explicitly so
+  // operators don't read the backtest as covering the bracket legs.
+  const hookCount = spec.strategies.filter((st) => st.type === "schedule" && st.onFill != null).length;
+  if (hookCount > 0) {
+    notes.push(`${hookCount} schedule(s) declare on_fill hooks — hook-created follow-up orders are NOT simulated`);
+  }
+
   for (const pt of series.points) {
     // Order matters: orders evaluate first, then schedules — matches
     // the live engine where orders tick more frequently than schedules.

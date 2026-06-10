@@ -40,6 +40,7 @@ import { resolveProfile } from "./config.js";
 import { resolveTradePair } from "./chains.js";
 import { createOrderRow, cancelOrderById, type CreateOrderArgs } from "./orders.js";
 import { createScheduleRow, cancelScheduleById, type CreateScheduleArgs } from "./schedules.js";
+import { parseOnFillSpec } from "./scheduleHooks.js";
 import { createRebalancePlanRow, cancelRebalancePlanById, type CreateRebalancePlanArgs } from "./rebalance.js";
 import {
   insertPlaybook,
@@ -99,6 +100,14 @@ export type ScheduleSpec = {
   chain?: string;
   account?: string;
   note?: string;
+  /** Post-fill hook (iter27 schedule on_fill): auto-create a follow-up
+   *  order after each successful fire. Same shape `schedule create
+   *  --on-fill` takes — { type: "createOrder", spec: { side, trigger,
+   *  ... } } with `{{filled.X}}` template substitution. Structurally
+   *  validated at parse time; the full chain-aware validation (token
+   *  resolution, fake-fill render through the order validators) runs
+   *  at deploy time inside createScheduleRow. */
+  onFill?: unknown;
 };
 
 export type RebalanceSpec = {
@@ -308,6 +317,17 @@ function validateScheduleSpec(s: Record<string, unknown>, prefix: string, errors
   }
   if (s.maxRuns != null && (typeof s.maxRuns !== "number" || !Number.isInteger(s.maxRuns) || s.maxRuns <= 0)) {
     errors.push(`${prefix}.maxRuns: must be positive integer`);
+  }
+  if (s.onFill != null) {
+    // Structural gate only — parseOnFillSpec checks the shape (type:
+    // "createOrder", spec.side/trigger/amounts) without touching the
+    // chain. Token resolution + fake-fill rendering happen at deploy
+    // time so a template spec with {{VAR}} placeholders still parses.
+    try {
+      parseOnFillSpec(s.onFill);
+    } catch (e) {
+      errors.push(`${prefix}.onFill: ${(e as Error).message.replace(/\n\s*/g, " ")}`);
+    }
   }
 }
 
@@ -614,6 +634,7 @@ export function createOnePrimitive(args: {
         maxRuns: entry.maxRuns,
         strategy: strategyTag,
         note: entry.note,
+        onFill: entry.onFill,
         paper,
       };
       const row = createScheduleRow(createArgs, config);

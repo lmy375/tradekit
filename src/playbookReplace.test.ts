@@ -809,3 +809,94 @@ describe("replacePlaybook v2 — paper inference", () => {
     expect(tp.paper).toBe(0);
   });
 });
+
+// ── on_fill hooks through replace ────────────────────────────
+
+describe("replacePlaybook — on_fill hooks", () => {
+  const HOOK = {
+    type: "createOrder",
+    spec: {
+      side: "sell",
+      trigger: "trailing",
+      trailPct: 5,
+      base: "ETH",
+      quote: "USDC",
+      baseAmount: "{{filled.baseAmount}}",
+    },
+  };
+
+  function dcaSpec(onFill?: unknown) {
+    return parsePlaybookSpec({
+      name: "hook-replace",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC", ...(onFill !== undefined ? { onFill } : {}) },
+      ],
+    });
+  }
+
+  it("adding a hook is an in-place EDIT — run counters preserved, on_fill_json set", () => {
+    const deploy = deployPlaybook({ spec: dcaSpec(), sourcePath: null });
+    const db = openDb();
+    const schedId = getPlaybookDetail(deploy.playbookId).schedules[0].id!;
+    db.prepare(`UPDATE schedules SET run_count = 3 WHERE id = ?`).run(schedId);
+
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: dcaSpec(HOOK), newSourcePath: null });
+
+    expect(result.edited).toEqual([{ type: "schedule", rowId: schedId, localId: "dca", fields: ["onFill"] }]);
+    expect(result.cancelled).toEqual([]);
+    const after = getPlaybookDetail(deploy.playbookId).schedules[0];
+    expect(after.id).toBe(schedId);
+    expect(after.run_count).toBe(3);
+    expect(JSON.parse(after.on_fill_json!)).toEqual(HOOK);
+  });
+
+  it("removing the hook edits on_fill_json back to null", () => {
+    const deploy = deployPlaybook({ spec: dcaSpec(HOOK), sourcePath: null });
+    const schedId = getPlaybookDetail(deploy.playbookId).schedules[0].id!;
+
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: dcaSpec(), newSourcePath: null });
+
+    expect(result.edited).toEqual([{ type: "schedule", rowId: schedId, localId: "dca", fields: ["onFill"] }]);
+    const after = getPlaybookDetail(deploy.playbookId).schedules[0];
+    expect(after.on_fill_json).toBeNull();
+  });
+
+  it("a structurally-bad hook in the new spec aborts BEFORE any cancellation", () => {
+    const deploy = deployPlaybook({
+      spec: parsePlaybookSpec({
+        name: "hook-prevalidate",
+        chain: "base",
+        account: "default",
+        strategies: [
+          // startAt makes the modified entry a RECREATE (frozen field),
+          // routing the new schedule through preValidate's create path.
+          { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+        ],
+      }),
+      sourcePath: null,
+    });
+    const schedId = getPlaybookDetail(deploy.playbookId).schedules[0].id!;
+
+    const badSpec = parsePlaybookSpec({
+      name: "hook-prevalidate",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC", startAt: "2027-01-01T00:00:00.000Z" },
+      ],
+    });
+    // Hand the parsed spec a bad hook AFTER parse (simulating a spec
+    // that slipped past structural parse, e.g. via direct API use).
+    (badSpec.strategies[0] as { onFill?: unknown }).onFill = { type: "bogus" };
+
+    expect(() =>
+      replacePlaybook({ playbookId: deploy.playbookId, newSpec: badSpec, newSourcePath: null }),
+    ).toThrow(/onFill/);
+    // Old schedule untouched — still active.
+    const after = getPlaybookDetail(deploy.playbookId).schedules[0];
+    expect(after.id).toBe(schedId);
+    expect(after.status).toBe("active");
+  });
+});

@@ -608,3 +608,111 @@ describe("full lifecycle", () => {
     expect(playbookCountsByStatus().destroyed).toBe(1);
   });
 });
+
+// ── schedule on_fill hooks in playbook specs ─────────────────
+
+describe("playbook on_fill hooks", () => {
+  const HOOK = {
+    type: "createOrder",
+    spec: {
+      side: "sell",
+      trigger: "trailing",
+      trailPct: 5,
+      base: "ETH",
+      quote: "USDC",
+      baseAmount: "{{filled.baseAmount}}",
+      note: "bracket after fire {{filled.fireNumber}}",
+    },
+  };
+
+  function dcaWithHook(onFill: unknown = HOOK) {
+    return {
+      name: "dca-with-hook",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC", onFill },
+      ],
+    };
+  }
+
+  it("parses a schedule with a valid hook", () => {
+    const spec = parsePlaybookSpec(dcaWithHook());
+    const sched = spec.strategies[0] as { onFill?: unknown };
+    expect(sched.onFill).toEqual(HOOK);
+  });
+
+  it("rejects a structurally-invalid hook with the strategies[N].onFill path", () => {
+    let err: Error | null = null;
+    try {
+      parsePlaybookSpec(dcaWithHook({ type: "bogus", spec: {} }));
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err?.message).toContain("strategies[0].onFill");
+    expect(err?.message).toContain("createOrder");
+  });
+
+  it("deploy persists the hook to the schedule row's on_fill_json", () => {
+    const spec = parsePlaybookSpec(dcaWithHook());
+    const result = deployPlaybook({ spec, sourcePath: null });
+    const detail = getPlaybookDetail(result.playbookId);
+    expect(detail.schedules).toHaveLength(1);
+    const persisted = JSON.parse(detail.schedules[0].on_fill_json!);
+    expect(persisted).toEqual(HOOK);
+  });
+
+  it("a chain-invalid hook fails the deploy ATOMICALLY (earlier primitives rolled back)", () => {
+    // trailPct: -5 passes the structural parse gate but fails the
+    // deploy-time fake-fill render through the order validators.
+    const spec = parsePlaybookSpec({
+      name: "hook-rollback",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        {
+          id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC",
+          onFill: { type: "createOrder", spec: { ...HOOK.spec, trailPct: -5 } },
+        },
+      ],
+    });
+    expect(() => deployPlaybook({ spec, sourcePath: null })).toThrow(/rolled back/i);
+    // Rollback CANCELS already-created primitives (rows kept for
+    // forensics) and deletes the playbook row — nothing stays active.
+    const db = openDb();
+    const active = db.prepare(`SELECT COUNT(*) AS n FROM orders WHERE strategy LIKE 'playbook:%' AND status = 'active'`).get() as { n: number };
+    expect(active.n).toBe(0);
+    expect(getPlaybookById(1)).toBeNull(); // playbook row deleted (fresh db per test)
+  });
+
+  it("{{filled.X}} hook placeholders pass through PLAYBOOK template rendering untouched", async () => {
+    const { renderTemplate, parseTemplateVars, resolveVars } = await import("./playbookTemplate.js");
+    const template = {
+      name: "{{ASSET}}-dca",
+      chain: "base",
+      account: "default",
+      vars: { ASSET: { type: "string", required: true }, TRAIL: { type: "number", default: 5 } },
+      strategies: [
+        {
+          id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "{{ASSET}}", quote: "USDC",
+          onFill: {
+            type: "createOrder",
+            spec: { ...HOOK.spec, base: "{{ASSET}}", trailPct: "{{TRAIL}}" },
+          },
+        },
+      ],
+    };
+    const declared = parseTemplateVars(template.vars);
+    const { resolved } = resolveVars({ declared, provided: { ASSET: "ETH" } });
+    const rendered = renderTemplate({ spec: template, vars: resolved });
+    const spec = parsePlaybookSpec(rendered);
+    const hook = (spec.strategies[0] as { onFill?: { spec: Record<string, unknown> } }).onFill!;
+    // Playbook vars rendered (uppercase pattern)…
+    expect(hook.spec.base).toBe("ETH");
+    expect(hook.spec.trailPct).toBe(5); // whole-field number var keeps its type
+    // …while the runtime fill placeholders survive verbatim for the engine.
+    expect(hook.spec.baseAmount).toBe("{{filled.baseAmount}}");
+    expect(hook.spec.note).toBe("bracket after fire {{filled.fireNumber}}");
+  });
+});
