@@ -800,7 +800,39 @@ describe("createOrderRow — v35 amount validation", () => {
   });
   it("rejects garbage amounts at create (not at first fire)", async () => {
     const { createOrderRow } = await import("./orders.js");
-    expect(() => createOrderRow({ ...base, side: "sell", baseAmount: "lots" })).toThrow(/positive decimal or "max"/);
-    expect(() => createOrderRow({ ...base, side: "buy", quoteAmount: "-5" })).toThrow(/positive decimal or "max"/);
+    expect(() => createOrderRow({ ...base, side: "sell", baseAmount: "lots" })).toThrow(/positive decimal, "max", or a percentage/);
+    expect(() => createOrderRow({ ...base, side: "buy", quoteAmount: "-5" })).toThrow(/positive decimal, "max", or a percentage/);
+  });
+});
+
+describe("runOrderTick — percentage sizing (v35.5)", () => {
+  it("a sell with baseAmount 50% takes half the position at fire time", async () => {
+    const { setPaperBalance: setBal } = await import("./paperTrade.js");
+    const { listPaperTrades } = await import("./db.js");
+    setBal({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "2" });
+    seedOrder({
+      side: "sell",
+      trigger_type: "price_below",
+      target_price_usd: 2100,
+      base_amount: "50%",
+      quote_amount: null,
+      paper: true,
+    });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+    const fills = listPaperTrades({});
+    expect(parseFloat(fills[0].base_amount)).toBeCloseTo(1.0, 9); // half of 2
+  });
+
+  it("createOrderRow accepts spend-side percentages and rejects bad ones", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    const base = {
+      trigger: "price_below" as const, targetPriceUsd: 1800,
+      chain: "base", account: "default",
+      base: WETH as `0x${string}`, quote: USDC as `0x${string}`, paper: true,
+    };
+    expect(createOrderRow({ ...base, side: "sell", baseAmount: "37.5%" }).base_amount).toBe("37.5%");
+    expect(() => createOrderRow({ ...base, side: "sell", baseAmount: "150%" })).toThrow(/percentage/);
+    expect(() => createOrderRow({ ...base, side: "buy", baseAmount: "50%" })).toThrow(/SPEND side/);
   });
 });

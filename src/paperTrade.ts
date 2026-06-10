@@ -63,6 +63,7 @@ import {
 import { ToolError } from "./errors.js";
 import { getCurrentPrice } from "./price.js";
 import { getToken, isNativeSentinel, NATIVE_TOKEN } from "./tokens.js";
+import { parseSizingSentinel, applyFractionBig, describeSentinel } from "./sizing.js";
 import type { ChainProfile } from "./chains.js";
 import type { Config } from "./config.js";
 import type { Logger } from "./logger.js";
@@ -361,33 +362,37 @@ export async function executePaperTrade(
   let reqBaseAmount = req.baseAmount ?? null;
   let reqQuoteAmount = req.quoteAmount ?? null;
   const chainKey = ctx.profile.name.toLowerCase();
-  if (reqBaseAmount != null && reqBaseAmount.toLowerCase() === "max") {
+  const baseSentinel = reqBaseAmount != null ? parseSizingSentinel(reqBaseAmount) : null;
+  if (baseSentinel) {
     if (req.direction !== "sell") {
-      throw new ToolError("INVALID_PARAMS", `baseAmount "max" is only valid on sells (the spend side).`);
+      throw new ToolError("INVALID_PARAMS", `baseAmount "${describeSentinel(baseSentinel)}" is only valid on sells (the spend side).`);
     }
     const bal = readVirtualBalance(ctx.accountLabel, chainKey, baseAddr, baseMeta.decimals);
-    if (bal === 0n) {
+    const resolved = applyFractionBig(bal, baseSentinel);
+    if (resolved === 0n) {
       throw new ToolError(
         "PAPER_INSUFFICIENT_BALANCE",
-        `Virtual ${baseMeta.symbol} balance is zero — "max" has nothing to sell. Seed the book via: tradekit paper deposit`,
+        `Virtual ${baseMeta.symbol} balance is zero — "${describeSentinel(baseSentinel)}" has nothing to sell. Seed the book via: tradekit paper deposit`,
         { details: { chain: chainKey, account: ctx.accountLabel, token: baseAddr } },
       );
     }
-    reqBaseAmount = formatUnits(bal, baseMeta.decimals);
+    reqBaseAmount = formatUnits(resolved, baseMeta.decimals);
   }
-  if (reqQuoteAmount != null && reqQuoteAmount.toLowerCase() === "max") {
+  const quoteSentinel = reqQuoteAmount != null ? parseSizingSentinel(reqQuoteAmount) : null;
+  if (quoteSentinel) {
     if (req.direction !== "buy") {
-      throw new ToolError("INVALID_PARAMS", `quoteAmount "max" is only valid on buys (the spend side).`);
+      throw new ToolError("INVALID_PARAMS", `quoteAmount "${describeSentinel(quoteSentinel)}" is only valid on buys (the spend side).`);
     }
     const bal = readVirtualBalance(ctx.accountLabel, chainKey, quoteAddr, quoteMeta.decimals);
-    if (bal === 0n) {
+    const resolved = applyFractionBig(bal, quoteSentinel);
+    if (resolved === 0n) {
       throw new ToolError(
         "PAPER_INSUFFICIENT_BALANCE",
-        `Virtual ${quoteMeta.symbol} balance is zero — "max" has nothing to spend. Seed the book via: tradekit paper deposit`,
+        `Virtual ${quoteMeta.symbol} balance is zero — "${describeSentinel(quoteSentinel)}" has nothing to spend. Seed the book via: tradekit paper deposit`,
         { details: { chain: chainKey, account: ctx.accountLabel, token: quoteAddr } },
       );
     }
-    reqQuoteAmount = formatUnits(bal, quoteMeta.decimals);
+    reqQuoteAmount = formatUnits(resolved, quoteMeta.decimals);
   }
 
   // Amount math.

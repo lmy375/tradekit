@@ -35,6 +35,7 @@ import { isOrderTriggered } from "./orders.js";
 import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.js";
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
 import { parseOnFillSpec, renderOnFillSpec, onFillLegs, autoHookGroup, type OnFillSpec } from "./scheduleHooks.js";
+import { parseSizingSentinel, applyFraction } from "./sizing.js";
 import type { OrderSide, OrderTrigger } from "./db.js";
 
 // ── price series ─────────────────────────────────────────────
@@ -1013,18 +1014,21 @@ function simulateFillForState(args: {
   quoteSymbol: string;
 }): PlaybookBacktestFire {
   const { state, pt, balance, baseSymbol, quoteSymbol } = args;
-  // v35: the "max" sentinel resolves against the SIM balance at fire
-  // time — the backtest twin of executeTrade's on-chain resolution.
-  // A zero balance resolves to 0 and the existing insufficient-
-  // balance halt path reports it.
-  const isMax = (v: unknown) => typeof v === "string" && v.toLowerCase() === "max";
+  // v35/v35.5: dynamic sizing ("max" / "N%") resolves against the SIM
+  // balance at fire time — the backtest twin of executeTrade's
+  // on-chain resolution. A zero balance resolves to 0 and the
+  // existing insufficient-balance halt path reports it.
+  const dynamicOf = (v: unknown): ReturnType<typeof parseSizingSentinel> =>
+    typeof v === "string" ? parseSizingSentinel(v) : null;
+  const baseSentinel = dynamicOf(state.spec.baseAmount);
+  const quoteSentinel = dynamicOf(state.spec.quoteAmount);
   const fillSpec = {
     side: state.spec.side,
-    baseAmount: isMax(state.spec.baseAmount)
-      ? (balance[baseSymbol] ?? 0)
+    baseAmount: baseSentinel
+      ? applyFraction(balance[baseSymbol] ?? 0, baseSentinel)
       : numericOrUndefined(state.spec.baseAmount),
-    quoteAmount: isMax(state.spec.quoteAmount)
-      ? (balance[quoteSymbol] ?? 0)
+    quoteAmount: quoteSentinel
+      ? applyFraction(balance[quoteSymbol] ?? 0, quoteSentinel)
       : numericOrUndefined(state.spec.quoteAmount),
   };
   const single = simulateFillAt({

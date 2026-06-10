@@ -27,6 +27,7 @@
 import type { Address, PublicClient, WalletClient, Account, Transport, Chain } from "viem";
 import { ToolError, type NextAction } from "./errors.js";
 import { validateOnFillSpec } from "./scheduleHooks.js";
+import { parseSizingSentinel } from "./sizing.js";
 import { executeTrade, type TradeRequest, type TradeContext, type TradeResult } from "./trade.js";
 import { executePaperTrade, type PaperTradeContext } from "./paperTrade.js";
 import { resolveTradePair } from "./chains.js";
@@ -339,24 +340,29 @@ export function validateSpendAmounts(args: {
   context: string;
 }): { baseAmount: string | null; quoteAmount: string | null } {
   const check = (field: "baseAmount" | "quoteAmount", raw: string): string => {
-    if (raw.toLowerCase() === "max") {
+    const sentinel = parseSizingSentinel(raw);
+    if (sentinel) {
       const isSpendSide =
         (args.side === "sell" && field === "baseAmount") ||
         (args.side === "buy" && field === "quoteAmount");
       if (!isSpendSide) {
         throw new ToolError(
           "INVALID_PARAMS",
-          `${args.context}: "max" is only valid on the SPEND side (sell → baseAmount, buy → quoteAmount). ` +
+          `${args.context}: dynamic sizing ("max" / "N%") is only valid on the SPEND side (sell → baseAmount, buy → quoteAmount). ` +
             `The ${field} of a ${args.side} is the RECEIVE side — it's derived from the live quote at fire time.`,
         );
       }
-      return "max";
+      // Normalize: "MAX" → "max"; percentages keep the operator's spelling.
+      return sentinel.kind === "max" ? "max" : raw.trim();
     }
     const n = parseFloat(raw);
-    if (!Number.isFinite(n) || n <= 0) {
+    // Reject decimal-looking-but-invalid percent forms explicitly:
+    // parseFloat("150%") = 150 would otherwise slip through as a
+    // plain decimal and silently mean 150 TOKENS, not a fraction.
+    if (raw.trim().endsWith("%") || !Number.isFinite(n) || n <= 0) {
       throw new ToolError(
         "INVALID_PARAMS",
-        `${args.context}: ${field} must be a positive decimal or "max" (got "${raw}").`,
+        `${args.context}: ${field} must be a positive decimal, "max", or a percentage in (0, 100] (got "${raw}").`,
       );
     }
     return raw;

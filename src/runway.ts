@@ -33,6 +33,7 @@
 
 import { listOrders, listSchedules, getPaperBalance, recentGasStats, type OrderRow, type ScheduleRow } from "./db.js";
 import { parseCron, nextRun } from "./cron.js";
+import { isDynamicAmount } from "./sizing.js";
 import { loadConfig, resolveProfile, type Config } from "./config.js";
 import { ToolError } from "./errors.js";
 
@@ -153,17 +154,22 @@ interface SpendSide {
 }
 
 function spendOf(row: Pick<ScheduleRow, "side" | "base_token" | "base_symbol" | "quote_token" | "quote_symbol" | "base_amount" | "quote_amount">): SpendSide {
+  // Dynamic sentinels ("max" / "N%") have no fixed per-fire spend —
+  // parseFloat("50%") would otherwise read as 50 TOKENS and corrupt
+  // the walk. null routes them to skipped[] with an explicit reason.
+  const fixed = (raw: string | null): number | null =>
+    raw == null || isDynamicAmount(raw) ? null : parseFloat(raw);
   if (row.side === "buy") {
     return {
       token: row.quote_token,
       symbol: row.quote_symbol,
-      amount: row.quote_amount != null ? parseFloat(row.quote_amount) : null,
+      amount: fixed(row.quote_amount),
     };
   }
   return {
     token: row.base_token,
     symbol: row.base_symbol,
-    amount: row.base_amount != null ? parseFloat(row.base_amount) : null,
+    amount: fixed(row.base_amount),
   };
 }
 
@@ -340,8 +346,8 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
   };
 
   const skipReason = (side: string, raw: string | null): string =>
-    raw != null && raw.toLowerCase() === "max"
-      ? `${side} sized "max" — spend resolves to the live balance at fire time; excluded from runway math (it spends whatever is there)`
+    raw != null && isDynamicAmount(raw)
+      ? `${side} sized "${raw}" — spend resolves against the live balance at fire time; excluded from runway math (it spends a function of whatever is there)`
       : `${side} sized in the opposite denomination — spend per fire needs a price; excluded from runway math`;
 
   for (const s of schedules) {

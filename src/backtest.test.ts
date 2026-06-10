@@ -1296,3 +1296,43 @@ describe("simulatePlaybook — max sizing", () => {
     expect(r.finalBalance["ETH"]).toBeCloseTo(900 / 1800, 9);
   });
 });
+
+// ── v35.5: percentage sizing — the scale-out playbook ────────
+
+describe("simulatePlaybook — percentage scale-out", () => {
+  it("TP1 takes 50% at the target; the trailing-max leg exits the rest", () => {
+    // Buy 1 ETH up front (manual position via initialBalance). Two
+    // OCO-free exits: TP1 sells 50% at 2600; the trailing 10% stop
+    // rides to 3000 and fires at 2700 selling the REMAINING half.
+    const spec = parsePlaybookSpec({
+      name: "scale-out",
+      strategies: [
+        {
+          id: "tp1", type: "order", side: "sell", trigger: "price_above", price: 2600,
+          base: "ETH", quote: "USDC", baseAmount: "50%",
+        },
+        {
+          id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 10,
+          base: "ETH", quote: "USDC", baseAmount: "max",
+        },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2700, 3000, 2700, 2700]);
+    const r = simulatePlaybook({
+      spec,
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 1, USDC: 0 },
+      series,
+    });
+    const tp1 = r.perStrategy.find((s) => s.strategyId === "tp1")!;
+    const trail = r.perStrategy.find((s) => s.strategyId === "trail")!;
+    expect(tp1.finalStatus).toBe("filled");
+    expect(tp1.baseDelta).toBeCloseTo(-0.5, 9);  // half the position at 2700
+    expect(trail.finalStatus).toBe("filled");
+    expect(trail.baseDelta).toBeCloseTo(-0.5, 9); // max = whatever remains
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+    // 0.5×2700 (TP1) + 0.5×2700 (trail fired on the dip back to 2700).
+    expect(r.finalBalance["USDC"]).toBeCloseTo(2700, 6);
+  });
+});

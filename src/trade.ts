@@ -9,6 +9,7 @@ import {
   type Chain,
 } from "viem";
 import { ERC20_ABI } from "./constants.js";
+import { parseSizingSentinel, applyFractionBig, describeSentinel } from "./sizing.js";
 import { ToolError, toToolError, classifyReason, type NextAction } from "./errors.js";
 import { aggregateQuote, type AggregatorQuote, type ProviderName } from "./aggregator.js";
 import { simulateTx, type SimulationResult } from "./simulate.js";
@@ -545,19 +546,22 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
     tokenIn = quoteAddr;
     tokenOut = baseAddr;
     if (req.quoteAmount != null) {
-      // "max" → full quote-token balance (ERC20 case; native-quote is unusual but we'd
-      // need a gas reserve for it).
-      if (req.quoteAmount.toLowerCase() === "max") {
-        amountIn = (await ctx.publicClient.readContract({
+      // "max" → full quote-token balance; "N%" → that fraction of it
+      // (v35.5 — ERC20 case; native-quote is unusual but we'd need a
+      // gas reserve for it).
+      const quoteSentinel = parseSizingSentinel(req.quoteAmount);
+      if (quoteSentinel) {
+        const spendable = (await ctx.publicClient.readContract({
           address: quoteAddr,
           abi: ERC20_ABI,
           functionName: "balanceOf",
           args: [ctx.walletClient.account.address],
         })) as bigint;
+        amountIn = applyFractionBig(spendable, quoteSentinel);
         if (amountIn === 0n) {
           throw new ToolError(
             "INSUFFICIENT_BALANCE",
-            `Zero balance of ${quoteSym ?? quoteAddr}; cannot buy with max.`,
+            `Zero spendable balance of ${quoteSym ?? quoteAddr}; cannot buy with ${describeSentinel(quoteSentinel)}.`,
             {
               details: { balance: "0", required: "any positive amount", symbol: quoteSym ?? quoteAddr },
               nextActions: [
@@ -571,7 +575,7 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
           );
         }
         req = { ...req, quoteAmount: formatUnits(amountIn, quoteDec) };
-        ctx.logger.info(`buy max → using full balance ${req.quoteAmount} ${quoteSym ?? "quote"}`);
+        ctx.logger.info(`buy ${describeSentinel(quoteSentinel)} → using ${req.quoteAmount} ${quoteSym ?? "quote"}`);
       } else {
         amountIn = parseUnits(req.quoteAmount, quoteDec);
       }
@@ -595,8 +599,10 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
     tokenIn = baseAddr;
     tokenOut = quoteAddr;
     if (req.baseAmount != null) {
-      // "max" resolves to current balance of the base token (with a gas reserve when native).
-      if (req.baseAmount.toLowerCase() === "max") {
+      // "max" resolves to the spendable base balance (with a gas
+      // reserve when native); "N%" (v35.5) to that fraction of it.
+      const baseSentinel = parseSizingSentinel(req.baseAmount);
+      if (baseSentinel) {
         // Iter326: track the pre-reserve balance so the success-log can name the
         // reservation amount honestly. Pre-iter326 the log said "using full balance"
         // when the amount was already post-reserve — a subtle untruth that confused
@@ -619,11 +625,12 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
           // Reserve enough native for the swap itself (~300K gas at the current max-fee × 2 safety).
           const reserve = 300000n * gpw * 2n;
           gasReserveNative = formatUnits(reserve, 18);
-          amountIn = bal > reserve ? bal - reserve : 0n;
+          const spendable = bal > reserve ? bal - reserve : 0n;
+          amountIn = applyFractionBig(spendable, baseSentinel);
           if (amountIn === 0n) {
             throw new ToolError(
               "INSUFFICIENT_BALANCE",
-              `Native balance ${formatUnits(bal, 18)} is below the gas reserve (${formatUnits(reserve, 18)}); cannot sell max.`,
+              `Native balance ${formatUnits(bal, 18)} leaves nothing spendable after the gas reserve (${formatUnits(reserve, 18)}); cannot sell ${describeSentinel(baseSentinel)}.`,
               {
                 details: {
                   balance: formatUnits(bal, 18),
@@ -643,16 +650,17 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
           }
           nativeFullBalance = bal;
         } else {
-          amountIn = (await ctx.publicClient.readContract({
+          const spendable = (await ctx.publicClient.readContract({
             address: baseAddr,
             abi: ERC20_ABI,
             functionName: "balanceOf",
             args: [ctx.walletClient.account.address],
           })) as bigint;
+          amountIn = applyFractionBig(spendable, baseSentinel);
           if (amountIn === 0n) {
             throw new ToolError(
               "INSUFFICIENT_BALANCE",
-              `Zero balance of ${baseSym ?? baseAddr}; cannot sell max.`,
+              `Zero spendable balance of ${baseSym ?? baseAddr}; cannot sell ${describeSentinel(baseSentinel)}.`,
               {
                 details: { balance: "0", required: "any positive amount", symbol: baseSym ?? baseAddr },
                 nextActions: [
@@ -671,10 +679,10 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
         if (nativeFullBalance != null && nativeFullBalance > amountIn) {
           const reserved = nativeFullBalance - amountIn;
           ctx.logger.info(
-            `sell max → reserved ${formatUnits(reserved, baseDec)} ${baseSym ?? "base"} for gas; selling ${req.baseAmount} (full balance was ${formatUnits(nativeFullBalance, baseDec)}).`,
+            `sell ${describeSentinel(baseSentinel)} → keeping ${formatUnits(reserved, baseDec)} ${baseSym ?? "base"} (gas reserve${baseSentinel.kind === "pct" ? " + unsold fraction" : ""}); selling ${req.baseAmount} (full balance was ${formatUnits(nativeFullBalance, baseDec)}).`,
           );
         } else {
-          ctx.logger.info(`sell max → using full balance ${req.baseAmount} ${baseSym ?? "base"}`);
+          ctx.logger.info(`sell ${describeSentinel(baseSentinel)} → using ${req.baseAmount} ${baseSym ?? "base"}`);
         }
       } else {
         amountIn = parseUnits(req.baseAmount, baseDec);
