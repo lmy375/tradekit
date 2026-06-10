@@ -477,3 +477,39 @@ describe("runOrderTick — on_fill hook", () => {
     }
   });
 });
+
+// ── multi-leg bracket hooks (createOrders) ──────────────────
+
+describe("runOrderTick — multi-leg bracket hook", () => {
+  it("a fill chains TP+SL legs sharing the auto-OCO group + paper flag", async () => {
+    seedQuoteBalance("10000");
+    const id = seedOrder({
+      side: "buy",
+      trigger_type: "price_below",
+      target_price_usd: 2100,
+      base_amount: null,
+      quote_amount: "1000",
+      paper: true,
+      on_fill_json: JSON.stringify({
+        type: "createOrders",
+        specs: [
+          { side: "sell", trigger: "price_above", price: 3000, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+          { side: "sell", trigger: "price_below", price: 1500, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+        ],
+      }),
+    });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+
+    const { listOrders } = await import("./db.js");
+    const legs = listOrders({ status: "active" });
+    expect(legs).toHaveLength(2);
+    for (const leg of legs) {
+      expect(leg.group_id).toBe(`hook-order-${id}-1`);
+      expect(leg.paper).toBe(1); // inherits the parent's book
+      expect(leg.side).toBe("sell");
+    }
+    const triggers = legs.map((l) => l.trigger_type).sort();
+    expect(triggers).toEqual(["price_above", "price_below"]);
+  });
+});

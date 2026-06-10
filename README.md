@@ -1635,7 +1635,7 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Hook failures don't unwind the fill.** If the hook errors at fire time (e.g. the rendered amount is too small for slippage cap), the fill stays — the trade already happened — and a `schedule.on_fill_failed` notification fires with the error code. Operators can investigate + create the follow-up manually. Success emits `schedule.on_fill_created`.
 
-**No recursion.** Only schedules carry hooks; orders don't. So a DCA's hook creates a trailing-stop; when the trailing-stop later fires, no further hook fires. Bounded by construction.
+**No recursion.** Hook-created orders never carry hooks themselves (the hook spec dialect has no `onFill` field). So a DCA's hook creates a trailing-stop; when the trailing-stop later fires, no further hook fires. Bounded by construction.
 
 **Strategy tag propagates.** The auto-created order inherits the schedule's `strategy` column verbatim. A schedule tagged `playbook:1` produces orders tagged `playbook:1` → tradekit's playbook + strategy-budget filters cover them automatically.
 
@@ -1654,6 +1654,24 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 ```
 
 Fire 1 → order with group `bracket-1`. Fire 2 → order with group `bracket-2`. Each fire's bracket is independent — no cross-fire OCO cascade.
+
+**Multi-leg brackets (`createOrders`).** One fill can spawn several follow-up orders atomically — the classic bracket is a take-profit AND a stop-loss on the slice just bought, where either fire cancels the other:
+
+```jsonc
+{
+  "type": "createOrders",
+  "specs": [
+    { "side": "sell", "trigger": "price_above", "price": 3000,
+      "baseAmount": "{{filled.baseAmount}}", "base": "ETH", "quote": "USDC" },
+    { "side": "sell", "trigger": "price_below", "price": 1500,
+      "baseAmount": "{{filled.baseAmount}}", "base": "ETH", "quote": "USDC" }
+  ]
+}
+```
+
+2–4 legs per hook. Legs that declare no explicit `group` are **auto-OCO-paired per fire** (generated group `hook-<parent>-<fireNumber>`): the TP fires → the SL dies, and vice versa — no manual group bookkeeping, and each fire's bracket is independent of the previous fire's. Declare an explicit `group` on any leg to take over pairing yourself. Leg creation is **all-or-nothing**: if leg 2 fails validation at fire time, leg 1 is rolled back (cancelled, row kept for forensics) before the `on_fill_failed` notification — a bracket with only one arm never survives. Works everywhere `createOrder` does: schedule + order hooks, playbook entries, and the playbook backtest (the sim spawns every leg and replays the OCO cascade — `dca:hook#1.1` / `dca:hook#1.2` in per-strategy stats).
+
+**Paper inheritance.** Hook orders inherit the parent's paper flag: a paper DCA's bracket lives on the paper book, never the real one.
 
 ### MEV-protected submission (private mempool)
 

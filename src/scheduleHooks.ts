@@ -26,6 +26,21 @@
  * hook creates a trailing-stop; when the trailing-stop later fires,
  * no further hook executes. Bounded by construction.
  *
+ * Multi-leg brackets (`createOrders`). One fill can spawn SEVERAL
+ * follow-up orders atomically — the classic bracket is a take-profit
+ * (price_above sell) PLUS a stop-loss (price_below sell) on the slice
+ * just bought. When a multi-leg hook's legs declare no explicit
+ * `group`, the executor auto-assigns one shared OCO group per fire
+ * (`hook-<parentRef>-<fireNumber>`) so the legs cancel each other:
+ * TP fires → SL dies, and vice versa. Legs with an explicit group
+ * keep it verbatim (the operator opted out of auto-pairing). Leg
+ * creation is all-or-nothing: if leg N fails validation at fire
+ * time, the already-created legs are cancelled before the error
+ * propagates — a bracket with only one arm is worse than no bracket.
+ *
+ * Paper inheritance. Hook orders inherit the parent's paper flag —
+ * a paper DCA's bracket lives on the paper book, never the real one.
+ *
  * Template variables. The renderer substitutes `{{filled.X}}` with
  * the fill context's X field. Type-aware like iter21 templates:
  * whole-field `"{{filled.baseAmount}}"` preserves the value's raw
@@ -35,7 +50,8 @@
  * matters for numeric amounts.
  */
 
-import { ToolError } from "./errors.js";
+import { ToolError, type ErrorCode } from "./errors.js";
+import { cancelOrder } from "./db.js";
 import { createOrderRow, type CreateOrderArgs } from "./orders.js";
 import type { Address } from "viem";
 import type { Config } from "./config.js";
@@ -43,29 +59,62 @@ import type { OrderRow, OrderSide, OrderTrigger } from "./db.js";
 
 // ── hook spec types ──────────────────────────────────────────
 
-/** v1 supports only `createOrder`. Multi-leg `createOrders` deferred. */
-export type OnFillSpec = {
-  type: "createOrder";
-  /** Order spec, with `{{filled.X}}` template placeholders permitted
-   *  on string fields. The order spec mirrors the existing
-   *  CreateOrderArgs shape but uses operator-friendly field names
-   *  (matches the playbook spec dialect). */
-  spec: {
-    side: OrderSide;
-    trigger: OrderTrigger;
-    price?: number | string;
-    trailPct?: number | string;
-    base: string;
-    quote: string;
-    baseAmount?: number | string;
-    quoteAmount?: number | string;
-    slippageBps?: number | string;
-    autoSlippage?: boolean;
-    expiresAt?: string;
-    group?: string;
-    note?: string;
-  };
+/** One follow-up order spec, with `{{filled.X}}` template
+ *  placeholders permitted on string fields. Mirrors the existing
+ *  CreateOrderArgs shape but uses operator-friendly field names
+ *  (matches the playbook spec dialect). */
+export type OnFillLeg = {
+  side: OrderSide;
+  trigger: OrderTrigger;
+  price?: number | string;
+  trailPct?: number | string;
+  base: string;
+  quote: string;
+  baseAmount?: number | string;
+  quoteAmount?: number | string;
+  slippageBps?: number | string;
+  autoSlippage?: boolean;
+  expiresAt?: string;
+  group?: string;
+  note?: string;
 };
+
+/** `createOrder` spawns one follow-up; `createOrders` spawns a
+ *  multi-leg bracket (2–4 legs, auto-OCO-paired when no explicit
+ *  groups are given). */
+export type OnFillSpec =
+  | { type: "createOrder"; spec: OnFillLeg }
+  | { type: "createOrders"; specs: OnFillLeg[] };
+
+/** Bracket size cap. Two legs is the classic TP+SL; four covers a
+ *  laddered exit. Beyond that the spec is almost certainly a mistake
+ *  (and each leg is a real order the engine must watch). */
+export const MAX_ON_FILL_LEGS = 4;
+
+/** Normalize either hook shape to its list of order legs. */
+export function onFillLegs(spec: OnFillSpec): OnFillLeg[] {
+  return spec.type === "createOrder" ? [spec.spec] : spec.specs;
+}
+
+/**
+ * Auto-OCO group for a multi-leg fire: when EVERY leg of a multi-leg
+ * hook omits `group`, all legs share one generated group so they
+ * cancel each other (bracket semantics). Single-leg hooks and hooks
+ * where any leg declares an explicit group get no auto group — the
+ * operator has taken over pairing.
+ */
+export function autoHookGroup(
+  legs: OnFillLeg[],
+  parentRef: string,
+  fireNumber: number,
+): string | undefined {
+  if (legs.length < 2) return undefined;
+  if (legs.some((l) => l.group != null && l.group !== "")) return undefined;
+  // Group ids are restricted to [A-Za-z0-9_-]; parentRef carries
+  // "schedule#12"-style refs, so sanitize.
+  const ref = parentRef.replace(/[^A-Za-z0-9_-]/g, "-");
+  return `hook-${ref}-${fireNumber}`;
+}
 
 /** Fill context passed to the renderer at fire time. The schedule
  *  engine populates this from the persisted fill data after
@@ -92,25 +141,55 @@ export function parseOnFillSpec(raw: unknown): OnFillSpec {
   const r = raw as Record<string, unknown>;
   const errors: string[] = [];
 
-  if (r.type !== "createOrder") {
-    errors.push(`onFill.type: only "createOrder" is supported in v1 (got ${JSON.stringify(r.type)})`);
-  }
-  if (!r.spec || typeof r.spec !== "object" || Array.isArray(r.spec)) {
-    errors.push(`onFill.spec: required object`);
+  if (r.type !== "createOrder" && r.type !== "createOrders") {
+    errors.push(`onFill.type: must be "createOrder" or "createOrders" (got ${JSON.stringify(r.type)})`);
     throw new ToolError("INVALID_PARAMS", `Invalid onFill spec:\n  ${errors.join("\n  ")}`);
   }
-  const s = r.spec as Record<string, unknown>;
+
+  if (r.type === "createOrder") {
+    if (!r.spec || typeof r.spec !== "object" || Array.isArray(r.spec)) {
+      errors.push(`onFill.spec: required object`);
+      throw new ToolError("INVALID_PARAMS", `Invalid onFill spec:\n  ${errors.join("\n  ")}`);
+    }
+    collectLegErrors(r.spec as Record<string, unknown>, "onFill.spec", errors);
+  } else {
+    if (!Array.isArray(r.specs) || r.specs.length === 0) {
+      errors.push(`onFill.specs: required non-empty array of order specs for createOrders`);
+      throw new ToolError("INVALID_PARAMS", `Invalid onFill spec:\n  ${errors.join("\n  ")}`);
+    }
+    if (r.specs.length > MAX_ON_FILL_LEGS) {
+      errors.push(`onFill.specs: at most ${MAX_ON_FILL_LEGS} legs per hook (got ${r.specs.length})`);
+    }
+    r.specs.forEach((leg, i) => {
+      if (!leg || typeof leg !== "object" || Array.isArray(leg)) {
+        errors.push(`onFill.specs[${i}]: must be an object`);
+        return;
+      }
+      collectLegErrors(leg as Record<string, unknown>, `onFill.specs[${i}]`, errors);
+    });
+  }
+
+  if (errors.length) {
+    throw new ToolError("INVALID_PARAMS", `Invalid onFill spec:\n  ${errors.join("\n  ")}`);
+  }
+  return raw as OnFillSpec;
+}
+
+/** Structural checks for one order leg. Semantic checks (positive
+ *  price, trailPct range, exactly-one amount) run post-render in
+ *  validateOnFillSpec where placeholders are resolved. */
+function collectLegErrors(s: Record<string, unknown>, path: string, errors: string[]): void {
   if (s.side !== "buy" && s.side !== "sell") {
-    errors.push(`onFill.spec.side: must be "buy" or "sell"`);
+    errors.push(`${path}.side: must be "buy" or "sell"`);
   }
   if (s.trigger !== "price_below" && s.trigger !== "price_above" && s.trigger !== "trailing") {
-    errors.push(`onFill.spec.trigger: must be "price_below" | "price_above" | "trailing"`);
+    errors.push(`${path}.trigger: must be "price_below" | "price_above" | "trailing"`);
   }
   if (typeof s.base !== "string" || s.base === "") {
-    errors.push(`onFill.spec.base: required non-empty string`);
+    errors.push(`${path}.base: required non-empty string`);
   }
   if (typeof s.quote !== "string" || s.quote === "") {
-    errors.push(`onFill.spec.quote: required non-empty string`);
+    errors.push(`${path}.quote: required non-empty string`);
   }
   // baseAmount / quoteAmount: at least one required (createOrderRow
   // will enforce "exactly one"). Permit strings (for template
@@ -118,13 +197,8 @@ export function parseOnFillSpec(raw: unknown): OnFillSpec {
   const hasBase = s.baseAmount != null;
   const hasQuote = s.quoteAmount != null;
   if (!hasBase && !hasQuote) {
-    errors.push(`onFill.spec: at least one of baseAmount / quoteAmount required (template placeholders allowed)`);
+    errors.push(`${path}: at least one of baseAmount / quoteAmount required (template placeholders allowed)`);
   }
-
-  if (errors.length) {
-    throw new ToolError("INVALID_PARAMS", `Invalid onFill spec:\n  ${errors.join("\n  ")}`);
-  }
-  return raw as OnFillSpec;
 }
 
 // ── renderer (type-aware) ────────────────────────────────────
@@ -251,37 +325,40 @@ export function validateOnFillSpec(args: {
   // For v1, the simplest implementation is to call createOrderRow
   // with a flag that skips DB write. We don't have that flag, so
   // we do a structural pre-validate inline matching createOrderRow's
-  // checks. The minimal set:
-  const orderSpec = rendered.spec;
-  if (orderSpec.side !== "buy" && orderSpec.side !== "sell") {
-    throw new ToolError("INVALID_PARAMS", `onFill rendered: spec.side must be buy/sell`);
-  }
-  if (orderSpec.trigger === "price_below" || orderSpec.trigger === "price_above") {
-    const price = numericOrUndefined(orderSpec.price);
-    if (price == null || !(price > 0)) {
+  // checks, per leg. The minimal set:
+  const legs = onFillLegs(rendered);
+  legs.forEach((orderSpec, i) => {
+    const where = legs.length > 1 ? `specs[${i}]` : `spec`;
+    if (orderSpec.side !== "buy" && orderSpec.side !== "sell") {
+      throw new ToolError("INVALID_PARAMS", `onFill rendered: ${where}.side must be buy/sell`);
+    }
+    if (orderSpec.trigger === "price_below" || orderSpec.trigger === "price_above") {
+      const price = numericOrUndefined(orderSpec.price);
+      if (price == null || !(price > 0)) {
+        throw new ToolError(
+          "INVALID_PARAMS",
+          `onFill rendered: ${where}.price must be a positive number for ${orderSpec.trigger} (got ${JSON.stringify(orderSpec.price)})`,
+        );
+      }
+    }
+    if (orderSpec.trigger === "trailing") {
+      const pct = numericOrUndefined(orderSpec.trailPct);
+      if (pct == null || !(pct > 0 && pct <= 100)) {
+        throw new ToolError(
+          "INVALID_PARAMS",
+          `onFill rendered: ${where}.trailPct must be in (0, 100] for trailing (got ${JSON.stringify(orderSpec.trailPct)})`,
+        );
+      }
+    }
+    const hasBase = orderSpec.baseAmount != null && orderSpec.baseAmount !== "";
+    const hasQuote = orderSpec.quoteAmount != null && orderSpec.quoteAmount !== "";
+    if (hasBase === hasQuote) {
       throw new ToolError(
         "INVALID_PARAMS",
-        `onFill rendered: spec.price must be a positive number for ${orderSpec.trigger} (got ${JSON.stringify(orderSpec.price)})`,
+        `onFill rendered: ${where} must have exactly one of baseAmount / quoteAmount (got base=${hasBase}, quote=${hasQuote})`,
       );
     }
-  }
-  if (orderSpec.trigger === "trailing") {
-    const pct = numericOrUndefined(orderSpec.trailPct);
-    if (pct == null || !(pct > 0 && pct <= 100)) {
-      throw new ToolError(
-        "INVALID_PARAMS",
-        `onFill rendered: spec.trailPct must be in (0, 100] for trailing (got ${JSON.stringify(orderSpec.trailPct)})`,
-      );
-    }
-  }
-  const hasBase = orderSpec.baseAmount != null && orderSpec.baseAmount !== "";
-  const hasQuote = orderSpec.quoteAmount != null && orderSpec.quoteAmount !== "";
-  if (hasBase === hasQuote) {
-    throw new ToolError(
-      "INVALID_PARAMS",
-      `onFill rendered: spec must have exactly one of baseAmount / quoteAmount (got base=${hasBase}, quote=${hasQuote})`,
-    );
-  }
+  });
 
   void args.chain;
   void args.account;
@@ -307,17 +384,26 @@ function numericOrUndefined(v: unknown): number | undefined {
 /**
  * Execute a hook at FIRE time. Called by the schedule engine after a
  * successful markScheduleFired. Renders the hook spec with the real
- * fill context, builds a CreateOrderArgs, and inserts via
+ * fill context, builds CreateOrderArgs per leg, and inserts via
  * createOrderRow.
  *
- * Returns the created order row id on success. Throws on failure —
- * the engine catches and emits a `schedule.on_fill_failed`
- * notification, but does NOT unwind the fill (the trade already
- * happened).
+ * Multi-leg hooks are all-or-nothing: if leg N fails, the already-
+ * created legs are cancelled (rows kept for forensics, status
+ * `cancelled`) and the error rethrows. A bracket with only the
+ * take-profit arm silently missing its stop-loss is the worst
+ * outcome — partial creation never survives.
+ *
+ * Returns the created order row ids on success (`orderId` is the
+ * first leg, kept for single-leg ergonomics). Throws on failure —
+ * the engine catches and emits a `*.on_fill_failed` notification,
+ * but does NOT unwind the fill (the trade already happened).
  *
  * `strategyTag` is the schedule's strategy column value, propagated
  * verbatim to the new order so playbook + budget filters work
- * across DCA + auto-stop.
+ * across DCA + auto-stop. `paper` is the parent's paper flag —
+ * hook orders always live on the same book as the fill that spawned
+ * them. `parentRef` (e.g. "schedule#12", "order#34") feeds default
+ * notes and the auto-OCO group name.
  */
 export interface ExecuteOnFillHookArgs {
   spec: OnFillSpec;
@@ -327,36 +413,62 @@ export interface ExecuteOnFillHookArgs {
   baseAddress: Address | "ETH";
   quoteAddress: Address;
   strategyTag: string | null;
+  paper: boolean;
+  parentRef: string;
   config: Config;
 }
 
 export function executeOnFillHook(args: ExecuteOnFillHookArgs): {
   orderId: number;
-  rendered: OnFillSpec["spec"];
+  orderIds: number[];
+  rendered: OnFillSpec;
 } {
   const rendered = renderOnFillSpec({ spec: args.spec, fill: args.fill });
-  const s = rendered.spec;
+  const legs = onFillLegs(rendered);
+  const sharedGroup = autoHookGroup(legs, args.parentRef, args.fill.fireNumber);
 
-  // Build CreateOrderArgs from the rendered hook spec.
-  const createArgs: CreateOrderArgs = {
-    side: s.side,
-    trigger: s.trigger,
-    targetPriceUsd: numericOrUndefined(s.price),
-    trailPct: numericOrUndefined(s.trailPct),
-    chain: args.chain,
-    account: args.account,
-    base: args.baseAddress,
-    quote: args.quoteAddress,
-    baseAmount: s.baseAmount != null ? String(s.baseAmount) : undefined,
-    quoteAmount: s.quoteAmount != null ? String(s.quoteAmount) : undefined,
-    slippageBps: numericOrUndefined(s.slippageBps),
-    autoSlippage: s.autoSlippage,
-    expiresAt: s.expiresAt,
-    strategy: args.strategyTag ?? undefined,
-    note: s.note ?? `auto-created by schedule on_fill (fire #${args.fill.fireNumber})`,
-    group: s.group,
-  };
+  const created: number[] = [];
+  for (let i = 0; i < legs.length; i++) {
+    const s = legs[i];
+    const legTag = legs.length > 1 ? `, leg ${i + 1}/${legs.length}` : "";
+    const createArgs: CreateOrderArgs = {
+      side: s.side,
+      trigger: s.trigger,
+      targetPriceUsd: numericOrUndefined(s.price),
+      trailPct: numericOrUndefined(s.trailPct),
+      chain: args.chain,
+      account: args.account,
+      base: args.baseAddress,
+      quote: args.quoteAddress,
+      baseAmount: s.baseAmount != null ? String(s.baseAmount) : undefined,
+      quoteAmount: s.quoteAmount != null ? String(s.quoteAmount) : undefined,
+      slippageBps: numericOrUndefined(s.slippageBps),
+      autoSlippage: s.autoSlippage,
+      expiresAt: s.expiresAt,
+      strategy: args.strategyTag ?? undefined,
+      note: s.note ?? `auto-created by ${args.parentRef} on_fill (fire #${args.fill.fireNumber}${legTag})`,
+      group: s.group ?? sharedGroup,
+      paper: args.paper,
+    };
+    try {
+      const order: OrderRow = createOrderRow(createArgs, args.config);
+      created.push(order.id!);
+    } catch (e) {
+      // Roll back partial brackets before surfacing the failure.
+      for (const id of created) {
+        try { cancelOrder(id); } catch { /* best-effort rollback */ }
+      }
+      const code = (e as { code?: string }).code ?? "INTERNAL_ERROR";
+      const msg = (e as Error).message ?? String(e);
+      const rolledBack = created.length
+        ? ` Rolled back ${created.length} already-created leg(s): #${created.join(", #")}.`
+        : "";
+      throw new ToolError(
+        code as ErrorCode,
+        `on_fill leg ${i + 1}/${legs.length} failed: ${msg}${rolledBack}`,
+      );
+    }
+  }
 
-  const order: OrderRow = createOrderRow(createArgs, args.config);
-  return { orderId: order.id!, rendered: rendered.spec };
+  return { orderId: created[0]!, orderIds: created, rendered };
 }

@@ -34,7 +34,7 @@ import { getCoinGeckoId } from "./price.js";
 import { isOrderTriggered } from "./orders.js";
 import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.js";
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
-import { parseOnFillSpec, renderOnFillSpec, type OnFillSpec } from "./scheduleHooks.js";
+import { parseOnFillSpec, renderOnFillSpec, onFillLegs, autoHookGroup, type OnFillSpec } from "./scheduleHooks.js";
 import type { OrderSide, OrderTrigger } from "./db.js";
 
 // ── price series ─────────────────────────────────────────────
@@ -968,29 +968,37 @@ function spawnHookOrder(args: {
         fireNumber,
       },
     }) as OnFillSpec;
-    const hs = rendered.spec;
-    states.push({
-      id: `${parent.id}:hook#${fireNumber}`,
-      type: "order",
-      spec: {
+    // Multi-leg hooks spawn one sim order per leg; legs without an
+    // explicit group share the auto-OCO group (bracket semantics —
+    // the sim's cascadeOcoPeers handles the mutual cancel exactly
+    // like the live engine).
+    const legs = onFillLegs(rendered);
+    const sharedGroup = autoHookGroup(legs, parent.id, fireNumber);
+    legs.forEach((hs, legIdx) => {
+      const legSuffix = legs.length > 1 ? `.${legIdx + 1}` : "";
+      states.push({
+        id: `${parent.id}:hook#${fireNumber}${legSuffix}`,
         type: "order",
-        side: hs.side,
-        trigger: hs.trigger,
-        price: hs.price != null ? Number(hs.price) : undefined,
-        trailPct: hs.trailPct != null ? Number(hs.trailPct) : undefined,
-        base: hs.base,
-        quote: hs.quote,
-        baseAmount: hs.baseAmount != null ? String(hs.baseAmount) : undefined,
-        quoteAmount: hs.quoteAmount != null ? String(hs.quoteAmount) : undefined,
-        expiresAt: hs.expiresAt,
-        group: hs.group,
-      },
-      finalStatus: "active",
-      trailWaterMark: null,
-      fireCount: 0,
-      baseDelta: 0,
-      quoteDelta: 0,
-      spawnedBy: parent.id,
+        spec: {
+          type: "order",
+          side: hs.side,
+          trigger: hs.trigger,
+          price: hs.price != null ? Number(hs.price) : undefined,
+          trailPct: hs.trailPct != null ? Number(hs.trailPct) : undefined,
+          base: hs.base,
+          quote: hs.quote,
+          baseAmount: hs.baseAmount != null ? String(hs.baseAmount) : undefined,
+          quoteAmount: hs.quoteAmount != null ? String(hs.quoteAmount) : undefined,
+          expiresAt: hs.expiresAt,
+          group: hs.group ?? sharedGroup,
+        },
+        finalStatus: "active",
+        trailWaterMark: null,
+        fireCount: 0,
+        baseDelta: 0,
+        quoteDelta: 0,
+        spawnedBy: parent.id,
+      });
     });
   } catch (e) {
     notes.push(`${pt.ts}: on_fill hook for ${parent.id} failed to render (${(e as Error).message.split("\n")[0]}) — fill kept, hook skipped`);
@@ -1099,12 +1107,16 @@ function validatePlaybookForBacktest(
     if ((s.type === "schedule" || s.type === "order") && s.onFill != null) {
       try {
         const hook = parseOnFillSpec(s.onFill);
-        if (hook.spec.base.toUpperCase() !== baseSymbol.toUpperCase()) {
-          errors.push(`${prefix}.onFill: hook base "${hook.spec.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
-        }
-        if (hook.spec.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
-          errors.push(`${prefix}.onFill: hook quote "${hook.spec.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
-        }
+        const legs = onFillLegs(hook);
+        legs.forEach((leg, li) => {
+          const where = legs.length > 1 ? `${prefix}.onFill.specs[${li}]` : `${prefix}.onFill`;
+          if (leg.base.toUpperCase() !== baseSymbol.toUpperCase()) {
+            errors.push(`${where}: hook base "${leg.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
+          }
+          if (leg.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
+            errors.push(`${where}: hook quote "${leg.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
+          }
+        });
       } catch (e) {
         errors.push(`${prefix}.onFill: ${(e as Error).message.split("\n")[0]}`);
       }

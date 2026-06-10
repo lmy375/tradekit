@@ -480,3 +480,58 @@ describe("runScheduleTick — decision journal (v29)", () => {
     });
   });
 });
+
+// ── multi-leg bracket hooks (createOrders) ──────────────────
+
+describe("runScheduleTick — multi-leg bracket hook", () => {
+  it("spawns both legs OCO-paired under the auto group, inheriting paper", async () => {
+    seedQuoteBalance("10000");
+    const hook = {
+      type: "createOrders",
+      specs: [
+        { side: "sell", trigger: "price_above", price: 3000, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+        { side: "sell", trigger: "price_below", price: 1500, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+      ],
+    };
+    const id = seedSchedule({ on_fill_json: JSON.stringify(hook) });
+    const report = await tick();
+    expect(report.fired).toBe(1);
+    const fire = report.fires[0] as { onFillOrderId?: number; onFillOrderIds?: number[] };
+    expect(fire.onFillOrderIds).toHaveLength(2);
+    expect(fire.onFillOrderId).toBe(fire.onFillOrderIds![0]);
+
+    const orders = listOrders({ status: "all" });
+    expect(orders).toHaveLength(2);
+    const triggers = orders.map((o) => o.trigger_type).sort();
+    expect(triggers).toEqual(["price_above", "price_below"]);
+    // One shared auto-OCO group: TP fires → SL cancels, and vice versa.
+    for (const o of orders) {
+      expect(o.group_id).toBe(`hook-schedule-${id}-1`);
+      // The paper schedule's bracket lives on the paper book — never real.
+      expect(o.paper).toBe(1);
+      // Sized to the fill.
+      expect(parseFloat(o.base_amount!)).toBeGreaterThan(0);
+    }
+  });
+
+  it("a failing bracket leg rolls back the whole bracket, fill kept", async () => {
+    seedQuoteBalance("10000");
+    const hook = {
+      type: "createOrders",
+      specs: [
+        { side: "sell", trigger: "price_above", price: 3000, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+        // trailing without trailPct → leg 2 rejected at fire time
+        { side: "sell", trigger: "trailing", base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+      ],
+    };
+    seedSchedule({ on_fill_json: JSON.stringify(hook) });
+    const report = await tick();
+    // Fill persists — hooks never unwind the trade.
+    expect(report.fired).toBe(1);
+    const fire = report.fires[0] as { onFillError?: { code: string; message: string } };
+    expect(fire.onFillError).toBeDefined();
+    expect(fire.onFillError!.message).toMatch(/leg 2\/2 failed/);
+    // No half-bracket survives: leg 1 was rolled back to cancelled.
+    expect(listOrders({ status: "active" })).toHaveLength(0);
+  });
+});

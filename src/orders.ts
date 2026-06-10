@@ -1055,8 +1055,11 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
             baseAddress: order.base_token as Address | "ETH",
             quoteAddress: order.quote_token as Address,
             strategyTag: order.strategy ?? null,
+            paper: (order.paper ?? 0) === 1,
+            parentRef: `order#${order.id}`,
             config,
           });
+          const hookIdList = `#${hookResult.orderIds.join(", #")}`;
           if (journalConfig.enabled) {
             const { insertOrderCheckEntry } = await import("./db.js");
             try {
@@ -1067,7 +1070,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
                 waterMarkUsd: order.water_mark_usd,
                 thresholdUsd: null,
                 decision: "hook_created",
-                notes: `on_fill created order #${hookResult.orderId}`,
+                notes: `on_fill created order(s) ${hookIdList}`,
               });
             } catch { /* journal is best-effort */ }
           }
@@ -1075,9 +1078,9 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
             {
               event: "order.on_fill_created",
               severity: "info",
-              title: `Order #${order.id} on-fill hook created order #${hookResult.orderId}`,
-              body: `After the fill (tx ${result.txHash}), auto-created the follow-up order from the on_fill spec.`,
-              fields: { orderId: order.id, followUpOrderId: hookResult.orderId, chain: order.chain },
+              title: `Order #${order.id} on-fill hook created ${hookResult.orderIds.length > 1 ? `${hookResult.orderIds.length} orders ${hookIdList}` : `order ${hookIdList}`}`,
+              body: `After the fill (tx ${result.txHash}), auto-created the follow-up order(s) from the on_fill spec.`,
+              fields: { orderId: order.id, followUpOrderId: hookResult.orderId, followUpOrderIds: hookResult.orderIds.join(","), chain: order.chain },
               dedupKey: `order.on_fill_created:${order.id}`,
             },
             config,

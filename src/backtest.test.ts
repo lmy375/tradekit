@@ -1151,3 +1151,87 @@ describe("simulatePlaybook — ORDER on_fill hooks (v31)", () => {
     expect(r.notes.some((n) => n.includes("1 follow-up order(s) spawned"))).toBe(true);
   });
 });
+
+// ── multi-leg bracket hooks (createOrders) ──────────────────
+
+describe("simulatePlaybook — multi-leg bracket hooks", () => {
+  const BRACKET = {
+    type: "createOrders",
+    specs: [
+      { side: "sell", trigger: "price_above", price: 2600, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+      { side: "sell", trigger: "price_below", price: 1500, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+    ],
+  };
+
+  function bracketSpec(over: Record<string, unknown> = {}) {
+    return parsePlaybookSpec({
+      name: "dca-bracketed",
+      strategies: [
+        {
+          id: "dca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 1000,
+          base: "ETH", quote: "USDC", maxRuns: 1, onFill: BRACKET, ...over,
+        },
+      ],
+    });
+  }
+
+  it("TP fires → SL auto-cancelled via the shared OCO group (full bracket round trip)", () => {
+    // Day 0: DCA buys 0.5 ETH @2000 → spawns TP(2600) + SL(1500) legs.
+    // Day 1: price 2700 → TP fires, OCO cascade kills the SL leg.
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2700, 2700]);
+    const r = simulatePlaybook({
+      spec: bracketSpec(),
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series,
+    });
+    const tp = r.perStrategy.find((s) => s.strategyId === "dca:hook#1.1")!;
+    const sl = r.perStrategy.find((s) => s.strategyId === "dca:hook#1.2")!;
+    expect(tp.finalStatus).toBe("filled");
+    expect(tp.baseDelta).toBeCloseTo(-0.5, 9);
+    expect(sl.finalStatus).toBe("cancelled");
+    expect(sl.fireCount).toBe(0);
+    // 1000 → bought 0.5@2000 → TP sold 0.5@2700 = 1350 USDC, flat ETH.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(1350, 6);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+  });
+
+  it("SL fires on the crash → TP auto-cancelled", () => {
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 1400, 1400]);
+    const r = simulatePlaybook({
+      spec: bracketSpec(),
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series,
+    });
+    const tp = r.perStrategy.find((s) => s.strategyId === "dca:hook#1.1")!;
+    const sl = r.perStrategy.find((s) => s.strategyId === "dca:hook#1.2")!;
+    expect(sl.finalStatus).toBe("filled");
+    expect(tp.finalStatus).toBe("cancelled");
+    // Stop-loss capped the damage: sold 0.5 @1400 = 700 USDC back.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(700, 6);
+  });
+
+  it("validation rejects a bracket leg whose pair mismatches, naming the leg", () => {
+    const spec = bracketSpec({
+      onFill: {
+        type: "createOrders",
+        specs: [
+          BRACKET.specs[0],
+          { ...BRACKET.specs[1], base: "WBTC" },
+        ],
+      },
+    });
+    expect(() =>
+      simulatePlaybook({
+        spec,
+        baseSymbol: "ETH",
+        quoteSymbol: "USDC",
+        initialBalance: { ETH: 0, USDC: 1000 },
+        series: dailySeries("2026-04-01T00:00:00Z", [2000, 2000]),
+      }),
+    ).toThrow(/specs\[1\].*WBTC/s);
+  });
+});

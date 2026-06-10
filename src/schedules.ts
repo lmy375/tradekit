@@ -775,6 +775,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       // with the error code so operators can intervene + create the
       // follow-up manually.
       let onFillOrderId: number | null = null;
+      let onFillOrderIds: number[] = [];
       let onFillError: { code: string; message: string } | null = null;
       if (schedule.on_fill_json) {
         try {
@@ -797,24 +798,29 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
             baseAddress: schedule.base_token as Address | "ETH",
             quoteAddress: schedule.quote_token as Address,
             strategyTag: schedule.strategy ?? null,
+            paper: (schedule.paper ?? 0) === 1,
+            parentRef: `schedule#${schedule.id}`,
             config,
           });
           onFillOrderId = fireResult.orderId;
+          onFillOrderIds = fireResult.orderIds;
+          const idList = `#${onFillOrderIds.join(", #")}`;
           journal({
             scheduleId: schedule.id,
             decision: "hook_created",
             runNumber: schedule.run_count + 1,
-            notes: `on_fill created order #${onFillOrderId}`,
+            notes: `on_fill created order(s) ${idList}`,
           });
           await tryNotify(
             {
               event: "schedule.on_fill_created",
               severity: "info",
-              title: `Schedule #${schedule.id} on-fill hook created order #${onFillOrderId}`,
-              body: `After DCA fire #${schedule.run_count + 1}, auto-created follow-up order from on_fill spec.`,
+              title: `Schedule #${schedule.id} on-fill hook created ${onFillOrderIds.length > 1 ? `${onFillOrderIds.length} orders ${idList}` : `order ${idList}`}`,
+              body: `After DCA fire #${schedule.run_count + 1}, auto-created follow-up order(s) from on_fill spec.`,
               fields: {
                 scheduleId: schedule.id,
                 orderId: onFillOrderId,
+                orderIds: onFillOrderIds.join(","),
                 fireNumber: schedule.run_count + 1,
                 chain: schedule.chain,
               },
@@ -859,6 +865,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       const fireReportLast = fires[fires.length - 1];
       if (fireReportLast && onFillOrderId != null) {
         (fireReportLast as { onFillOrderId?: number }).onFillOrderId = onFillOrderId;
+        (fireReportLast as { onFillOrderIds?: number[] }).onFillOrderIds = onFillOrderIds;
       }
       if (fireReportLast && onFillError) {
         (fireReportLast as { onFillError?: { code: string; message: string } }).onFillError = onFillError;

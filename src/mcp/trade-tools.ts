@@ -641,7 +641,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
         .describe("Relative duration shorthand (30s, 15m, 2h, 7d, 4w). Converted to an absolute expiresAt at create time. Mutually exclusive with expiresAt."),
       strategy: z.string().max(100).optional().describe("Strategy tag stamped on the trade when the order fills (indexed; same column as trade strategy)."),
       note: z.string().optional().describe("Free-form note saved on the order row + on the eventual trade row."),
-      onFill: z.unknown().optional().describe("v31 post-fill hook: { type: 'createOrder', spec: {...} } with {{filled.X}} placeholders — auto-creates a follow-up order after THIS order fills (e.g. limit buy → auto-trailing). Validated with fake fill data at create time; hook failure at fire time keeps the fill."),
+      onFill: z.unknown().optional().describe("Post-fill hook: { type: 'createOrder', spec: {...} } for one follow-up, or { type: 'createOrders', specs: [{...}, {...}] } for a multi-leg bracket (2–4 legs; legs without explicit `group` are auto-OCO-paired, e.g. take-profit + stop-loss that cancel each other). {{filled.X}} placeholders interpolate the fill. Auto-creates the follow-up order(s) after THIS order fills (e.g. limit buy → auto-trailing, or limit buy → TP+SL bracket). Validated with fake fill data at create time; hook failure at fire time keeps the fill; multi-leg creation is all-or-nothing (partial legs roll back). Hook orders inherit this order's paper flag."),
       group: z
         .string()
         .regex(/^[A-Za-z0-9_-]+$/, "group must match /^[A-Za-z0-9_-]+$/ (letters, digits, dash, underscore)")
@@ -824,7 +824,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       strategy: z.string().optional().describe("New strategy tag."),
       note: z.string().optional().describe("New free-text note."),
       paper: z.boolean().optional().describe("Toggle paper mode (iter30)."),
-      onFill: z.unknown().optional().describe("Replacement on_fill hook spec (object). Pass null to remove an existing hook. Revalidated against the order's pair."),
+      onFill: z.unknown().optional().describe("Replacement on_fill hook spec: createOrder (single follow-up) or createOrders (multi-leg bracket). Pass null to remove an existing hook. Revalidated against the order's pair."),
     },
     async (input) => {
       try {
@@ -925,6 +925,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       maxRuns: z.number().int().positive().optional().describe("Lifetime cap on SUCCESSFUL fires. Schedule flips to 'completed' when reached. Failed attempts (RPC down, safeguard, balance) do NOT consume quota — a maxRuns=12 monthly DCA always delivers 12 actual buys."),
       strategy: z.string().max(100).optional(),
       note: z.string().optional(),
+      onFill: z.unknown().optional().describe("Post-fill hook executed after EACH successful fire: { type: 'createOrder', spec: {...} } for one follow-up order, or { type: 'createOrders', specs: [{...}, {...}] } for a multi-leg bracket (2–4 legs; legs without explicit `group` are auto-OCO-paired per fire — the classic DCA + TP/SL bracket). {{filled.X}} placeholders (baseAmount, quoteAmount, fillPriceUsd, txHash, fireNumber) interpolate the actual fill. Validated with fake fill data at create time; hook failure at fire time keeps the fill (notified + journaled); multi-leg creation is all-or-nothing. Hook orders inherit the schedule's paper flag."),
     },
     async (input) => {
       try {
@@ -955,6 +956,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 maxRuns: input.maxRuns,
                 strategy: input.strategy,
                 note: input.note,
+                onFill: input.onFill,
               },
               config,
             );
@@ -1095,7 +1097,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       strategy: z.string().optional(),
       note: z.string().optional(),
       paper: z.boolean().optional(),
-      onFill: z.unknown().optional().describe("Replacement on_fill spec (object). Pass null to remove an existing hook."),
+      onFill: z.unknown().optional().describe("Replacement on_fill spec: createOrder (single follow-up) or createOrders (multi-leg bracket). Pass null to remove an existing hook."),
     },
     async (input) => {
       try {

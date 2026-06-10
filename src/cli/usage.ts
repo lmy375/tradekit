@@ -204,11 +204,15 @@ SCHEDULED / RECURRING TRADES (DCA)
                   [--strategy TAG] [--note "..."] [--chain X] [--account L] [--json]
                   [--on-fill '<json>' | --on-fill-file <path>]
         --on-fill / --on-fill-file: post-fill hook spec. Validated at create time.
-        After each successful fire, auto-creates a follow-up order with template variables
+        After each successful fire, auto-creates follow-up order(s) with template variables
         interpolating fill data: {{filled.baseAmount}}, {{filled.fillPriceUsd}},
         {{filled.txHash}}, {{filled.fireNumber}}. Example for DCA + auto-trailing-stop:
         --on-fill '{"type":"createOrder","spec":{"side":"sell","trigger":"trailing",
         "trailPct":10,"baseAmount":"{{filled.baseAmount}}","base":"ETH","quote":"USDC"}}'
+        Multi-leg brackets: {"type":"createOrders","specs":[{...TP...},{...SL...}]} creates
+        2–4 orders per fire, all-or-nothing; legs without an explicit "group" are auto-
+        OCO-paired per fire (TP fires → SL cancels, and vice versa). Hook orders inherit
+        the schedule's paper flag.
         Standing intent that fires the same trade on a cron schedule. Each fire routes
         through executeTrade — so per-tx / daily USD limits, slippage cap, gas budget,
         token & contract whitelists, rate limit, and audit log all apply just like a
@@ -248,10 +252,11 @@ CONDITIONAL ORDERS
                --base ETH|<addr> --quote USDC|<addr>
                (--baseAmount A | --quoteAmount A) [--slippage <bps>] [--auto-slippage]
                [--expires-in 30s|15m|2h|7d|4w | --expires-at <ISO>]
-               [--on-fill '<json>' | --on-fill-file <path>]  ← v31: chain a follow-up
-               order after THIS order fills (same {{filled.X}} dialect as schedule
-               hooks; e.g. limit buy → auto-trailing the position). --unset on-fill
-               via 'order edit' removes it.
+               [--on-fill '<json>' | --on-fill-file <path>]  ← v31: chain follow-up
+               order(s) after THIS order fills (same {{filled.X}} dialect as schedule
+               hooks; e.g. limit buy → auto-trailing the position, or limit buy →
+               TP+SL bracket via {"type":"createOrders","specs":[...]} with auto-OCO
+               pairing). --unset on-fill via 'order edit' removes it.
                [--group <id>] [--strategy TAG] [--note "..."] [--chain X] [--account L] [--json]
         Standing intent that fires when the configured trigger satisfies. At fire time the
         engine routes through executeTrade — so every safety guardrail (USD limits, slippage
@@ -470,8 +475,9 @@ PLAYBOOKS (declarative strategy bundles)
         OCO group names are namespaced to pb<id>-<localname> so two playbooks with the
         same local group don't cross-cancel.
         Schedule entries can declare post-fill hooks inline ("onFill": {"type":"createOrder",
-        "spec": {...}} — same shape as schedule create --on-fill, {{filled.X}} placeholders
-        supported); validated structurally at parse + chain-aware at deploy.
+        "spec": {...}} or multi-leg {"type":"createOrders","specs":[...]} — same shape as
+        schedule create --on-fill, {{filled.X}} placeholders supported); validated
+        structurally at parse + chain-aware at deploy.
         For templates: declare {{vars}} in the JSON, supply via --var NAME=VALUE (repeatable)
         or --vars-file PATH (JSON object). --var overrides --vars-file on conflict.
   playbook list [--status all|deploying|deployed|destroyed|failed] [--limit N] [--json]
