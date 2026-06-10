@@ -54,7 +54,9 @@ npx tradekit help
 ## Quick start
 
 ```bash
-# Guided one-time setup (wallet + active chain + safety guardrails)
+# Guided one-time setup (wallet + active chain + safety guardrails +
+# the production observability preset: decision journals, DB retention,
+# alert watcher with starter rules — one Y answer, idempotent re-runs)
 tradekit init
 
 # Operator dashboard — portfolio + 7d PnL + standing approvals + nextActions

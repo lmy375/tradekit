@@ -17,9 +17,14 @@ OVERVIEW
         Per-section partial failure tolerated — one bad RPC drops that section without aborting the rest.
 
 SETUP
-  init                                First-run wizard (wallet + chain + safety)
+  init                                First-run wizard (wallet + chain + safety + observability)
         [--non-interactive] [--wallet-type hd|keystore|skip] [--chain X]
         [--per-tx-limit N] [--max-slippage-bps N] [--allow-infinite-approvals true|false]
+        [--observability true|false]
+        Step 4 applies the production observability preset in one answer: decision
+        journals (order/schedule/rebalance replay + drift history), DB retention
+        (audit/events 180d, journals 60d), and the alert watcher with 5 starter
+        rules. Never clobbers operator-tuned config; idempotent; re-run anytime.
   doctor [--chains a,b,c | --chains all] [--pass P] [--strict] [--quiet] [--summary] [--json] [--verbose]
         Health check; --pass verifies keystore decrypts; --strict treats warnings as failures (CI-friendly); --quiet hides ok rows (iter752); --summary prints a one-line cron/Slack-friendly digest (iter847).
         Ops-hygiene pack (offline): retention (journal tables growing unbounded vs

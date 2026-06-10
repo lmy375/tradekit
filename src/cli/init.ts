@@ -9,6 +9,76 @@ import { createMnemonicWallet, hasMnemonic } from "../accounts.js";
 import { getKeystoreAddress } from "../wallet.js";
 import { ToolError } from "../errors.js";
 import { makeCliLogger, prompt, promptPassword, checkPasswordStrength, parseIntFlag, parseFloatFlag } from "./helpers.js";
+import type { Config } from "../config.js";
+
+/**
+ * Production observability preset (iter-init-4). PURE — returns the
+ * updated config + a human list of what changed; the caller saves.
+ *
+ * Never clobbers operator choices:
+ *   - journals/retention flip only when currently off/unset
+ *   - the alert watcher is enabled with starter rules ONLY when it
+ *     is currently disabled AND has no rules — an operator-tuned
+ *     rule set is left byte-for-byte intact
+ *
+ * Idempotent: a second apply returns changed=[].
+ */
+export function applyObservabilityPreset(config: Config): { config: Config; changed: string[] } {
+  let next = config;
+  const changed: string[] = [];
+  const set = (path: string, value: unknown, label: string) => {
+    next = setConfigPath(next, path, value);
+    changed.push(label);
+  };
+
+  if (!next.engine.orderJournal.enabled) {
+    set("engine.orderJournal.enabled", true, "engine.orderJournal.enabled = true   (order replay)");
+  }
+  if (!next.engine.scheduleJournal.enabled) {
+    set("engine.scheduleJournal.enabled", true, "engine.scheduleJournal.enabled = true   (schedule replay)");
+  }
+  if (!next.engine.rebalanceJournal.enabled) {
+    set("engine.rebalanceJournal.enabled", true, "engine.rebalanceJournal.enabled = true   (drift history)");
+  }
+
+  if (!next.db.retention.enabled) {
+    set("db.retention.enabled", true, "db.retention.enabled = true");
+  }
+  const retentionDefaults: Array<[keyof Config["db"]["retention"], number, string]> = [
+    ["auditLogDays", 180, "db.retention.auditLogDays = 180"],
+    ["orderCheckLogDays", 60, "db.retention.orderCheckLogDays = 60"],
+    ["scheduleCheckLogDays", 60, "db.retention.scheduleCheckLogDays = 60"],
+    ["rebalanceCheckLogDays", 60, "db.retention.rebalanceCheckLogDays = 60"],
+    ["alertEventsDays", 180, "db.retention.alertEventsDays = 180"],
+    ["engineEventsDays", 180, "db.retention.engineEventsDays = 180"],
+  ];
+  for (const [field, days, label] of retentionDefaults) {
+    if (next.db.retention[field] == null) {
+      set(`db.retention.${String(field)}`, days, label);
+    }
+  }
+
+  const alerts = (next.safety as { strategyAlerts?: { enabled?: boolean; rules?: unknown[] } }).strategyAlerts;
+  const hasOperatorRules = alerts?.enabled === true || (alerts?.rules?.length ?? 0) > 0;
+  if (!hasOperatorRules) {
+    set(
+      "safety.strategyAlerts",
+      {
+        enabled: true,
+        rules: [
+          { type: "failure_streak", alertCount: 3 },
+          { type: "staleness", thresholdSeconds: 172_800 },
+          { type: "drift_proximity", alertPctOfThreshold: 80 },
+          { type: "budget_approach", warnPct: 0.8 },
+          { type: "drawdown_threshold", alertPct: 10 },
+        ],
+      },
+      "safety.strategyAlerts = enabled with 5 starter rules",
+    );
+  }
+
+  return { config: next, changed };
+}
 
 /**
  * Safe to re-run: skips steps that are already configured.
@@ -38,9 +108,9 @@ export async function initCommand(flags: Record<string, string>) {
   const haveHd = hasMnemonic();
   if (haveSingle || haveHd) {
     const addr = activeWalletAddress();
-    console.log(`Step 1/3  Wallet:  already configured  (${haveHd ? "HD" : "single-key"} → ${addr})`);
+    console.log(`Step 1/4  Wallet:  already configured  (${haveHd ? "HD" : "single-key"} → ${addr})`);
   } else {
-    console.log("Step 1/3  Wallet:");
+    console.log("Step 1/4  Wallet:");
     // Iter368: explicit --wallet-type beats the prompt even in interactive mode (same
     // "explicit flag = already decided" rule as the safety step below).
     const choice = flags["wallet-type"] != null
@@ -113,7 +183,7 @@ export async function initCommand(flags: Record<string, string>) {
     (c) => !listChains().includes(c.toLowerCase()),
   );
   const allChainNames = [...listChains(), ...customChainNames];
-  console.log(`Step 2/3  Active chain — currently: ${config.activeChain}`);
+  console.log(`Step 2/4  Active chain — currently: ${config.activeChain}`);
   // Iter368: explicit --chain beats the prompt in interactive mode too.
   const chainChoice = flags["chain"] != null
     ? flags["chain"]
@@ -136,7 +206,7 @@ export async function initCommand(flags: Record<string, string>) {
 
   // ── Step 3: safety ──
   const cur = loadConfig();
-  console.log("Step 3/3  Safety guardrails (production-grade defaults):");
+  console.log("Step 3/4  Safety guardrails (production-grade defaults):");
   // Iter368: honor explicit safety flags in interactive mode too. Pre-iter368 the
   // wizard only consulted flags when nonInteractive=true — so an operator running
   //   `tradekit init --per-tx-limit 100`
@@ -187,6 +257,53 @@ export async function initCommand(flags: Record<string, string>) {
       console.log("  (kept: infinite approvals require explicit override)");
     }
   }
+  // ── Step 4: observability & automation preset ──
+  //
+  // The automation stack (decision journals, retention, the alert
+  // watcher) ships disabled-by-default for minimal installs. Wiring
+  // it by hand is a dozen config commands scattered across the
+  // README — the preset applies production-sane defaults in one
+  // answer, never clobbering anything the operator already set.
+  {
+    const cfg4 = loadConfig();
+    const already =
+      cfg4.engine.orderJournal.enabled &&
+      cfg4.engine.scheduleJournal.enabled &&
+      cfg4.engine.rebalanceJournal.enabled &&
+      cfg4.db.retention.enabled &&
+      (cfg4.safety as { strategyAlerts?: { enabled?: boolean } }).strategyAlerts?.enabled === true;
+    if (already) {
+      console.log("Step 4/4  Observability:  already configured  (journals + retention + alert watcher on)");
+    } else {
+      console.log("Step 4/4  Observability & automation (production preset):");
+      console.log("  Enables: decision journals (order/schedule/rebalance replay + drift history),");
+      console.log("           DB retention (audit/events 180d, journals 60d),");
+      console.log("           the alert watcher with 5 starter rules (failure streak, staleness,");
+      console.log("           drift proximity, budget approach, drawdown).");
+      const obsAnswer = flags["observability"] != null
+        ? flags["observability"]
+        : nonInteractive
+          ? "n"
+          : await prompt("  Apply the observability preset? (Y/n): ");
+      const v = (obsAnswer ?? "").trim().toLowerCase();
+      const accepted = flags["observability"] != null
+        ? obsAnswer === "true" || v === "y" || v === "yes"
+        : v === "" || v === "y" || v === "yes";
+      if (accepted) {
+        const { config: next, changed } = applyObservabilityPreset(loadConfig());
+        saveConfig(next);
+        for (const c of changed) console.log(`  ✓ ${c}`);
+        if (changed.length === 0) console.log("  (nothing to change — already configured)");
+        console.log("  ℹ alert + digest delivery needs a notify channel:");
+        console.log("    tradekit config push notifications.channels '{\"name\":\"ops\",\"url\":\"https://hooks.slack.com/...\"}'");
+        console.log("    then: tradekit config set notifications.digest '{\"enabled\":true,\"hourUtc\":9}'");
+      } else {
+        console.log("  (skipped — enable later by re-running `tradekit init` or via the README's");
+        console.log("   \"Strategy alerts\" / \"Order decision journal\" / \"DB retention\" sections)");
+      }
+    }
+  }
+
   console.log("");
   console.log("Done. Next steps:");
   console.log("  • `tradekit doctor`               — verify everything is healthy");
@@ -205,6 +322,9 @@ export async function initCommand(flags: Record<string, string>) {
     console.log("  • `tradekit health`               — operator dashboard (portfolio + PnL + alerts)");
     console.log("  • `tradekit quote --chain base --direction sell --base ETH --quote USDC --baseAmount 0.001`");
     console.log("                                   — try a real quote (no tx sent)");
+    console.log("  • `tradekit engine run`           — start the automation supervisor (orders/DCA/rebalance)");
+    console.log("  • Paper trial loop: `paper deposit` → `playbook deploy --paper` → watch `paper pnl --mtm`");
+    console.log("                                   → `playbook promote` when it earns real funds");
   } else {
     console.log("  • `tradekit account create-mnemonic`  — create an HD wallet (or `wallet create` for single-key)");
   }
