@@ -43,6 +43,27 @@ export async function runwayCommand(flags: Record<string, string>) {
   for (const b of report.buckets) {
     console.log(renderBucket(b, horizonDays));
   }
+  if (report.gas.length > 0) {
+    console.log("Gas (native, REAL fires only — estimate from recent trade history):\n");
+    for (const g of report.gas) {
+      const scope = `${g.account}/${g.chain}`;
+      let verdict: string;
+      if (g.balance == null) verdict = "?  native balance unknown";
+      else if (g.avgGasPerFire == null) verdict = `?  no gas history yet (balance ${trimNum(g.balance)})`;
+      else if (g.exhaustsAt != null) {
+        const marker = (g.runwayDays ?? 0) <= 7 ? "✗" : "⚠";
+        verdict = `${marker}  gas runs out ~${g.exhaustsAt.slice(0, 10)} (${g.runwayDays!.toFixed(1)}d) — covers ${g.firesCovered}/${g.totalFiresInHorizon} fires`;
+      } else verdict = `✓  gas survives the horizon (${g.totalFiresInHorizon} fires)`;
+      console.log(`⛽ ${scope}`);
+      console.log(`  ${verdict}`);
+      const parts: string[] = [];
+      if (g.balance != null) parts.push(`balance ${trimNum(g.balance)}`);
+      if (g.avgGasPerFire != null) parts.push(`~${trimNum(g.avgGasPerFire)}/fire (n=${g.gasSamples})`);
+      if (g.oneShotOrders > 0) parts.push(`${g.oneShotOrders} one-shot order(s) reserved`);
+      if (parts.length) console.log(`  ${parts.join("  ·  ")}`);
+      console.log("");
+    }
+  }
   if (report.skipped.length > 0) {
     console.log("Skipped (spend needs a price — sized in the opposite denomination):");
     for (const s of report.skipped) {

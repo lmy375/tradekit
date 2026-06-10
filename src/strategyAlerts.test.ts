@@ -1368,3 +1368,60 @@ describe("evaluateFundingRunway", () => {
     expect(needed.has("runway")).toBe(true);
   });
 });
+
+// ── funding_runway × gas buckets (v34.5) ────────────────────
+
+describe("evaluateFundingRunway — gas buckets", () => {
+  const rule = { type: "funding_runway", thresholdDays: 7 } as never;
+  const NOW3 = new Date("2026-06-10T00:00:00Z");
+
+  function reportWithGas(gas: unknown[], buckets: unknown[] = []) {
+    return {
+      tag: "t", mode: "real", window: "30d", generatedAt: NOW3.toISOString(),
+      runway: { generatedAt: NOW3.toISOString(), horizonDays: 90, buckets, gas, skipped: [] },
+    } as never;
+  }
+
+  const gasBucket = (over: Record<string, unknown> = {}) => ({
+    account: "default", chain: "base",
+    balance: 0.002, avgGasPerFire: 0.001, gasSamples: 40,
+    totalFiresInHorizon: 10, oneShotOrders: 0, firesCovered: 2,
+    exhaustsAt: "2026-06-14T00:00:00.000Z", runwayDays: 4,
+    ...over,
+  });
+
+  it("a gas bucket inside the threshold fires the rule", () => {
+    const ev = evaluateFundingRunway({ tag: "t", rule, report: reportWithGas([gasBucket()]), now: NOW3 });
+    expect(ev.applicable).toBe(true);
+    expect(ev.violated).toBe(true);
+    expect(ev.message).toMatch(/gas \(base\) runs out in 4.0d/);
+    expect(ev.value.kind).toBe("gas");
+  });
+
+  it("a no-estimate gas bucket never pages (no guess)", () => {
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWithGas([gasBucket({ avgGasPerFire: null, runwayDays: 2 })]),
+      now: NOW3,
+    });
+    expect(ev.applicable).toBe(false);
+  });
+
+  it("the shortest fuse wins across token AND gas candidates", () => {
+    const tokenBucket = {
+      account: "default", chain: "base", paper: false,
+      token: "0xusdc", symbol: "USDC",
+      balance: 300, oneShotReserved: 0, burn30d: 400,
+      totalFiresInHorizon: 8, firesCovered: 6,
+      exhaustsAt: "2026-06-30T00:00:00.000Z", runwayDays: 20,
+      obligations: [],
+    };
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWithGas([gasBucket()], [tokenBucket]),
+      now: NOW3,
+    });
+    expect(ev.violated).toBe(true);
+    expect(ev.value.kind).toBe("gas"); // 4d < 20d
+  });
+});

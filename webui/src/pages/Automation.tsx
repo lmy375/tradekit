@@ -459,10 +459,10 @@ export function Automation({ status: _status }: PageProps) {
               current balances (real buckets read on-chain).
             </Text>
           )}
-          {runway && runway.buckets.length === 0 && (
+          {runway && runway.buckets.length === 0 && runway.gas.length === 0 && (
             <Text size="xs" c="dimmed">no computable spend — nothing to forecast</Text>
           )}
-          {runway && runway.buckets.length > 0 && (
+          {runway && (runway.buckets.length > 0 || runway.gas.length > 0) && (
             <Stack gap={4}>
               {runway.buckets.slice(0, 8).map((b, i) => {
                 const sym = b.symbol ?? (b.token === "native" ? "native" : `${b.token.slice(0, 8)}…`);
@@ -479,6 +479,25 @@ export function Automation({ status: _status }: PageProps) {
                     <Text size="xs" ff="monospace" style={{ flex: 1 }}>
                       {b.account}/{b.chain}{b.paper ? " [paper]" : ""} · bal {b.balance == null ? "?" : b.balance.toFixed(2)} · {verdict.text}
                       {b.exhaustsAt != null ? ` · ${b.firesCovered}/${b.totalFiresInHorizon} fires` : ""}
+                    </Text>
+                  </Group>
+                );
+              })}
+              {runway.gas.map((g, i) => {
+                const verdict =
+                  g.balance == null ? { color: "gray", text: "native balance unknown" } :
+                  g.avgGasPerFire == null ? { color: "gray", text: `no gas history (bal ${g.balance.toFixed(4)})` } :
+                  g.exhaustsAt != null && (g.runwayDays ?? 0) <= 7 ? { color: "red", text: `gas out ~${g.exhaustsAt.slice(0, 10)} (${g.runwayDays!.toFixed(1)}d)` } :
+                  g.exhaustsAt != null ? { color: "yellow", text: `gas out ~${g.exhaustsAt.slice(0, 10)} (${g.runwayDays!.toFixed(1)}d)` } :
+                  { color: "teal", text: `gas survives ${runway.horizonDays}d` };
+                return (
+                  <Group key={`gas-${i}`} gap={6} wrap="nowrap">
+                    <Badge size="xs" color={verdict.color} variant="outline" style={{ flexShrink: 0 }}>
+                      ⛽ gas
+                    </Badge>
+                    <Text size="xs" ff="monospace" style={{ flex: 1 }}>
+                      {g.account}/{g.chain} · {verdict.text}
+                      {g.avgGasPerFire != null ? ` · ~${g.avgGasPerFire.toFixed(6)}/fire (n=${g.gasSamples})` : ""}
                     </Text>
                   </Group>
                 );

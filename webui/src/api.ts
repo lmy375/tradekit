@@ -385,11 +385,25 @@ export interface RunwayBucket {
   runwayDays: number | null;
 }
 
+export interface GasRunwayRow {
+  account: string;
+  chain: string;
+  balance: number | null;
+  avgGasPerFire: number | null;
+  gasSamples: number;
+  totalFiresInHorizon: number;
+  oneShotOrders: number;
+  firesCovered: number;
+  exhaustsAt: string | null;
+  runwayDays: number | null;
+}
+
 export interface RunwayResp {
   ok: true;
   generatedAt: string;
   horizonDays: number;
   buckets: RunwayBucket[];
+  gas: GasRunwayRow[];
   skipped: { kind: string; id: number; reason: string }[];
 }
 

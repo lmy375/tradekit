@@ -536,32 +536,72 @@ export const evaluateFundingRunway: EvaluateFn<
   });
   const runway = report.runway;
   if (!runway) return evaluation({ message: "runway section missing" });
-  let shortest: typeof runway.buckets[number] | null = null;
+  // Candidates: token buckets AND (v34.5) gas buckets — both burn out
+  // the same way; the shortest fuse decides. Normalized to one shape.
+  interface Candidate {
+    kind: "token" | "gas";
+    label: string;
+    token: string | null;
+    symbol: string | null;
+    chain: string;
+    account: string;
+    paper: boolean;
+    balance: number;
+    runwayDays: number;
+    exhaustsAt: string | null;
+    firesCovered: number;
+    totalFiresInHorizon: number;
+  }
+  const candidates: Candidate[] = [];
+  let evaluable = false;
   for (const b of runway.buckets) {
     if (b.balance == null) continue; // balance fetch failed — skip, don't guess
     if (b.totalFiresInHorizon === 0 && b.oneShotReserved === 0) continue; // nothing burns this token
+    evaluable = true;
     if (b.runwayDays == null) continue; // survives the whole horizon
-    if (!shortest || (shortest.runwayDays ?? Infinity) > b.runwayDays) shortest = b;
+    candidates.push({
+      kind: "token",
+      label: b.symbol ?? b.token,
+      token: b.token, symbol: b.symbol, chain: b.chain, account: b.account, paper: b.paper,
+      balance: b.balance, runwayDays: b.runwayDays, exhaustsAt: b.exhaustsAt,
+      firesCovered: b.firesCovered, totalFiresInHorizon: b.totalFiresInHorizon,
+    });
+  }
+  for (const g of runway.gas ?? []) {
+    if (g.balance == null || g.avgGasPerFire == null) continue; // no estimate — never page on a guess
+    if (g.totalFiresInHorizon === 0 && g.oneShotOrders === 0) continue;
+    evaluable = true;
+    if (g.runwayDays == null) continue;
+    candidates.push({
+      kind: "gas",
+      label: `gas (${g.chain})`,
+      token: null, symbol: null, chain: g.chain, account: g.account, paper: false,
+      balance: g.balance, runwayDays: g.runwayDays, exhaustsAt: g.exhaustsAt,
+      firesCovered: g.firesCovered, totalFiresInHorizon: g.totalFiresInHorizon,
+    });
+  }
+  let shortest: Candidate | null = null;
+  for (const c of candidates) {
+    if (!shortest || shortest.runwayDays > c.runwayDays) shortest = c;
   }
   if (!shortest) {
-    const evaluable = runway.buckets.some((b) => b.balance != null && (b.totalFiresInHorizon > 0 || b.oneShotReserved > 0));
     if (!evaluable) return evaluation({ message: "no recurring spend (or balances unknown)" });
     return evaluation({
       applicable: true,
       violated: false,
-      message: `all spend tokens survive the ${runway.horizonDays}d horizon`,
+      message: `all spend tokens + gas survive the ${runway.horizonDays}d horizon`,
       value: { horizonDays: runway.horizonDays },
     });
   }
-  const violated = shortest.runwayDays! <= rule.thresholdDays;
-  const sym = shortest.symbol ?? shortest.token;
+  const violated = shortest.runwayDays <= rule.thresholdDays;
   return evaluation({
     applicable: true,
     violated,
     message: violated
-      ? `${sym} runs out in ${shortest.runwayDays!.toFixed(1)}d (≤ ${rule.thresholdDays}d): balance ${shortest.balance!.toFixed(4)} covers ${shortest.firesCovered}/${shortest.totalFiresInHorizon} upcoming fires`
-      : `shortest runway ${shortest.runwayDays!.toFixed(1)}d on ${sym} (> ${rule.thresholdDays}d)`,
+      ? `${shortest.label} runs out in ${shortest.runwayDays.toFixed(1)}d (≤ ${rule.thresholdDays}d): balance ${shortest.balance.toFixed(4)} covers ${shortest.firesCovered}/${shortest.totalFiresInHorizon} upcoming fires`
+      : `shortest runway ${shortest.runwayDays.toFixed(1)}d on ${shortest.label} (> ${rule.thresholdDays}d)`,
     value: {
+      kind: shortest.kind,
       token: shortest.token,
       symbol: shortest.symbol,
       chain: shortest.chain,

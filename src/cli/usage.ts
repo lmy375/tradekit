@@ -366,8 +366,13 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
         on-chain read for real). Price-free spend accounting: buys burn quote,
         sells burn base; opposite-denomination sizing is listed as skipped.
         "USDC covers 3 more DCA fires; runs out Thursday" — BEFORE the first
-        fire_failed. Pair with the funding_runway alert rule for push (or
-        action:"pause" to stop firing into guaranteed failures).
+        fire_failed. v34.5: a gas section estimates native-gas burn for REAL
+        fires from recent trade history (avg gas_cost_native × upcoming
+        occurrences vs native balance) — the most common beginner failure
+        (full of USDC, dry of ETH) becomes a forecast too. Pair with the
+        funding_runway alert rule for push — token and gas buckets both
+        count, shortest fuse decides (or action:"pause" to stop firing
+        into guaranteed failures).
   strategy pause <tag> [--json]
         Bulk-pause EVERY active primitive (orders / schedules / rebalance plans)
         owned by the strategy tag in one command. Non-destructive — nothing is

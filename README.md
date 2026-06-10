@@ -693,6 +693,8 @@ USDC  ·  default/base
 
 **Price-free and exact.** Buys burn the quote token (`quote_amount` per fire); sells burn the base token. Primitives sized in the *opposite* denomination (a buy specified in base amount) have an unknowable spend without a price oracle — they're listed under `skipped` rather than silently guessed. Rebalance plans are out of scope by design: their trades are drift-dependent and sells fund the buys — no fixed burn rate exists.
 
+**Gas is fuel too (v34.5).** Every REAL fire burns native gas regardless of the spend token — a wallet flush with USDC but dry of ETH fails every fire, and it's the most common beginner failure. The report's `gas` section groups real schedules + active orders by (account, chain), estimates per-fire gas from the **historical average over the last 50 successful trades** (`gas_cost_native`), and replays the same occurrence stream against the native balance: `⛽ default/base · gas runs out ~2026-07-02 (21d) — covers 53/90 fires · ~0.0004/fire (n=37)`. Honesty rules: no trade history → no estimate, no verdict (exposure still listed); gas prices move, so `exhaustsAt` is order-of-magnitude; paper fires burn nothing and never appear; rebalance evaluations are excluded (0..N legs per occurrence). The `funding_runway` alert rule considers gas buckets alongside token buckets — **the shortest fuse decides** — so "out of gas in 5 days" pages exactly like "out of USDC in 5 days".
+
 **Push, not pull.** The `funding_runway` alert rule closes the loop:
 
 ```jsonc

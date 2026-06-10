@@ -31,7 +31,7 @@
  * the real wallet and vice versa.
  */
 
-import { listOrders, listSchedules, getPaperBalance, type OrderRow, type ScheduleRow } from "./db.js";
+import { listOrders, listSchedules, getPaperBalance, recentGasStats, type OrderRow, type ScheduleRow } from "./db.js";
 import { parseCron, nextRun } from "./cron.js";
 import { loadConfig, resolveProfile, type Config } from "./config.js";
 import { ToolError } from "./errors.js";
@@ -86,10 +86,40 @@ export interface TokenRunwayBucket {
   obligations: RunwayObligation[];
 }
 
+/** v34.5: gas-runway verdict for one (account, chain) — REAL
+ *  primitives only (paper fires burn no gas). The walk reuses the
+ *  same cron occurrence merge as token buckets, charging the
+ *  historical average gas per fire at every upcoming schedule
+ *  occurrence, with active orders reserved one-shot. Rebalance
+ *  evaluations are excluded (0..N legs per occurrence — unknowable).
+ *  NOTE: this is an ESTIMATE — gas prices move; treat exhaustsAt as
+ *  order-of-magnitude. Native SELL schedules also appear as a token
+ *  bucket ("native" spend); the two views share one balance but are
+ *  reported independently. */
+export interface GasRunwayBucket {
+  account: string;
+  chain: string;
+  /** Native balance. null = fetch failed. */
+  balance: number | null;
+  /** Historical average gas per fire. null = no priced trade history
+   *  on this (chain, account) — no estimate is attempted. */
+  avgGasPerFire: number | null;
+  gasSamples: number;
+  /** Real fires in the horizon (schedules) + one-shot orders reserved. */
+  totalFiresInHorizon: number;
+  oneShotOrders: number;
+  firesCovered: number;
+  exhaustsAt: string | null;
+  runwayDays: number | null;
+}
+
 export interface RunwayReport {
   generatedAt: string;
   horizonDays: number;
   buckets: TokenRunwayBucket[];
+  /** v34.5: per-(account, chain) native-gas forecast for REAL
+   *  primitives. Empty when no real schedules/orders exist. */
+  gas: GasRunwayBucket[];
   skipped: RunwaySkipped[];
 }
 
@@ -252,6 +282,9 @@ export interface ComputeRunwayArgs {
   strategy?: string;
   horizonDays?: number;
   balanceFetcher: RunwayBalanceFetcher;
+  /** Historical gas estimator (test seam). Defaults to db
+   *  recentGasStats. Return null = no estimate. */
+  gasStatsFn?: (chain: string, account: string) => { avgGasNative: number; samples: number } | null;
   now?: Date;
 }
 
@@ -418,10 +451,109 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
     return `${a.account}/${a.chain}/${a.token}`.localeCompare(`${z.account}/${z.chain}/${z.token}`);
   });
 
+  // ── v34.5 gas buckets ─────────────────────────────────────
+  // Every REAL fire burns native gas regardless of the spend token —
+  // a wallet flush with USDC but dry of ETH fails every fire. Group
+  // real schedules + active orders by (account, chain), estimate
+  // per-fire gas from recent trade history, and replay the SAME
+  // occurrence stream against the native balance.
+  const gasStats = args.gasStatsFn ?? ((c: string, a: string) => recentGasStats(c, a));
+  interface GasAccum {
+    account: string;
+    chain: string;
+    schedules: Array<{
+      obligation: RunwayObligation;
+      cron: string;
+      nextRunAt: string;
+      endAt: string | null;
+      remainingRuns: number;
+    }>;
+    orders: number;
+  }
+  const gasGroups = new Map<string, GasAccum>();
+  for (const s of schedules) {
+    if (s.id == null || (s.paper ?? 0) === 1) continue;
+    const key = `${s.account} ${s.chain.toLowerCase()}`;
+    let g = gasGroups.get(key);
+    if (!g) {
+      g = { account: s.account, chain: s.chain.toLowerCase(), schedules: [], orders: 0 };
+      gasGroups.set(key, g);
+    }
+    g.schedules.push({
+      obligation: { kind: "schedule", id: s.id, name: s.name, strategy: s.strategy, amountPerFire: 0, cron: s.cron_expr },
+      cron: s.cron_expr,
+      nextRunAt: s.next_run_at,
+      endAt: s.end_at,
+      remainingRuns: s.max_runs != null ? Math.max(0, s.max_runs - s.run_count) : Infinity,
+    });
+  }
+  for (const o of orders) {
+    if (o.id == null || (o.paper ?? 0) === 1) continue;
+    const key = `${o.account} ${o.chain.toLowerCase()}`;
+    let g = gasGroups.get(key);
+    if (!g) {
+      g = { account: o.account, chain: o.chain.toLowerCase(), schedules: [], orders: 0 };
+      gasGroups.set(key, g);
+    }
+    g.orders += 1;
+  }
+
+  const gas: GasRunwayBucket[] = [];
+  for (const g of gasGroups.values()) {
+    const stats = gasStats(g.chain, g.account);
+    const fetched = await args.balanceFetcher({ account: g.account, chain: g.chain, token: "native", paper: false });
+    const balance = fetched?.amount ?? null;
+
+    if (stats == null || balance == null) {
+      // No estimate possible — still report fire counts so the
+      // operator sees the exposure even without a verdict.
+      const probe = walkRunway({
+        schedules: g.schedules.map((s) => ({ ...s, obligation: { ...s.obligation, amountPerFire: 0 } })),
+        startBalance: Number.MAX_SAFE_INTEGER,
+        now,
+        horizonDays,
+      });
+      gas.push({
+        account: g.account,
+        chain: g.chain,
+        balance,
+        avgGasPerFire: stats?.avgGasNative ?? null,
+        gasSamples: stats?.samples ?? 0,
+        totalFiresInHorizon: probe.totalFiresInHorizon,
+        oneShotOrders: g.orders,
+        firesCovered: 0,
+        exhaustsAt: null,
+        runwayDays: null,
+      });
+      continue;
+    }
+
+    const walk = walkRunway({
+      schedules: g.schedules.map((s) => ({ ...s, obligation: { ...s.obligation, amountPerFire: stats.avgGasNative } })),
+      startBalance: balance - g.orders * stats.avgGasNative,
+      now,
+      horizonDays,
+    });
+    gas.push({
+      account: g.account,
+      chain: g.chain,
+      balance,
+      avgGasPerFire: stats.avgGasNative,
+      gasSamples: stats.samples,
+      totalFiresInHorizon: walk.totalFiresInHorizon,
+      oneShotOrders: g.orders,
+      firesCovered: walk.firesCovered,
+      exhaustsAt: walk.exhaustsAt,
+      runwayDays: walk.runwayDays,
+    });
+  }
+  gas.sort((a, z) => (a.runwayDays ?? Infinity) - (z.runwayDays ?? Infinity));
+
   return {
     generatedAt: now.toISOString(),
     horizonDays,
     buckets: out,
+    gas,
     skipped,
   };
 }

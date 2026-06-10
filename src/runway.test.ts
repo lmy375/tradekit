@@ -312,3 +312,95 @@ describe("computeFundingRunway — db integration", () => {
     expect(report.buckets[1].exhaustsAt).toBeNull();
   });
 });
+
+// ── v34.5: gas runway ────────────────────────────────────────
+
+describe("computeFundingRunway — gas buckets", () => {
+  const gasStats = (avg: number | null, samples = 40) =>
+    (_c: string, _a: string) => (avg == null ? null : { avgGasNative: avg, samples });
+
+  it("charges avg gas per upcoming REAL fire against the native balance", async () => {
+    seedSchedule({ paper: false }); // weekly, real
+    const report = await computeFundingRunway({
+      horizonDays: 60,
+      balanceFetcher: fetcher({ [`r:${USDC}`]: 100_000, "r:native": 0.0035 }),
+      gasStatsFn: gasStats(0.001),
+      now: NOW,
+    });
+    expect(report.gas).toHaveLength(1);
+    const g = report.gas[0];
+    expect(g.avgGasPerFire).toBe(0.001);
+    expect(g.balance).toBe(0.0035);
+    // 0.0035 covers 3 fires at 0.001; the 4th (Jul 6) exhausts.
+    expect(g.firesCovered).toBe(3);
+    expect(g.exhaustsAt).toBe("2026-07-06T00:00:00.000Z");
+    expect(g.runwayDays).toBeCloseTo(26, 0);
+  });
+
+  it("paper primitives never produce gas buckets", async () => {
+    seedSchedule({ paper: true });
+    const report = await computeFundingRunway({
+      horizonDays: 30,
+      balanceFetcher: fetcher({ [`p:${USDC}`]: 1000 }),
+      gasStatsFn: gasStats(0.001),
+      now: NOW,
+    });
+    expect(report.gas).toHaveLength(0);
+  });
+
+  it("active real orders reserve one-shot gas", async () => {
+    seedSchedule({ paper: false });
+    seedOrder({ paper: false });
+    seedOrder({ paper: false });
+    const report = await computeFundingRunway({
+      horizonDays: 60,
+      balanceFetcher: fetcher({ "r:native": 0.0035, [`r:${USDC}`]: 100_000 }),
+      gasStatsFn: gasStats(0.001),
+      now: NOW,
+    });
+    const g = report.gas[0];
+    expect(g.oneShotOrders).toBe(2);
+    // 0.0035 - 2×0.001 = 0.0015 → covers only 1 weekly fire.
+    expect(g.firesCovered).toBe(1);
+  });
+
+  it("no gas history → no estimate, no verdict (never guess)", async () => {
+    seedSchedule({ paper: false });
+    const report = await computeFundingRunway({
+      horizonDays: 30,
+      balanceFetcher: fetcher({ "r:native": 1, [`r:${USDC}`]: 100_000 }),
+      gasStatsFn: gasStats(null),
+      now: NOW,
+    });
+    const g = report.gas[0];
+    expect(g.avgGasPerFire).toBeNull();
+    expect(g.exhaustsAt).toBeNull();
+    expect(g.runwayDays).toBeNull();
+    expect(g.totalFiresInHorizon).toBeGreaterThan(0); // exposure still visible
+  });
+
+  it("default gasStatsFn reads real trade history", async () => {
+    const { insertTrade } = await import("./db.js");
+    for (let i = 0; i < 3; i++) {
+      insertTrade({
+        timestamp: `2026-06-0${i + 1}T00:00:00Z`,
+        chain: "base", account: "default", direction: "buy",
+        base_token: WETH, base_symbol: "WETH", base_amount: "0.1",
+        quote_token: USDC, quote_symbol: "USDC", quote_amount: "200",
+        price: "2000", tx_hash: `0xg${i}`, status: "success",
+        gas_used: "21000", gas_price_wei: null,
+        gas_cost_native: String(0.001 * (i + 1)), // avg 0.002
+        aggregator: "kyberswap", fee_tier: null, notes: null,
+        strategy: null, realized_slippage_bps: null,
+      });
+    }
+    seedSchedule({ paper: false });
+    const report = await computeFundingRunway({
+      horizonDays: 30,
+      balanceFetcher: fetcher({ "r:native": 1, [`r:${USDC}`]: 100_000 }),
+      now: NOW,
+    });
+    expect(report.gas[0].avgGasPerFire).toBeCloseTo(0.002, 9);
+    expect(report.gas[0].gasSamples).toBe(3);
+  });
+});

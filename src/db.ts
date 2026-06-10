@@ -3773,6 +3773,27 @@ export function findScheduleFireEvidence(args: {
   return { txHash: row.tx_hash, baseAmount: row.base_amount, quoteAmount: row.quote_amount, status: row.status, at: row.timestamp };
 }
 
+/** v34.5: average native gas per trade from recent history — the
+ *  basis for the gas-runway estimate. Success trades only (reverted
+ *  rows burn gas too but their cost profile is unrepresentative),
+ *  most recent `limit` rows on the (chain, account). Returns null
+ *  when no priced samples exist — the caller reports "no estimate"
+ *  instead of guessing. */
+export function recentGasStats(chain: string, account: string, limit = 50): { avgGasNative: number; samples: number } | null {
+  const db = openDb();
+  const row = db
+    .prepare(
+      `SELECT AVG(CAST(gas_cost_native AS REAL)) AS avg_gas, COUNT(*) AS n FROM (
+         SELECT gas_cost_native FROM trades
+          WHERE chain = ? AND account = ? AND status = 'success' AND gas_cost_native IS NOT NULL
+          ORDER BY timestamp DESC LIMIT ?
+       )`,
+    )
+    .get(chain, account, limit) as { avg_gas: number | null; n: number };
+  if (row.avg_gas == null || row.n === 0 || !Number.isFinite(row.avg_gas)) return null;
+  return { avgGasNative: row.avg_gas, samples: row.n };
+}
+
 /** v33: order counterpart of findScheduleFireEvidence. Orders fire
  *  ONCE ever, so the evidence window is the order’s whole lifetime
  *  (created_at): ANY pending/success trade stamped `[order #<id>]`
