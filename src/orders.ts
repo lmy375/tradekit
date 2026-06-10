@@ -41,6 +41,7 @@ import {
   activeOrders,
   recordOrderCheck,
   markOrderFilled,
+  findOrderFireEvidence,
   markOrderFailed,
   markOrderExpired,
   cancelOrder as dbCancelOrder,
@@ -567,7 +568,7 @@ export interface OrderTickArgs {
 
 export interface OrderTickFillReport {
   orderId: number;
-  status: "filled" | "failed" | "skipped";
+  status: "filled" | "failed" | "skipped" | "recovered";
   /** Price observed at trigger time. Always populated for fills/failures;
    *  may be null for skipped (e.g. unpriceable token). */
   observedPriceUsd: number | null;
@@ -592,6 +593,11 @@ export interface OrderTickReport {
   failedCount: number;
   expiredCount: number;
   transientErrorCount: number;
+  /** v33: fills booked by the crash-window guard from an evidence
+   *  trade (engine crash mid-fire, or a TX_TIMEOUT'd tx that
+   *  confirmed before this tick). Counted separately from `filled`
+   *  — nothing was sent this tick. */
+  recoveredCount: number;
   /** Per-order fill outcomes for the orders that triggered this tick. Skipped
    *  rows (price unknown, etc.) are also surfaced so a watching operator can
    *  see why a near-triggering row didn't fire. */
@@ -615,6 +621,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
   const fills: OrderTickFillReport[] = [];
   let transientErrors = 0;
   let filled = 0;
+  let recoveredCount = 0;
   let failed = 0;
   let expired = 0;
   let triggered = 0;
@@ -870,6 +877,84 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       setOrderError(order.id, "ENGINE_LOCKED", msg);
       await recordJournal({ skipped: true, notes: msg });
       continue;
+    }
+
+    // v33 crash-window guard: an order fires ONCE, ever — so ANY
+    // pending/success trade attributable to it (real fires stamp
+    // `[order #<id>]` into the note; paper fires carry source ids)
+    // means the intent already executed and the bookkeeping never
+    // landed: the engine crashed between tx-send and markOrderFilled,
+    // or a TX_TIMEOUT'd tx confirmed before this tick (the timeout
+    // path leaves the order ACTIVE for retry — without this guard
+    // the retry would double-buy). Book the fill from the evidence
+    // trade instead of refiring. Reverted rows don't count — the
+    // swap didn't deliver; refiring is correct.
+    {
+      const isPaperOrderGuard = (order.paper ?? 0) === 1;
+      const evidence = findOrderFireEvidence({
+        orderId: order.id,
+        sinceIso: order.created_at,
+        paper: isPaperOrderGuard,
+      });
+      if (evidence) {
+        markOrderFilled(order.id, {
+          tx_hash: evidence.txHash ?? "recovered",
+          fill_price: evidence.priceUsd ?? currentPrice ?? 0,
+          base_amount: evidence.baseAmount ?? "0",
+          quote_amount: evidence.quoteAmount ?? "0",
+        });
+        recoveredCount += 1;
+        fills.push({
+          orderId: order.id,
+          status: "recovered",
+          observedPriceUsd: currentPrice,
+          txHash: evidence.txHash ?? undefined,
+        });
+        if (journalConfig.enabled) {
+          const { insertOrderCheckEntry } = await import("./db.js");
+          try {
+            insertOrderCheckEntry({
+              orderId: order.id,
+              checkedAt: new Date().toISOString(),
+              priceUsd: currentPrice,
+              waterMarkUsd: order.water_mark_usd,
+              thresholdUsd: null,
+              decision: "recovered",
+              notes: `interrupted fire recovered from ${evidence.status} trade at ${evidence.at} — booked, not refired`,
+            });
+          } catch { /* journal is best-effort */ }
+        }
+        await tryNotify(
+          {
+            event: "order.recovered",
+            severity: "warn",
+            title: `Order #${order.id} fill recovered — found ${evidence.status} trade, NOT refiring`,
+            body:
+              `A trade attributable to this order already exists (${evidence.txHash ?? "no hash"}, status ${evidence.status}) ` +
+              `but the order was still active — likely an engine crash mid-fire or a timed-out tx that confirmed later. ` +
+              `The fill was booked from the evidence trade.` +
+              (order.on_fill_json ? ` NOTE: the on_fill hook was NOT executed for the recovered fill — create the follow-up manually if needed.` : ""),
+            fields: {
+              orderId: order.id,
+              chain: order.chain,
+              account: order.account,
+              txHash: evidence.txHash,
+              evidenceStatus: evidence.status,
+            },
+            dedupKey: `order.recovered:${order.id}`,
+          },
+          config,
+          args.logger,
+        );
+        // The fill happened — OCO peers must die exactly as on a
+        // normal fill (a surviving stop-loss would re-exit a closed
+        // position when the operator resumes it).
+        await cascadeOcoIfApplicable(order, config, args.logger, {
+          firedAs: "filled",
+          firedReason: evidence.txHash ?? "recovered",
+        });
+        continue;
+      }
     }
 
     // Pre-fire expiry re-check. The step-1 check ran BEFORE the price
@@ -1241,6 +1326,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     scanned: orders.length,
     triggered,
     filled,
+    recoveredCount,
     failedCount: failed,
     expiredCount: expired,
     transientErrorCount: transientErrors,

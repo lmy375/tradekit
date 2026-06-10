@@ -387,6 +387,7 @@ export function decisionMarker(d: OrderCheckDecision): string {
     case "expired":            return "⌛";
     case "hook_created":       return "↳";
     case "hook_failed":        return "↯";
+    case "recovered":          return "♻";
   }
 }
 
@@ -404,5 +405,6 @@ export function decisionLabel(d: OrderCheckDecision): string {
     case "hook_failed":        return "on-fill hook FAILED (fill kept)";
     case "edited_by_operator": return "edited by operator";
     case "expired":            return "expired";
+    case "recovered":          return "RECOVERED — booked from evidence trade, not refired";
   }
 }

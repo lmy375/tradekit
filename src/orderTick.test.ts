@@ -558,3 +558,176 @@ describe("runOrderTick — paused orders", () => {
     expect(slRow.last_error_code).toBe("OCO_PEER_FIRED");
   });
 });
+
+// ── v33: crash-window recovery guard ─────────────────────────
+
+describe("runOrderTick — v33 crash-window recovery", () => {
+  async function seedPaperEvidence(orderId: number, over: Record<string, unknown> = {}) {
+    const { recordPaperTrade } = await import("./db.js");
+    return recordPaperTrade({
+      timestamp: new Date().toISOString(),
+      source_type: "order",
+      source_id: orderId,
+      chain: "base",
+      account: "default",
+      direction: "buy",
+      base_token: WETH,
+      base_symbol: "WETH",
+      base_amount: "0.5",
+      quote_token: USDC,
+      quote_symbol: "USDC",
+      quote_amount: "1000",
+      price: "2000",
+      slippage_bps: 50,
+      strategy: null,
+      notes: null,
+      ...over,
+    } as never);
+  }
+
+  it("a triggered paper order with an orphaned fill is booked, not refired", async () => {
+    seedQuoteBalance("10000");
+    const id = seedOrder({ paper: true }); // price_below 2100, mock 2000 → triggered
+    await seedPaperEvidence(id);
+    const report = await tick();
+    expect(report.recoveredCount).toBe(1);
+    expect(report.filled).toBe(0); // nothing sent this tick
+    const fill = report.fills.find((f) => f.orderId === id)!;
+    expect(fill.status).toBe("recovered");
+
+    const { getOrderById, listPaperTrades } = await import("./db.js");
+    const row = getOrderById(id)!;
+    expect(row.status).toBe("filled");
+    expect(row.base_amount === "0.5" || row.fill_price === 2000).toBe(true);
+    expect(row.fill_price).toBe(2000); // from the evidence trade
+    // Exactly the one orphaned fill — no double-buy.
+    expect(listPaperTrades({})).toHaveLength(1);
+  });
+
+  it("a real order recovers from a pending trade row (the TX_TIMEOUT refire scenario)", async () => {
+    const { insertTrade, getOrderById } = await import("./db.js");
+    seedQuoteBalance("10000");
+    const id = seedOrder({ paper: false }); // triggered at mock price
+    // The timed-out tx from the previous tick — still pending.
+    insertTrade({
+      timestamp: new Date().toISOString(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.5",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "1000",
+      price: "1999",
+      tx_hash: "0xtimedout",
+      status: "pending",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[order #${id}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recoveredCount).toBe(1);
+    const row = getOrderById(id)!;
+    expect(row.status).toBe("filled");
+    expect(row.fill_tx_hash).toBe("0xtimedout");
+    expect(row.fill_price).toBe(1999);
+  });
+
+  it("a reverted trade is NOT evidence — the order refires", async () => {
+    const { insertTrade } = await import("./db.js");
+    seedQuoteBalance("10000");
+    const id = seedOrder({ paper: true });
+    insertTrade({
+      timestamp: new Date().toISOString(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.5",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "1000",
+      price: "2000",
+      tx_hash: "0xreverted",
+      status: "failed",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[order #${id}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recoveredCount).toBe(0);
+    expect(report.filled).toBe(1); // refired normally (paper)
+  });
+
+  it("recovery cascades the OCO group — the surviving arm dies with the booked fill", async () => {
+    seedQuoteBalance("10000");
+    const { getOrderById } = await import("./db.js");
+    const tp = seedOrder({ paper: true, group_id: "bracket-r" }); // triggered
+    const sl = seedOrder({
+      paper: true, group_id: "bracket-r",
+      target_price_usd: 900, // far from trigger — stays active unless cascaded
+    });
+    await seedPaperEvidence(tp);
+    const report = await tick();
+    expect(report.recoveredCount).toBe(1);
+    expect(getOrderById(tp)?.status).toBe("filled");
+    const slRow = getOrderById(sl)!;
+    expect(slRow.status).toBe("cancelled");
+    expect(slRow.last_error_code).toBe("OCO_PEER_FIRED");
+  });
+
+  it("recovery skips the on_fill hook (notification says so; no follow-up created)", async () => {
+    seedQuoteBalance("10000");
+    const { listOrders, getOrderById } = await import("./db.js");
+    const id = seedOrder({
+      paper: true,
+      on_fill_json: JSON.stringify({
+        type: "createOrder",
+        spec: { side: "sell", trigger: "trailing", trailPct: 5, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+      }),
+    });
+    await seedPaperEvidence(id);
+    const report = await tick();
+    expect(report.recoveredCount).toBe(1);
+    expect(getOrderById(id)?.status).toBe("filled");
+    expect(listOrders({ status: "active" })).toHaveLength(0); // no chained follow-up
+  });
+
+  it("marker matching is exact — #N evidence never matches #N5", async () => {
+    const { insertTrade } = await import("./db.js");
+    seedQuoteBalance("10000");
+    const id = seedOrder({ paper: true });
+    insertTrade({
+      timestamp: new Date().toISOString(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.5",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "1000",
+      price: "2000",
+      tx_hash: "0xother",
+      status: "success",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[order #${id}5]`, // someone else's marker
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recoveredCount).toBe(0);
+    expect(report.filled).toBe(1);
+  });
+
+  it("journals the recovered decision", async () => {
+    const { saveConfig } = await import("./config.js");
+    const { loadConfig: lc } = await import("./config.js");
+    const cfg = lc();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, orderJournal: { ...cfg.engine.orderJournal, enabled: true } } } as never);
+    try {
+      seedQuoteBalance("10000");
+      const id = seedOrder({ paper: true });
+      await seedPaperEvidence(id);
+      await tick();
+      const { replayOrderEntries } = await import("./db.js");
+      const entries = replayOrderEntries(id);
+      const recoveredEntry = entries.find((e) => e.decision === "recovered");
+      expect(recoveredEntry).toBeDefined();
+      expect(recoveredEntry!.notes).toMatch(/booked, not refired/);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+});

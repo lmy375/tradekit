@@ -3711,6 +3711,9 @@ export interface FireEvidence {
   quoteAmount: string | null;
   status: string;
   at: string;
+  /** USD price recorded on the evidence trade (orders use it for the
+   *  fill_price column). null when the trade row has no price. */
+  priceUsd?: number | null;
 }
 
 export function findScheduleFireEvidence(args: {
@@ -3749,6 +3752,53 @@ export function findScheduleFireEvidence(args: {
     | undefined;
   if (!row) return null;
   return { txHash: row.tx_hash, baseAmount: row.base_amount, quoteAmount: row.quote_amount, status: row.status, at: row.timestamp };
+}
+
+/** v33: order counterpart of findScheduleFireEvidence. Orders fire
+ *  ONCE ever, so the evidence window is the order’s whole lifetime
+ *  (created_at): ANY pending/success trade stamped `[order #<id>]`
+ *  (real) or carrying source_type=order/source_id (paper) means the
+ *  intent already executed — an active order with such a trade is
+ *  precisely the crash/timeout case. Reverted rows do not count. */
+export function findOrderFireEvidence(args: {
+  orderId: number;
+  sinceIso: string;
+  paper: boolean;
+}): FireEvidence | null {
+  const db = openDb();
+  if (args.paper) {
+    const row = db
+      .prepare(
+        `SELECT base_amount, quote_amount, price, timestamp
+           FROM paper_trades
+          WHERE source_type = 'order' AND source_id = ? AND timestamp >= ?
+          ORDER BY timestamp DESC LIMIT 1`,
+      )
+      .get(args.orderId, args.sinceIso) as
+      | { base_amount: string; quote_amount: string; price: string; timestamp: string }
+      | undefined;
+    if (!row) return null;
+    return { txHash: null, baseAmount: row.base_amount, quoteAmount: row.quote_amount, status: "success", at: row.timestamp, priceUsd: parseFloat(row.price) };
+  }
+  const row = db
+    .prepare(
+      `SELECT tx_hash, base_amount, quote_amount, price, status, timestamp
+         FROM trades
+        WHERE notes LIKE ? AND timestamp >= ? AND status IN ('pending', 'success')
+        ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(`%[order #${args.orderId}]%`, args.sinceIso) as
+    | { tx_hash: string | null; base_amount: string; quote_amount: string; price: string | null; status: string; timestamp: string }
+    | undefined;
+  if (!row) return null;
+  return {
+    txHash: row.tx_hash,
+    baseAmount: row.base_amount,
+    quoteAmount: row.quote_amount,
+    status: row.status,
+    at: row.timestamp,
+    priceUsd: row.price != null ? parseFloat(row.price) : null,
+  };
 }
 
 /** v33: count UNCONFIRMED legs from an interrupted rebalance run in
@@ -4729,6 +4779,10 @@ export type OrderCheckDecision =
   | "triggered_fired"
   | "triggered_skipped"
   | "error"
+  // v33: crash-window guard booked the fill from an evidence trade
+  // (engine crash between tx-send and markOrderFilled, or a
+  // TX_TIMEOUT'd tx that confirmed before the next tick).
+  | "recovered"
   // v31: post-fill hook outcomes — the chained order's id (or the
   // error) lands in notes, alongside the fire in `order replay`.
   | "hook_created"
