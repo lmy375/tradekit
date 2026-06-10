@@ -173,6 +173,11 @@ PORTFOLIO REBALANCING
         the same validation as create (sum exactly 100). Frozen: chain, account,
         quote token (routing anchor), start-at. Cron/every change recomputes
         next_run_at from now. maxRuns cannot drop below the current run_count.
+  rebalance replay <id> [--limit N] [--json]
+        v29: forensic decision timeline — every evaluated occurrence incl. IN-BAND
+        ones with max drift (watch drift creep toward the threshold), plus fired /
+        partial_failure / failed / dry_run / locked-skip with leg counts. Requires
+        engine.rebalanceJournal.enabled=true. Prunable: db.retention.rebalanceCheckLogDays.
   rebalance pause <id> [--json]                Pause (engine ignores until resumed)
   rebalance resume <id> [--json]               Resume (next_run_at recomputed)
   rebalance cancel <id> [--yes] [--json]       Cancel (terminal — use pause for temporary)
@@ -221,6 +226,11 @@ SCHEDULED / RECURRING TRADES (DCA)
         Run the schedule engine. Without --once, defaults to --watch 30 (daemon mode).
         Each tick scans active schedules with next_run_at <= now, fires due ones via
         executeTrade, advances next_run_at. --dry-run advances time but never sends tx.
+  schedule replay <id> [--limit N] [--json]
+        v29: forensic decision timeline — every fired / fire_failed / retired /
+        locked-skip / on_fill hook outcome with timestamps, run numbers, tx hashes.
+        Requires engine.scheduleJournal.enabled=true (default off). Answers "why
+        didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
 CONDITIONAL ORDERS
   order create --side buy|sell --trigger price_below|price_above|trailing

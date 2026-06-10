@@ -114,6 +114,7 @@ afterAll(() => {
 beforeEach(() => {
   const db = openDb();
   db.exec("DELETE FROM rebalance_plans");
+  db.exec("DELETE FROM rebalance_check_log");
   db.exec("DELETE FROM paper_trades");
   db.exec("DELETE FROM paper_balances");
   vi.clearAllMocks();
@@ -485,5 +486,90 @@ describe("runRebalanceTick — engine lock", () => {
     } finally {
       await unlockEngine({ unlockedBy: "test", config, logger: noopLogger });
     }
+  });
+});
+
+// ── v29: decision journal ────────────────────────────────────
+
+describe("runRebalanceTick — decision journal (v29)", () => {
+  function seedPaperBook2(args: { eth: string; usdc: string }): void {
+    setPaperBalance({ account: "default", chain: "base", token: NATIVE_TOKEN, decimals: 18, amount: args.eth });
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: args.usdc });
+  }
+
+  async function withJournal<T>(fn: () => Promise<T>): Promise<T> {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, rebalanceJournal: { enabled: true } } } as never);
+    try {
+      return await fn();
+    } finally {
+      saveConfig(cfg);
+    }
+  }
+
+  it("journal is OFF by default — evaluations write no rows", async () => {
+    seedPaperBook2({ eth: "0.4", usdc: "200" });
+    seedPlan({ paper: true });
+    await runRebalanceTick({ logger: noopLogger });
+    const n = (openDb().prepare(`SELECT COUNT(*) AS n FROM rebalance_check_log`).get() as { n: number }).n;
+    expect(n).toBe(0);
+  });
+
+  it("a fire journals 'fired' with drift, threshold, and leg counts", async () => {
+    await withJournal(async () => {
+      seedPaperBook2({ eth: "0.4", usdc: "200" }); // 80/20 vs 60/40 → 20pt drift
+      const id = seedPlan({ paper: true });
+      await runRebalanceTick({ logger: noopLogger });
+      const { replayRebalanceEntries } = await import("./db.js");
+      const entries = replayRebalanceEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("fired");
+      expect(entries[0].max_drift_pct).toBeCloseTo(20, 1);
+      expect(entries[0].threshold_pct).toBe(5);
+      expect(entries[0].executed_count).toBe(1);
+    });
+  });
+
+  it("in-band evaluations journal the DRIFT HISTORY (the headline feature)", async () => {
+    await withJournal(async () => {
+      // Book exactly at 60/40 → in band; drift recorded anyway.
+      seedPaperBook2({ eth: "0.3", usdc: "400" }); // 0.3×2000=600 / 400 → 60/40
+      const id = seedPlan({ paper: true });
+      const r = await runRebalanceTick({ logger: noopLogger });
+      expect(r.skipped).toBe(1);
+      const { replayRebalanceEntries } = await import("./db.js");
+      const entries = replayRebalanceEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("in_band");
+      expect(entries[0].max_drift_pct).toBeLessThan(5);
+      expect(entries[0].threshold_pct).toBe(5);
+    });
+  });
+
+  it("paper leg failure journals partial_failure with the leg counts", async () => {
+    await withJournal(async () => {
+      // Drifted book but almost no ETH to actually sell → the leg
+      // fails with PAPER_INSUFFICIENT_BALANCE → PARTIAL_FAILURE.
+      seedPaperBook2({ eth: "0.01", usdc: "200" });
+      const id = seedPlan({ paper: true });
+      await runRebalanceTick({
+        logger: noopLogger,
+        fetchPaperPortfolio: async () => ({
+          totalUsd: 1000,
+          hasUnpriced: false,
+          tokens: [
+            { chain: "base", symbol: "ETH", address: "NATIVE", usd: 800 },
+            { chain: "base", symbol: "USDC", address: USDC, usd: 200 },
+          ],
+        }),
+      });
+      const { replayRebalanceEntries } = await import("./db.js");
+      const entries = replayRebalanceEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("partial_failure");
+      expect(entries[0].error_code).toBe("PARTIAL_FAILURE");
+      expect(entries[0].executed_count).toBe(0);
+    });
   });
 });

@@ -126,6 +126,86 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── schedule_replay + rebalance_replay (v29) ──────────────
+  // Forensic parity for the other two engines.
+  server.tool(
+    "schedule_replay",
+    "Forensic decision timeline for a schedule — every fired / fire_failed / retired (end_at, max_runs) / locked-skip / on_fill hook outcome with exact timestamps, run numbers, and tx hashes. Requires `engine.scheduleJournal.enabled=true` (default off; the response carries journalEnabled so an agent can tell 'no entries' from 'journal off'). Answers \"why didn't my DCA fire this morning?\" from the persistent journal. Errors: INVALID_PARAMS (id not found).",
+    {
+      id: z.number().int().positive().describe("Schedule id."),
+      limit: z.number().int().min(1).max(10_000).optional().describe("Max entries, newest-first; default 200."),
+    },
+    async ({ id, limit }) => {
+      try {
+        return ok(
+          await runTool("schedule_replay", rt.opts, { id, limit }, undefined, async () => {
+            const { getScheduleById, replayScheduleEntries } = await import("../db.js");
+            const schedule = getScheduleById(id);
+            if (!schedule) throw new ToolError("INVALID_PARAMS", `Schedule #${id} not found.`);
+            const { loadConfig } = await import("../config.js");
+            const config = loadConfig();
+            const entries = replayScheduleEntries(id, limit ?? 200);
+            return {
+              ok: true,
+              scheduleId: id,
+              schedule: {
+                id: schedule.id, status: schedule.status, side: schedule.side,
+                cron: schedule.cron_expr, runCount: schedule.run_count, maxRuns: schedule.max_runs,
+                chain: schedule.chain, account: schedule.account,
+                base: schedule.base_symbol, quote: schedule.quote_symbol,
+                nextRunAt: schedule.next_run_at, paper: (schedule.paper ?? 0) === 1,
+              },
+              journalEnabled: config.engine.scheduleJournal?.enabled === true,
+              count: entries.length,
+              entries,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "rebalance_replay",
+    "Forensic decision timeline for a rebalance plan — every evaluated occurrence including IN-BAND ones with max_drift_pct, so the DRIFT HISTORY is visible (watch drift creep toward the threshold instead of being surprised by the fire), plus fired / partial_failure / failed / dry_run / locked-skip outcomes with executed/skipped leg counts. Requires `engine.rebalanceJournal.enabled=true` (default off; journalEnabled in the response disambiguates). Errors: INVALID_PARAMS (id not found).",
+    {
+      id: z.number().int().positive().describe("Rebalance plan id."),
+      limit: z.number().int().min(1).max(10_000).optional().describe("Max entries, newest-first; default 200."),
+    },
+    async ({ id, limit }) => {
+      try {
+        return ok(
+          await runTool("rebalance_replay", rt.opts, { id, limit }, undefined, async () => {
+            const { replayRebalanceEntries } = await import("../db.js");
+            const { getRebalancePlanById } = await import("../rebalance.js");
+            const plan = getRebalancePlanById(id);
+            if (!plan) throw new ToolError("INVALID_PARAMS", `Rebalance plan #${id} not found.`);
+            const { loadConfig } = await import("../config.js");
+            const config = loadConfig();
+            const entries = replayRebalanceEntries(id, limit ?? 200);
+            return {
+              ok: true,
+              planId: id,
+              plan: {
+                id: plan.id, status: plan.status, name: plan.name,
+                driftThresholdPct: plan.drift_threshold_pct, runCount: plan.run_count,
+                chain: plan.chain, account: plan.account,
+                nextRunAt: plan.next_run_at, paper: (plan.paper ?? 0) === 1,
+              },
+              journalEnabled: config.engine.rebalanceJournal?.enabled === true,
+              count: entries.length,
+              entries,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── backtest_list ──────────────────────────────────────────
   server.tool(
     "backtest_list",

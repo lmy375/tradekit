@@ -466,7 +466,57 @@ export async function rebalanceCommand(
     case "resume": await rebalanceResumeCommand(flags, positional); break;
     case "cancel": await rebalanceCancelCommand(flags, positional); break;
     case "run":    await rebalanceRunCommand(flags); break;
+    case "replay": await rebalanceReplayCommand(flags, positional); break;
     default:
-      throw subcommandError("rebalance", action, ["create", "list", "show", "edit", "pause", "resume", "cancel", "run"]);
+      throw subcommandError("rebalance", action, ["create", "list", "show", "edit", "pause", "resume", "cancel", "run", "replay"]);
+  }
+}
+
+/** v29: decision-journal replay. The in_band rows are the headline:
+ *  drift history per evaluation — operators watch drift creep toward
+ *  the threshold instead of being surprised by the fire. Gated by
+ *  engine.rebalanceJournal.enabled. */
+export async function rebalanceReplayCommand(flags: Record<string, string>, positional: string[]) {
+  const id = parsePlanId(positional[2]);
+  const plan = getRebalancePlanById(id);
+  if (!plan) throw new ToolError("INVALID_PARAMS", `Rebalance plan #${id} not found.`);
+  const { replayRebalanceEntries } = await import("../db.js");
+  const config = loadConfig();
+  const limit = flags["limit"] ? parseInt(flags["limit"], 10) : 200;
+  const entries = replayRebalanceEntries(id, Number.isFinite(limit) && limit > 0 ? limit : 200);
+
+  if (flags["json"] === "true") {
+    printJson({
+      ok: true,
+      planId: id,
+      journalEnabled: config.engine.rebalanceJournal?.enabled === true,
+      count: entries.length,
+      entries,
+    });
+    return;
+  }
+  console.log(`Rebalance plan #${id}${plan.name ? ` (${plan.name})` : ""}  threshold ${plan.drift_threshold_pct}%  status=${plan.status}  run_count=${plan.run_count}`);
+  console.log("");
+  if (config.engine.rebalanceJournal?.enabled !== true) {
+    console.log(`Rebalance journal is NOT enabled. To enable drift-history tracking:`);
+    console.log(`  tradekit config set engine.rebalanceJournal '{"enabled":true}'`);
+    console.log("");
+  }
+  if (entries.length === 0) {
+    console.log(`No journal entries for this plan yet.`);
+    return;
+  }
+  for (const e of entries) {
+    const marker =
+      e.decision === "fired" ? "●" :
+      e.decision === "in_band" ? "·" :
+      e.decision === "dry_run" || e.decision.startsWith("skipped") ? "‖" : "✕";
+    const drift =
+      e.max_drift_pct != null
+        ? `drift ${e.max_drift_pct.toFixed(2)}%${e.threshold_pct != null ? `/${e.threshold_pct}%` : ""}`
+        : "";
+    const legs = e.executed_count != null ? `  legs ${e.executed_count} ok${e.skipped_count ? ` / ${e.skipped_count} skipped` : ""}` : "";
+    const err = e.error_code ? `  [${e.error_code}]` : "";
+    console.log(`  ${marker} ${e.checked_at}  ${e.decision.padEnd(16)} ${drift}${legs}${err}${e.notes ? `  ${e.notes}` : ""}`);
   }
 }

@@ -427,8 +427,61 @@ export async function scheduleCommand(
     case "cancel": await scheduleCancelCommand(flags, positional); break;
     case "edit":   await scheduleEditCommand(flags, positional); break;
     case "run":    await scheduleRunCommand(flags); break;
+    case "replay": await scheduleReplayCommand(flags, positional); break;
     default:
-      throw subcommandError("schedule", action, ["create", "list", "show", "pause", "resume", "cancel", "edit", "run"]);
+      throw subcommandError("schedule", action, ["create", "list", "show", "pause", "resume", "cancel", "edit", "run", "replay"]);
+  }
+}
+
+/** v29: decision-journal replay — every fired / fire_failed / retired /
+ *  locked-skip / hook outcome with exact timestamps. Gated by
+ *  engine.scheduleJournal.enabled (the command works either way; it
+ *  explains how to enable when the journal is off). */
+export async function scheduleReplayCommand(flags: Record<string, string>, positional: string[]) {
+  const idArg = positional[2];
+  if (!idArg) throw new ToolError("INVALID_PARAMS", `Usage: tradekit schedule replay <id>`);
+  const id = parseInt(idArg, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new ToolError("INVALID_PARAMS", `<id> must be a positive integer (got "${idArg}").`);
+  }
+  const schedule = getScheduleById(id);
+  if (!schedule) throw new ToolError("INVALID_PARAMS", `Schedule #${id} not found.`);
+  const { replayScheduleEntries } = await import("../db.js");
+  const { loadConfig } = await import("../config.js");
+  const config = loadConfig();
+  const limit = flags["limit"] ? parseInt(flags["limit"], 10) : 200;
+  const entries = replayScheduleEntries(id, Number.isFinite(limit) && limit > 0 ? limit : 200);
+
+  if (flags["json"] === "true") {
+    printJson({
+      ok: true,
+      scheduleId: id,
+      journalEnabled: config.engine.scheduleJournal?.enabled === true,
+      count: entries.length,
+      entries,
+    });
+    return;
+  }
+  console.log(`Schedule #${id}${schedule.name ? ` (${schedule.name})` : ""}  ${schedule.side} ${schedule.base_symbol ?? "?"}/${schedule.quote_symbol ?? "?"}  status=${schedule.status}  run_count=${schedule.run_count}`);
+  console.log("");
+  if (config.engine.scheduleJournal?.enabled !== true) {
+    console.log(`Schedule journal is NOT enabled. To enable forensic decision tracking:`);
+    console.log(`  tradekit config set engine.scheduleJournal '{"enabled":true}'`);
+    console.log("");
+  }
+  if (entries.length === 0) {
+    console.log(`No journal entries for this schedule yet.`);
+    return;
+  }
+  for (const e of entries) {
+    const marker =
+      e.decision === "fired" || e.decision === "hook_created" ? "●" :
+      e.decision.startsWith("retired") ? "✓" :
+      e.decision.startsWith("skipped") ? "‖" : "✕";
+    const run = e.run_number != null ? `  run #${e.run_number}` : "";
+    const tx = e.tx_hash ? `  tx ${e.tx_hash.slice(0, 14)}…` : "";
+    const err = e.error_code ? `  [${e.error_code}]` : "";
+    console.log(`  ${marker} ${e.checked_at}  ${e.decision.padEnd(18)}${run}${tx}${err}${e.notes ? `  ${e.notes}` : ""}`);
   }
 }
 

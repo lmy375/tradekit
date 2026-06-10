@@ -573,6 +573,20 @@ const engineSchema = z
       })
       .strict()
       .default({ enabled: false, proximityPct: 5, retentionDays: 30 }),
+    /** v29: schedule-engine decision journal (fired / fire_failed /
+     *  retired / locked-skip). Due-driven → naturally low cardinality.
+     *  Prunable via db.retention.scheduleCheckLogDays. */
+    scheduleJournal: z
+      .object({ enabled: z.boolean().default(false) })
+      .strict()
+      .default({ enabled: false }),
+    /** v29: rebalance-engine decision journal. Records EVERY evaluated
+     *  occurrence incl. in_band with max_drift_pct — the drift history
+     *  is the point. Prunable via db.retention.rebalanceCheckLogDays. */
+    rebalanceJournal: z
+      .object({ enabled: z.boolean().default(false) })
+      .strict()
+      .default({ enabled: false }),
   })
   .strict()
   .default({
@@ -593,6 +607,8 @@ const engineSchema = z
     },
     heartbeatIntervalMs: 3_600_000,
     orderJournal: { enabled: false, proximityPct: 5, retentionDays: 30 },
+    scheduleJournal: { enabled: false },
+    rebalanceJournal: { enabled: false },
   });
 
 export type EngineConfig = z.infer<typeof engineSchema>;
@@ -709,6 +725,10 @@ const dbRetentionSchema = z
     /** Days to keep alert_events (v28 strategy-alert transition journal).
      *  NULL = never prune. */
     alertEventsDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** Days to keep schedule_check_log (v29). NULL = never prune. */
+    scheduleCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** Days to keep rebalance_check_log (v29). NULL = never prune. */
+    rebalanceCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep TERMINAL FAILED trades. NULL = never prune.
      *  Successful trades are NEVER auto-pruned — they're tax-relevant
      *  for most operators. To prune successes, use direct SQL or
@@ -723,6 +743,8 @@ const dbRetentionSchema = z
     orderCheckLogDays: null,
     engineEventsDays: null,
     alertEventsDays: null,
+    scheduleCheckLogDays: null,
+    rebalanceCheckLogDays: null,
     failedTradesDays: null,
   });
 
@@ -769,6 +791,8 @@ const dbSchema = z
       orderCheckLogDays: null,
       engineEventsDays: null,
       alertEventsDays: null,
+      scheduleCheckLogDays: null,
+      rebalanceCheckLogDays: null,
       failedTradesDays: null,
     },
     backup: { enabled: false, intervalHours: 24, destDir: "backups", retainCount: 7 },

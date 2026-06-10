@@ -38,6 +38,9 @@ import {
   setScheduleNextRunAt,
   recordScheduleFire,
   recordScheduleError,
+  insertScheduleCheckEntry,
+  lastScheduleCheckDecision,
+  type ScheduleCheckDecision,
   pauseSchedule as dbPauseSchedule,
   resumeSchedule as dbResumeSchedule,
   cancelSchedule as dbCancelSchedule,
@@ -368,6 +371,36 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
 
   const config = loadConfig();
 
+  // v29: decision journal (opt-in). Best-effort writer — a journal
+  // hiccup must never break the tick. Repeat-skip dedup: the engine
+  // lock case re-evaluates every tick; only log the transition.
+  const journalOn = config.engine.scheduleJournal?.enabled === true;
+  const journal = (entry: {
+    scheduleId: number;
+    decision: ScheduleCheckDecision;
+    runNumber?: number | null;
+    txHash?: string | null;
+    errorCode?: string | null;
+    notes?: string | null;
+    dedupeRepeat?: boolean;
+  }): void => {
+    if (!journalOn) return;
+    try {
+      if (entry.dedupeRepeat && lastScheduleCheckDecision(entry.scheduleId) === entry.decision) return;
+      insertScheduleCheckEntry({
+        scheduleId: entry.scheduleId,
+        checkedAt: now.toISOString(),
+        decision: entry.decision,
+        runNumber: entry.runNumber,
+        txHash: entry.txHash,
+        errorCode: entry.errorCode,
+        notes: entry.notes,
+      });
+    } catch (e) {
+      args.logger.debug(`schedule journal write failed (#${entry.scheduleId} ${entry.decision}): ${(e as Error).message}`);
+    }
+  };
+
   // Walk in deterministic id order. dueSchedules already orders by id ASC,
   // but be explicit so future caller-side merges don't surprise us.
   due.sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
@@ -418,6 +451,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       const parsed = parseCron(schedule.cron_expr);
       const nextAt = nextRun(parsed, new Date(Date.parse(schedule.start_at) - 60_000));
       setScheduleNextRunAt(schedule.id, nextAt.toISOString());
+      journal({ scheduleId: schedule.id, decision: "skipped_pre_start", notes: `start_at ${schedule.start_at}`, dedupeRepeat: true });
       skipped += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -437,6 +471,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         now.toISOString(),
         schedule.id,
       );
+      journal({ scheduleId: schedule.id, decision: "retired_end_at", runNumber: schedule.run_count, notes: `end_at ${schedule.end_at}` });
       completed += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -470,6 +505,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         now.toISOString(),
         schedule.id,
       );
+      journal({ scheduleId: schedule.id, decision: "retired_max_runs", runNumber: schedule.run_count, notes: `max_runs ${schedule.max_runs}` });
       completed += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -568,6 +604,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         "ENGINE_LOCKED",
         `engine locked: ${lockReason}`,
       );
+      journal({ scheduleId: schedule.id, decision: "skipped_locked", errorCode: "ENGINE_LOCKED", notes: lockReason, dedupeRepeat: true });
       skipped += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -594,6 +631,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       // Wallet load is a config / password problem. Record on the row but
       // ALSO advance next_run_at — otherwise the engine re-tries every tick.
       recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
+      journal({ scheduleId: schedule.id, decision: "fire_failed", errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -668,6 +706,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       // Transient AND terminal both advance next_run_at — DCA's per-occurrence
       // semantic. The error trail stays on the row for diagnosis.
       recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
+      journal({ scheduleId: schedule.id, decision: "fire_failed", errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -713,6 +752,13 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         quoteAmount: result.quoteAmount,
         completed: completedNow,
       });
+      journal({
+        scheduleId: schedule.id,
+        decision: "fired",
+        runNumber: schedule.run_count + 1,
+        txHash: result.txHash,
+        notes: completedNow ? "fire completed the schedule" : null,
+      });
       fired += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -754,6 +800,12 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
             config,
           });
           onFillOrderId = fireResult.orderId;
+          journal({
+            scheduleId: schedule.id,
+            decision: "hook_created",
+            runNumber: schedule.run_count + 1,
+            notes: `on_fill created order #${onFillOrderId}`,
+          });
           await tryNotify(
             {
               event: "schedule.on_fill_created",
@@ -775,6 +827,13 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
           const code = (e as { code?: string }).code ?? "INTERNAL_ERROR";
           const msg = (e as Error).message ?? String(e);
           onFillError = { code, message: msg };
+          journal({
+            scheduleId: schedule.id,
+            decision: "hook_failed",
+            runNumber: schedule.run_count + 1,
+            errorCode: code,
+            notes: msg.slice(0, 200),
+          });
           args.logger.error(`schedule #${schedule.id} on_fill hook failed: ${msg}`);
           await tryNotify(
             {

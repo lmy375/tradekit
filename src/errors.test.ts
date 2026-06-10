@@ -477,7 +477,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "backtest_order", "backtest_playbook", "backtest_compare", "backtest_rebalance",
     // Iter26: observability — status dashboard, windowed digest, forensic order replay,
     // backtest history retrieval.
-    "status_dashboard", "digest_summary", "order_replay",
+    "status_dashboard", "digest_summary", "order_replay", "schedule_replay", "rebalance_replay",
     "backtest_list", "backtest_show", "backtest_compare_list", "backtest_compare_show",
     // Iter31: unified strategy observability report.
     "strategy_report",

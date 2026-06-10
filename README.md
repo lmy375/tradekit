@@ -195,6 +195,8 @@ tradekit order create --side sell --trigger trailing --trail-pct 5 --price 3500 
 
 **Order decision journal — `tradekit order replay <id>` (iter25).** When `engine.orderJournal.enabled=true`, the orders engine writes a row to `order_check_log` on each STATE-CHANGING tick (HWM advanced, proximity crossed, fire, error). Naive "log every tick" would produce ~10M rows/year at 30s intervals × 10 active orders; state-change sampling reduces this to typically 5-20 rows per order's full lifecycle while preserving the full forensic signal.
 
+**Schedule + rebalance decision journals (v29) — forensic parity across all three engines.** `engine.scheduleJournal.enabled` / `engine.rebalanceJournal.enabled` journal the other two engines' decisions to `schedule_check_log` / `rebalance_check_log`, replayed via `tradekit schedule replay <id>` / `tradekit rebalance replay <id>` (MCP: `schedule_replay` / `rebalance_replay`). Schedules record every fired / fire_failed / retired (end_at, max_runs) / locked-skip / on_fill hook outcome with run numbers and tx hashes — "why didn't my DCA fire this morning?" becomes one command. Rebalance records EVERY evaluated occurrence *including in-band ones* with `max_drift_pct`: the drift history is the point — operators watch drift creep toward the threshold instead of being surprised by the fire. Both engines are due-driven so cardinality is naturally bounded (a 6h-cron plan writes ≤4 rows/day); the one repeat case — engine-lock skips re-evaluating every tick — dedupes at the writer. Prunable via `db.retention.scheduleCheckLogDays` / `rebalanceCheckLogDays`.
+
 ```bash
 # Enable journaling (opt-in, default off)
 tradekit config set engine.orderJournal '{"enabled":true,"proximityPct":5,"retentionDays":30}'
@@ -681,6 +683,8 @@ tradekit db rotate --retain 14
       "orderCheckLogDays": null,
       "engineEventsDays": null,
       "alertEventsDays": null,
+      "scheduleCheckLogDays": null,
+      "rebalanceCheckLogDays": null,
       "failedTradesDays": null
     },
     "backup": {
@@ -756,6 +760,8 @@ DB stats: /Users/me/.tradekit/tradekit.db
     paper_trades             skipped (db.retention.paperTradesDays=null (unset))
     engine_events            skipped (db.retention.engineEventsDays=null (unset))
     alert_events             skipped (db.retention.alertEventsDays=null (unset))
+    schedule_check_log       skipped (db.retention.scheduleCheckLogDays=null (unset))
+    rebalance_check_log      skipped (db.retention.rebalanceCheckLogDays=null (unset))
     trades                   skipped (db.retention.failedTradesDays=null (unset))
 
   Run `tradekit db prune --dry-run` to see actual counts; `tradekit db prune` to apply.
@@ -1962,14 +1968,14 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 109 tools across six groups:
+Starts an MCP stdio server exposing 111 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
 - **Trade & automation** (30) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_edit`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
 - **Strategy & backtest** (12) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_rebalance`, `backtest_compare`, `strategy_report`
-- **Observability** (11) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `alert_history`, `price_stats`
+- **Observability** (13) — `status_dashboard`, `digest_summary`, `order_replay`, `schedule_replay`, `rebalance_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `alert_history`, `price_stats`
 - **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
 Every write tool accepts `simulate: true`. Errors are structured (see *Agent integration* below). Every monitoring/diagnostic tool exposes a top-level `severity` field ('ok' | 'warn' | 'critical' / 'fail') and a `recommendedActions[]` array carrying structured `NextAction[]` dispatch hints — agents branch on `severity` for at-a-glance status and iterate `recommendedActions` to auto-remediate without parsing prose.

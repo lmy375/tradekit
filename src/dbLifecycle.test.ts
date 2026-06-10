@@ -40,6 +40,8 @@ beforeEach(() => {
   db.exec("DELETE FROM order_check_log");
   db.exec("DELETE FROM engine_events");
   db.exec("DELETE FROM alert_events");
+  db.exec("DELETE FROM schedule_check_log");
+  db.exec("DELETE FROM rebalance_check_log");
   db.exec("DELETE FROM trades");
   db.exec("DELETE FROM orders");
 });
@@ -55,6 +57,8 @@ const defaultDb: DbConfig = {
     orderCheckLogDays: null,
     engineEventsDays: null,
     alertEventsDays: null,
+    scheduleCheckLogDays: null,
+    rebalanceCheckLogDays: null,
     failedTradesDays: null,
   },
   backup: { enabled: false, intervalHours: 24, destDir: "backups", retainCount: 7 },
@@ -219,6 +223,19 @@ describe("pruneByRetention", () => {
     });
     const r = pruneByRetention(withRetention({ enabled: true, orderCheckLogDays: 30 }));
     expect(r.tables.find((t) => t.table === "order_check_log")?.rowsRemoved).toBe(1);
+  });
+
+  it("schedule_check_log + rebalance_check_log retention works (v29)", async () => {
+    const { insertScheduleCheckEntry, insertRebalanceCheckEntry } = await import("./db.js");
+    const old = new Date(Date.now() - 60 * 86400 * 1000).toISOString();
+    const fresh = new Date().toISOString();
+    insertScheduleCheckEntry({ scheduleId: 1, checkedAt: old, decision: "fired", runNumber: 1 });
+    insertScheduleCheckEntry({ scheduleId: 1, checkedAt: fresh, decision: "fired", runNumber: 2 });
+    insertRebalanceCheckEntry({ planId: 1, checkedAt: old, decision: "in_band", maxDriftPct: 2 });
+    insertRebalanceCheckEntry({ planId: 1, checkedAt: fresh, decision: "fired", maxDriftPct: 8 });
+    const r = pruneByRetention(withRetention({ enabled: true, scheduleCheckLogDays: 30, rebalanceCheckLogDays: 30 }));
+    expect(r.tables.find((t) => t.table === "schedule_check_log")?.rowsRemoved).toBe(1);
+    expect(r.tables.find((t) => t.table === "rebalance_check_log")?.rowsRemoved).toBe(1);
   });
 
   it("alert_events retention works (v28)", async () => {

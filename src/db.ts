@@ -1075,6 +1075,59 @@ const MIGRATIONS: string[] = [
   CREATE INDEX IF NOT EXISTS idx_alert_events_at  ON alert_events (at DESC);
   CREATE INDEX IF NOT EXISTS idx_alert_events_tag ON alert_events (tag, at);
   `,
+
+  // v29 — schedule + rebalance decision journals.
+  //
+  // Forensic parity across the three automation engines. Orders got
+  // order_check_log in v21 (\`order replay\` answers "why did this fire
+  // HERE?"); schedules and rebalance plans only kept last_run_* columns
+  // — the latest outcome, history lost. "Why didn't my DCA fire this
+  // morning?" and "how close has drift been getting to the threshold?"
+  // were unanswerable.
+  //
+  // Cardinality: both engines are DUE-driven (next_run_at), so a row
+  // per evaluated decision is naturally bounded (a 6h-cron plan writes
+  // ≤4 rows/day). The one repeat-risk — engine-lock skips re-evaluating
+  // every tick — is deduped at the writer (skip the insert when the
+  // schedule's previous row is the same skipped_locked decision).
+  //
+  // rebalance_check_log records EVERY evaluated occurrence (in_band
+  // included) with max_drift_pct: the drift HISTORY is the point —
+  // operators watch drift creep toward the threshold instead of being
+  // surprised by the fire.
+  //
+  // Gated by engine.scheduleJournal.enabled / engine.rebalanceJournal
+  // .enabled (default off, mirroring orderJournal). Prunable via
+  // db.retention.scheduleCheckLogDays / rebalanceCheckLogDays.
+  `
+  CREATE TABLE IF NOT EXISTS schedule_check_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id  INTEGER NOT NULL,
+    checked_at   TEXT    NOT NULL,
+    decision     TEXT    NOT NULL,
+    run_number   INTEGER,
+    tx_hash      TEXT,
+    error_code   TEXT,
+    notes        TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_schedule_check_sched ON schedule_check_log (schedule_id, checked_at);
+  CREATE INDEX IF NOT EXISTS idx_schedule_check_at    ON schedule_check_log (checked_at);
+
+  CREATE TABLE IF NOT EXISTS rebalance_check_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id        INTEGER NOT NULL,
+    checked_at     TEXT    NOT NULL,
+    decision       TEXT    NOT NULL,
+    max_drift_pct  REAL,
+    threshold_pct  REAL,
+    executed_count INTEGER,
+    skipped_count  INTEGER,
+    error_code     TEXT,
+    notes          TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_rebalance_check_plan ON rebalance_check_log (plan_id, checked_at);
+  CREATE INDEX IF NOT EXISTS idx_rebalance_check_at   ON rebalance_check_log (checked_at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4936,6 +4989,169 @@ export function listAlertEvents(filter: ListAlertEventsFilter = {}): AlertEventR
 export function pruneAlertEvents(beforeIso: string): number {
   const db = openDb();
   const r = db.prepare(`DELETE FROM alert_events WHERE at < ?`).run(beforeIso);
+  return Number(r.changes ?? 0);
+}
+
+// ── schedule_check_log + rebalance_check_log (v29) ───────────
+//
+// Decision journals for the schedule + rebalance engines, mirroring
+// the v21 order_check_log contract: insert at decision time, replay
+// newest-first by primitive id, prune by age via the retention
+// registry.
+
+export type ScheduleCheckDecision =
+  | "fired"
+  | "fire_failed"
+  | "skipped_locked"
+  | "skipped_pre_start"
+  | "retired_end_at"
+  | "retired_max_runs"
+  | "hook_created"
+  | "hook_failed";
+
+export interface ScheduleCheckLogRow {
+  id: number;
+  schedule_id: number;
+  checked_at: string;
+  decision: ScheduleCheckDecision;
+  /** run_count AFTER the decision (fires only). */
+  run_number: number | null;
+  tx_hash: string | null;
+  error_code: string | null;
+  notes: string | null;
+}
+
+export interface InsertScheduleCheckEntryArgs {
+  scheduleId: number;
+  checkedAt: string;
+  decision: ScheduleCheckDecision;
+  runNumber?: number | null;
+  txHash?: string | null;
+  errorCode?: string | null;
+  notes?: string | null;
+}
+
+export function insertScheduleCheckEntry(args: InsertScheduleCheckEntryArgs): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO schedule_check_log
+         (schedule_id, checked_at, decision, run_number, tx_hash, error_code, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      args.scheduleId,
+      args.checkedAt,
+      args.decision,
+      args.runNumber ?? null,
+      args.txHash ?? null,
+      args.errorCode ?? null,
+      args.notes ?? null,
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export function replayScheduleEntries(scheduleId: number, limit = 200): ScheduleCheckLogRow[] {
+  const db = openDb();
+  return db
+    .prepare(
+      `SELECT * FROM schedule_check_log WHERE schedule_id = ? ORDER BY checked_at DESC, id DESC LIMIT ?`,
+    )
+    .all(scheduleId, Math.max(1, Math.floor(limit))) as unknown as ScheduleCheckLogRow[];
+}
+
+/** Last decision for a schedule — drives the writer-side dedup for
+ *  repeat skips (engine lock re-evaluates every tick). */
+export function lastScheduleCheckDecision(scheduleId: number): ScheduleCheckDecision | null {
+  const db = openDb();
+  const row = db
+    .prepare(`SELECT decision FROM schedule_check_log WHERE schedule_id = ? ORDER BY id DESC LIMIT 1`)
+    .get(scheduleId) as { decision: ScheduleCheckDecision } | undefined;
+  return row?.decision ?? null;
+}
+
+export function pruneScheduleCheckLog(beforeIso: string): number {
+  const db = openDb();
+  const r = db.prepare(`DELETE FROM schedule_check_log WHERE checked_at < ?`).run(beforeIso);
+  return Number(r.changes ?? 0);
+}
+
+export type RebalanceCheckDecision =
+  | "in_band"
+  | "fired"
+  | "partial_failure"
+  | "failed"
+  | "dry_run"
+  | "skipped_empty"
+  | "skipped_locked";
+
+export interface RebalanceCheckLogRow {
+  id: number;
+  plan_id: number;
+  checked_at: string;
+  decision: RebalanceCheckDecision;
+  max_drift_pct: number | null;
+  threshold_pct: number | null;
+  executed_count: number | null;
+  skipped_count: number | null;
+  error_code: string | null;
+  notes: string | null;
+}
+
+export interface InsertRebalanceCheckEntryArgs {
+  planId: number;
+  checkedAt: string;
+  decision: RebalanceCheckDecision;
+  maxDriftPct?: number | null;
+  thresholdPct?: number | null;
+  executedCount?: number | null;
+  skippedCount?: number | null;
+  errorCode?: string | null;
+  notes?: string | null;
+}
+
+export function insertRebalanceCheckEntry(args: InsertRebalanceCheckEntryArgs): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO rebalance_check_log
+         (plan_id, checked_at, decision, max_drift_pct, threshold_pct, executed_count, skipped_count, error_code, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      args.planId,
+      args.checkedAt,
+      args.decision,
+      args.maxDriftPct ?? null,
+      args.thresholdPct ?? null,
+      args.executedCount ?? null,
+      args.skippedCount ?? null,
+      args.errorCode ?? null,
+      args.notes ?? null,
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export function replayRebalanceEntries(planId: number, limit = 200): RebalanceCheckLogRow[] {
+  const db = openDb();
+  return db
+    .prepare(
+      `SELECT * FROM rebalance_check_log WHERE plan_id = ? ORDER BY checked_at DESC, id DESC LIMIT ?`,
+    )
+    .all(planId, Math.max(1, Math.floor(limit))) as unknown as RebalanceCheckLogRow[];
+}
+
+export function lastRebalanceCheckDecision(planId: number): RebalanceCheckDecision | null {
+  const db = openDb();
+  const row = db
+    .prepare(`SELECT decision FROM rebalance_check_log WHERE plan_id = ? ORDER BY id DESC LIMIT 1`)
+    .get(planId) as { decision: RebalanceCheckDecision } | undefined;
+  return row?.decision ?? null;
+}
+
+export function pruneRebalanceCheckLog(beforeIso: string): number {
+  const db = openDb();
+  const r = db.prepare(`DELETE FROM rebalance_check_log WHERE checked_at < ?`).run(beforeIso);
   return Number(r.changes ?? 0);
 }
 

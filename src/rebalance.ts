@@ -42,6 +42,9 @@ import {
   setRebalancePlanNextRunAt,
   recordRebalanceRun,
   recordRebalanceError,
+  insertRebalanceCheckEntry,
+  lastRebalanceCheckDecision,
+  type RebalanceCheckDecision,
   pauseRebalancePlan as dbPauseRebalancePlan,
   resumeRebalancePlan as dbResumeRebalancePlan,
   cancelRebalancePlan as dbCancelRebalancePlan,
@@ -643,6 +646,42 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
   let completed = 0;
 
   const config = loadConfig();
+
+  // v29: decision journal (opt-in). Records EVERY evaluated occurrence
+  // (in_band included, with max drift) — drift history is the point.
+  // Best-effort: a journal hiccup never breaks the tick. Lock skips
+  // dedupe on repeat since the engine re-evaluates every tick.
+  const journalOn = config.engine.rebalanceJournal?.enabled === true;
+  const journal = (entry: {
+    planId: number;
+    decision: RebalanceCheckDecision;
+    maxDriftPct?: number | null;
+    thresholdPct?: number | null;
+    executedCount?: number | null;
+    skippedCount?: number | null;
+    errorCode?: string | null;
+    notes?: string | null;
+    dedupeRepeat?: boolean;
+  }): void => {
+    if (!journalOn) return;
+    try {
+      if (entry.dedupeRepeat && lastRebalanceCheckDecision(entry.planId) === entry.decision) return;
+      insertRebalanceCheckEntry({
+        planId: entry.planId,
+        checkedAt: now.toISOString(),
+        decision: entry.decision,
+        maxDriftPct: entry.maxDriftPct,
+        thresholdPct: entry.thresholdPct,
+        executedCount: entry.executedCount,
+        skippedCount: entry.skippedCount,
+        errorCode: entry.errorCode,
+        notes: entry.notes,
+      });
+    } catch (e) {
+      args.logger.debug(`rebalance journal write failed (#${entry.planId} ${entry.decision}): ${(e as Error).message}`);
+    }
+  };
+
   const realFetcher = args.fetchPortfolio ?? defaultFetchPortfolio;
   // v27: paper plans evaluate drift against the virtual book.
   const paperFetcher = args.fetchPaperPortfolio ?? defaultFetchPaperPortfolio;
@@ -661,6 +700,9 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       `rebalance: engine locked (${lockReason}) — skipping evaluation of ${due.length} due plan${due.length === 1 ? "" : "s"}`,
     );
     for (const plan of due) {
+      if (plan.id != null) {
+        journal({ planId: plan.id, decision: "skipped_locked", errorCode: "ENGINE_LOCKED", notes: lockReason, dedupeRepeat: true });
+      }
       fires.push({
         planId: plan.id ?? 0,
         name: plan.name,
@@ -807,6 +849,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "API_ERROR";
       recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
+      journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
       fires.push({
         planId: plan.id, name: plan.name, status: "failed", executed: [], skipped: [],
@@ -839,6 +882,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         maxDriftPct: 0,
         completed: false,
       });
+      journal({ planId: plan.id, decision: "skipped_empty", thresholdPct: plan.drift_threshold_pct, notes: "empty portfolio" });
       skipped += 1;
       fires.push({
         planId: plan.id, name: plan.name, status: "skipped",
@@ -874,6 +918,13 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         skippedCount: trades.skipped.length,
         maxDriftPct: drift.maxDriftPct,
         completed: false,
+      });
+      journal({
+        planId: plan.id,
+        decision: "in_band",
+        maxDriftPct: drift.maxDriftPct,
+        thresholdPct: plan.drift_threshold_pct,
+        skippedCount: trades.skipped.length,
       });
       skipped += 1;
       fires.push({
@@ -911,6 +962,13 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         maxDriftPct: drift.maxDriftPct,
         completed: false,
       });
+      journal({
+        planId: plan.id,
+        decision: "dry_run",
+        maxDriftPct: drift.maxDriftPct,
+        thresholdPct: plan.drift_threshold_pct,
+        notes: `${trades.steps.length} leg(s) would fire`,
+      });
       skipped += 1;
       fires.push({
         planId: plan.id, name: plan.name, status: "skipped",
@@ -933,6 +991,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "WALLET_LOCKED";
       recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
+      journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
       fires.push({
         planId: plan.id, name: plan.name, status: "failed", executed: [], skipped: [],
@@ -1043,6 +1102,16 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         (plan.end_at != null && Date.parse(plan.end_at) <= nextAt.getTime()),
     });
 
+    journal({
+      planId: plan.id,
+      decision: allOk ? "fired" : "partial_failure",
+      maxDriftPct: drift.maxDriftPct,
+      thresholdPct: plan.drift_threshold_pct,
+      executedCount: executedLegs.filter((l) => l.ok).length,
+      skippedCount: trades.skipped.length,
+      errorCode: allOk ? null : "PARTIAL_FAILURE",
+      notes: allOk ? null : `${legFailed} of ${trades.steps.length} leg(s) failed`,
+    });
     if (allOk) {
       executed += 1;
       fires.push({

@@ -369,3 +369,114 @@ describe("runScheduleTick — on_fill hook", () => {
     expect(listOrders({ status: "all" })).toHaveLength(0);
   });
 });
+
+// ── v29: decision journal ────────────────────────────────────
+
+describe("runScheduleTick — decision journal (v29)", () => {
+  async function withJournal<T>(fn: () => Promise<T>): Promise<T> {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, scheduleJournal: { enabled: true } } } as never);
+    try {
+      return await fn();
+    } finally {
+      saveConfig(cfg);
+    }
+  }
+
+  it("journal is OFF by default — fires write no rows", async () => {
+    seedQuoteBalance("10000");
+    seedSchedule();
+    await tick();
+    const { replayScheduleEntries } = await import("./db.js");
+    const all = openDb().prepare(`SELECT COUNT(*) AS n FROM schedule_check_log`).get() as { n: number };
+    expect(all.n).toBe(0);
+    void replayScheduleEntries;
+  });
+
+  it("fired writes a row with run number + paper tx hash", async () => {
+    await withJournal(async () => {
+      seedQuoteBalance("10000");
+      const id = seedSchedule();
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("fired");
+      expect(entries[0].run_number).toBe(1);
+      expect(entries[0].tx_hash).toMatch(/^paper:/);
+    });
+  });
+
+  it("paper-balance failure journals fire_failed with the error code", async () => {
+    await withJournal(async () => {
+      // No quote balance seeded → PAPER_INSUFFICIENT_BALANCE.
+      const id = seedSchedule();
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("fire_failed");
+      expect(entries[0].error_code).toBeTruthy();
+    });
+  });
+
+  it("max_runs retirement journals retired_max_runs", async () => {
+    await withJournal(async () => {
+      // run_count already at the cap → pre-fire retirement branch.
+      const id = seedSchedule({ max_runs: 2 });
+      openDb().prepare(`UPDATE schedules SET run_count = 2 WHERE id = ?`).run(id);
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("retired_max_runs");
+      expect(entries[0].run_number).toBe(2);
+    });
+  });
+
+  it("engine-lock skips dedupe on repeat ticks (one row, not one per tick)", async () => {
+    await withJournal(async () => {
+      const { lockEngine: lock2, unlockEngine: unlock2 } = await import("./engineLock.js");
+      const cfg = (await import("./config.js")).loadConfig();
+      seedQuoteBalance("10000");
+      const id = seedSchedule();
+      await lock2({ reason: "journal-test", lockedBy: "test", config: cfg, logger: noopLogger });
+      try {
+        await tick();
+        await tick();
+        await tick();
+      } finally {
+        await unlock2({ unlockedBy: "test", config: cfg, logger: noopLogger });
+      }
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("skipped_locked");
+      expect(entries[0].error_code).toBe("ENGINE_LOCKED");
+    });
+  });
+
+  it("on_fill hook outcome journals hook_created alongside the fire", async () => {
+    await withJournal(async () => {
+      seedQuoteBalance("10000");
+      const id = seedSchedule({
+        on_fill_json: JSON.stringify({
+          type: "createOrder",
+          spec: {
+            side: "sell",
+            trigger: "trailing",
+            trailPct: 5,
+            base: "WETH",
+            quote: "USDC",
+            baseAmount: "{{filled.baseAmount}}",
+          },
+        }),
+      });
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const decisions = replayScheduleEntries(id).map((e) => e.decision).sort();
+      expect(decisions).toEqual(["fired", "hook_created"]);
+    });
+  });
+});
