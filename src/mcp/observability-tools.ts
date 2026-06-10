@@ -569,6 +569,34 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── incident report ───────────────────────────────────────
+  server.tool(
+    "incident_report",
+    "v39: the one-command postmortem. Composes the window's digest verdict, critical/warn timeline tail, alert transitions, signal counts, CONFIG CHANGES inside the window ('what changed before it broke' — the most-asked postmortem question), operator/agent notes, and the equity move into one structure (markdown: render on the CLI via `tradekit incident`). Pure composition over the existing gatherers — it can never disagree with the surfaces it summarizes. Use this FIRST when investigating: it tells you where to drill (order_replay / schedule_replay / timeline_query).",
+    {
+      window: z.string().optional().describe("Window like 4h, 24h, 7d (default 4h), ending now."),
+      strategy: z.string().optional().describe("Scope the event tail + notes to one strategy tag (digest stays global)."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("incident_report", rt.opts, input, undefined, async () => {
+            const { parseWindowMs } = await import("../digest.js");
+            const { gatherIncidentReport } = await import("../incident.js");
+            const windowLabel = input.window ?? "4h";
+            return gatherIncidentReport({
+              windowLabel,
+              windowMs: parseWindowMs(windowLabel),
+              strategy: input.strategy,
+            });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── operator notes ────────────────────────────────────────
   server.tool(
     "note_add",

@@ -298,6 +298,17 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+INCIDENT (v39 — the one-command postmortem)
+  incident [--window 4h|24h|7d] [--strategy TAG] [--out FILE] [--json]
+        Compose the window's digest verdict, activity counts, CONFIG CHANGES
+        ("what changed before it broke"), operator/agent notes, and the
+        critical/warn event tail into one markdown postmortem — reviewer
+        order: verdict → activity → config → notes → events. Pure
+        composition over the existing gatherers, so it can never disagree
+        with the surfaces it summarizes. Untagged notes survive --strategy
+        (global context). MCP: incident_report (read it FIRST when
+        investigating; it tells you where to drill).
+
 NOTES (v37 — the timeline's human layer)
   note add "what you did and why" [--strategy TAG] [--at ISO] [--json]
         Record context into the forensic timeline (kind note.operator):
