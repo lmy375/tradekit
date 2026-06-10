@@ -640,8 +640,12 @@ describe("runScheduleTick — v32 transient retry", () => {
     const row = getScheduleById(id)!;
     expect(row.retry_count).toBe(0); // reset for the next occurrence
     expect(row.last_run_status).toBe("failed");
-    // Advanced to the natural 6h cron slot, not a backoff slot.
-    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(30 * 60_000);
+    // Advanced to the NATURAL 6h cron slot, not a backoff slot —
+    // computed via the cron lib so the assertion holds at any time
+    // of day (a fixed ">30min" bound flakes near 6h boundaries).
+    const { parseCron, nextRun } = await import("./cron.js");
+    const expected = nextRun(parseCron("0 */6 * * *"), new Date(Date.now() - 5_000));
+    expect(Math.abs(Date.parse(row.next_run_at) - expected.getTime())).toBeLessThan(10_000);
   });
 
   it("a successful fire resets a lingering retry counter", async () => {

@@ -301,8 +301,12 @@ describe("runRebalanceTick — drift evaluation", () => {
     const row = getRebalancePlanById(id)!;
     expect(row.retry_count).toBe(0);
     expect(row.last_run_status).toBe("failed");
-    // Advanced to the natural cron slot (way past the 5m backoff window).
-    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(10 * 60_000);
+    // Advanced to the NATURAL cron slot — computed via the cron lib
+    // so the assertion holds at any time of day (a fixed bound
+    // flakes near 6h boundaries).
+    const { parseCron, nextRun } = await import("./cron.js");
+    const expected1 = nextRun(parseCron("0 */6 * * *"), new Date(Date.now() - 5_000));
+    expect(Math.abs(Date.parse(row.next_run_at) - expected1.getTime())).toBeLessThan(10_000);
     expect(row.run_count).toBe(0);
   });
 
@@ -316,7 +320,9 @@ describe("runRebalanceTick — drift evaluation", () => {
     const row = getRebalancePlanById(id)!;
     expect(row.retry_count).toBe(0); // reset for the next occurrence
     expect(row.last_run_status).toBe("failed");
-    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(10 * 60_000);
+    const { parseCron: pc2, nextRun: nr2 } = await import("./cron.js");
+    const expected2 = nr2(pc2("0 */6 * * *"), new Date(Date.now() - 5_000));
+    expect(Math.abs(Date.parse(row.next_run_at) - expected2.getTime())).toBeLessThan(10_000);
   });
 });
 
