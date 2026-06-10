@@ -240,6 +240,14 @@ SCHEDULED / RECURRING TRADES (DCA)
         Run the schedule engine. Without --once, defaults to --watch 30 (daemon mode).
         Each tick scans active schedules with next_run_at <= now, fires due ones via
         executeTrade, advances next_run_at. --dry-run advances time but never sends tx.
+        v32 transient retry: a TRANSIENT fire failure (RPC flake, rate limit,
+        aggregator hiccup) parks the row on an exponential-backoff retry slot
+        (engine.fireRetry — default 5m/10m/20m, 3 attempts) instead of losing the
+        occurrence to the next cron slot. The retry never crosses the next natural
+        occurrence or end_at; budget exhaustion escalates to a critical
+        "occurrence LOST" notification. Terminal failures (safeguard, balance)
+        never retry. Same mechanism guards rebalance evaluations. Disable with
+        \`config set engine.fireRetry.enabled false\`.
   schedule replay <id> [--limit N] [--json]
         v29: forensic decision timeline — every fired / fire_failed / retired /
         locked-skip / on_fill hook outcome with timestamps, run numbers, tx hashes.

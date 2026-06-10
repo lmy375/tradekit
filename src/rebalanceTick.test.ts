@@ -270,18 +270,53 @@ describe("runRebalanceTick — drift evaluation", () => {
     expect(mockedExecuteTrade).not.toHaveBeenCalled();
   });
 
-  it("a portfolio fetch failure records the error WITHOUT consuming max_runs quota", async () => {
+  it("a TRANSIENT portfolio fetch failure parks the plan on a v32 retry slot", async () => {
     const id = seedPlan({ max_runs: 5 });
     const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+    const before = Date.now();
+    const report = await tick({ fetchPortfolio: async () => { throw err; } });
+    // v32: transient → bounded retry, NOT a lost occurrence.
+    expect(report.failed).toBe(0);
+    expect(report.retried).toBe(1);
+    expect(report.fires[0].status).toBe("retry_pending");
+    const row = getRebalancePlanById(id)!;
+    expect(row.status).toBe("active");
+    expect(row.retry_count).toBe(1);
+    expect(row.last_run_status).toBe("retry_pending");
+    expect(row.last_error_code).toBe("RPC_FAILED");
+    // Retry slot ≈ now + 5m (default backoff), well before the 6h cron.
+    const delta = Date.parse(row.next_run_at) - before;
+    expect(delta).toBeGreaterThan(4 * 60_000);
+    expect(delta).toBeLessThan(6 * 60_000);
+    // Failures never consume max_runs quota.
+    expect(row.run_count).toBe(0);
+  });
+
+  it("a TERMINAL fetch failure advances to the natural slot without retrying", async () => {
+    const id = seedPlan({ max_runs: 5 });
+    const err = Object.assign(new Error("nope"), { code: "INVALID_PARAMS" });
     const report = await tick({ fetchPortfolio: async () => { throw err; } });
     expect(report.failed).toBe(1);
+    expect(report.retried).toBe(0);
     const row = getRebalancePlanById(id)!;
-    expect(row.status).toBe("active"); // retries next occurrence
-    expect(row.last_error_code).toBe("RPC_FAILED");
-    expect(Date.parse(row.next_run_at)).toBeGreaterThan(Date.now()); // advanced — no refire storm
-    // Regression guard for the recordRebalanceError fix: failures must
-    // NOT count toward max_runs (run_count is executed-rebalances only).
+    expect(row.retry_count).toBe(0);
+    expect(row.last_run_status).toBe("failed");
+    // Advanced to the natural cron slot (way past the 5m backoff window).
+    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(10 * 60_000);
     expect(row.run_count).toBe(0);
+  });
+
+  it("retry budget exhaustion falls through to the natural slot + resets the counter", async () => {
+    const id = seedPlan();
+    openDb().prepare(`UPDATE rebalance_plans SET retry_count = 3 WHERE id = ?`).run(id);
+    const err = Object.assign(new Error("rpc still down"), { code: "RPC_FAILED" });
+    const report = await tick({ fetchPortfolio: async () => { throw err; } });
+    expect(report.failed).toBe(1);
+    expect(report.retried).toBe(0);
+    const row = getRebalancePlanById(id)!;
+    expect(row.retry_count).toBe(0); // reset for the next occurrence
+    expect(row.last_run_status).toBe("failed");
+    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(10 * 60_000);
   });
 });
 

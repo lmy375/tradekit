@@ -297,6 +297,9 @@ export async function scheduleShowCommand(flags: Record<string, string>, positio
   if (row.end_at) console.log(`  End:     ${row.end_at}  (${formatRelativeAge(row.end_at)})`);
   if (row.max_runs != null) console.log(`  Max runs: ${row.max_runs}`);
   console.log(`  Next:    ${row.next_run_at}  (${formatRelativeAge(row.next_run_at)})`);
+  if ((row.retry_count ?? 0) > 0) {
+    console.log(`  Retry:   next_run_at is a RETRY slot — ${row.retry_count} transient failure(s) this occurrence (last: ${row.last_error_code ?? "?"})`);
+  }
   console.log("");
   console.log(`  Runs:    ${row.run_count}${row.max_runs != null ? ` / ${row.max_runs}` : ""}`);
   if (row.total_base_filled) console.log(`  Total base filled:  ${row.total_base_filled} ${row.base_symbol ?? ""}`);

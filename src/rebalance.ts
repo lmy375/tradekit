@@ -42,6 +42,7 @@ import {
   setRebalancePlanNextRunAt,
   recordRebalanceRun,
   recordRebalanceError,
+  recordRebalanceRetry,
   insertRebalanceCheckEntry,
   lastRebalanceCheckDecision,
   type RebalanceCheckDecision,
@@ -54,6 +55,7 @@ import {
   type RebalanceTarget,
   type InsertRebalancePlanArgs,
 } from "./db.js";
+import { planTransientRetry } from "./schedules.js";
 import { parseCron, nextRun } from "./cron.js";
 import { tryNotify } from "./notify.js";
 import { loadWallet, loadReadOnlyWallet } from "./wallet.js";
@@ -489,7 +491,7 @@ export interface RebalanceTickArgs {
 export interface RebalanceFireReport {
   planId: number;
   name: string | null;
-  status: "executed" | "skipped" | "failed" | "completed";
+  status: "executed" | "skipped" | "failed" | "completed" | "retry_pending";
   /** Drift % observed at evaluation. */
   maxDriftPct?: number;
   /** Trades that fired this tick. */
@@ -511,6 +513,8 @@ export interface RebalanceTickReport {
   skipped: number;
   failed: number;
   completed: number;
+  /** v32: transient failures parked on a bounded-backoff retry slot. */
+  retried: number;
   fires: RebalanceFireReport[];
   recommendedActions: NextAction[];
 }
@@ -644,6 +648,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
   let skipped = 0;
   let failed = 0;
   let completed = 0;
+  let retried = 0;
 
   const config = loadConfig();
 
@@ -722,6 +727,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       skipped,
       failed,
       completed,
+      retried,
       fires,
       elapsedMs: Date.now() - startedAt,
       severity: "warn",
@@ -848,8 +854,47 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "API_ERROR";
+      // v32: a transient snapshot failure (RPC flake) earns a bounded
+      // retry instead of deferring the drift check a whole period.
+      const retry = planTransientRetry({
+        code,
+        retryCount: plan.retry_count ?? 0,
+        nowMs: Date.now(),
+        naturalNextAt: nextAt,
+        endAt: plan.end_at,
+        config,
+      });
+      if (retry) {
+        recordRebalanceRetry(plan.id, retry.retryAt.toISOString(), code, msg);
+        journal({
+          planId: plan.id,
+          decision: "retry_scheduled",
+          thresholdPct: plan.drift_threshold_pct,
+          errorCode: code,
+          notes: `attempt ${retry.attempt}/${retry.maxAttempts}, retrying at ${retry.retryAt.toISOString()}: ${msg.slice(0, 140)}`,
+        });
+        retried += 1;
+        fires.push({
+          planId: plan.id, name: plan.name, status: "retry_pending", executed: [], skipped: [],
+          errorCode: code, errorMessage: msg, nextRunAt: retry.retryAt.toISOString(),
+        });
+        await tryNotify(
+          {
+            event: "rebalance.failed",
+            severity: "warn",
+            title: `Rebalance plan #${plan.id}${plan.name ? ` (${plan.name})` : ""} failed: ${code} — retrying (attempt ${retry.attempt}/${retry.maxAttempts})`,
+            body: `${msg}\n\nTransient failure — next attempt at ${retry.retryAt.toISOString()}.`,
+            fields: { id: plan.id, chain: plan.chain, account: plan.account, errorCode: code, retryAt: retry.retryAt.toISOString(), attempt: retry.attempt, maxAttempts: retry.maxAttempts },
+            dedupKey: `rebalance.failed:${plan.id}:${code}:retry${retry.attempt}`,
+          },
+          config, args.logger,
+        );
+        continue;
+      }
+      const attemptsMade = plan.retry_count ?? 0;
+      const exhausted = isTransientErrorCode(code) && attemptsMade > 0;
       recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
-      journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: msg.slice(0, 200) });
+      journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: exhausted ? `evaluation skipped after ${attemptsMade + 1} attempts: ${msg.slice(0, 150)}` : msg.slice(0, 200) });
       failed += 1;
       fires.push({
         planId: plan.id, name: plan.name, status: "failed", executed: [], skipped: [],
@@ -858,10 +903,12 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       await tryNotify(
         {
           event: "rebalance.failed",
-          severity: isTransientErrorCode(code) ? "warn" : "critical",
-          title: `Rebalance plan #${plan.id}${plan.name ? ` (${plan.name})` : ""} failed: ${code}`,
+          severity: isTransientErrorCode(code) && !exhausted ? "warn" : "critical",
+          title: exhausted
+            ? `Rebalance plan #${plan.id}${plan.name ? ` (${plan.name})` : ""} evaluation LOST after ${attemptsMade + 1} attempts: ${code}`
+            : `Rebalance plan #${plan.id}${plan.name ? ` (${plan.name})` : ""} failed: ${code}`,
           body: msg,
-          fields: { id: plan.id, chain: plan.chain, account: plan.account, errorCode: code, nextRunAt: nextAt.toISOString() },
+          fields: { id: plan.id, chain: plan.chain, account: plan.account, errorCode: code, nextRunAt: nextAt.toISOString(), attemptsMade: attemptsMade + 1 },
           dedupKey: `rebalance.failed:${plan.id}:${code}`,
         },
         config, args.logger,
@@ -990,6 +1037,30 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "WALLET_LOCKED";
+      const retry = planTransientRetry({
+        code,
+        retryCount: plan.retry_count ?? 0,
+        nowMs: Date.now(),
+        naturalNextAt: nextAt,
+        endAt: plan.end_at,
+        config,
+      });
+      if (retry) {
+        recordRebalanceRetry(plan.id, retry.retryAt.toISOString(), code, msg);
+        journal({
+          planId: plan.id,
+          decision: "retry_scheduled",
+          thresholdPct: plan.drift_threshold_pct,
+          errorCode: code,
+          notes: `attempt ${retry.attempt}/${retry.maxAttempts}, retrying at ${retry.retryAt.toISOString()}: ${msg.slice(0, 140)}`,
+        });
+        retried += 1;
+        fires.push({
+          planId: plan.id, name: plan.name, status: "retry_pending", executed: [], skipped: [],
+          errorCode: code, errorMessage: msg, nextRunAt: retry.retryAt.toISOString(),
+        });
+        continue;
+      }
       recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
       journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
@@ -1174,6 +1245,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
     executed,
     skipped,
     failed,
+    retried,
     completed,
     fires,
     recommendedActions,

@@ -637,6 +637,24 @@ const engineSchema = z
       .object({ enabled: z.boolean().default(false) })
       .strict()
       .default({ enabled: false }),
+    /** v32: bounded retry for TRANSIENT schedule/rebalance fire
+     *  failures (RPC flake, rate limit, aggregator hiccup). Pre-v32 a
+     *  transient failure advanced next_run_at to the next natural
+     *  cron slot — a weekly DCA lost the whole week to one bad RPC
+     *  second. With retry enabled the engine parks the row on an
+     *  exponential-backoff slot (backoffMinutes × 2^attempt) instead,
+     *  up to maxAttempts; the retry never crosses the next natural
+     *  occurrence (when it would, the engine just advances — the next
+     *  occurrence supersedes). Terminal failures (safeguards, balance,
+     *  blacklist) never retry: they'd fail identically. */
+    fireRetry: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxAttempts: z.number().int().min(1).max(10).default(3),
+        backoffMinutes: z.number().min(1).max(120).default(5),
+      })
+      .strict()
+      .default({ enabled: true, maxAttempts: 3, backoffMinutes: 5 }),
   })
   .strict()
   .default({

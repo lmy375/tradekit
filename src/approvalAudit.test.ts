@@ -179,6 +179,7 @@ describe("auditAllowanceList (iter606)", () => {
       orderJournal: { enabled: false, proximityPct: 5, retentionDays: 30 },
       scheduleJournal: { enabled: false },
       rebalanceJournal: { enabled: false },
+      fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {
@@ -332,6 +333,7 @@ describe("approval freshness signal (iter617)", () => {
       orderJournal: { enabled: false, proximityPct: 5, retentionDays: 30 },
       scheduleJournal: { enabled: false },
       rebalanceJournal: { enabled: false },
+      fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {

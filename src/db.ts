@@ -1138,6 +1138,20 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE orders ADD COLUMN on_fill_json TEXT;
   `,
+
+  // v32 — bounded transient-failure retry for schedules + rebalance
+  // plans. Pre-v32 a TRANSIENT fire failure (RPC flake, rate limit)
+  // advanced next_run_at to the next natural cron slot — a weekly
+  // DCA lost the whole week to one bad RPC second. retry_count
+  // tracks consecutive transient failures for the CURRENT
+  // occurrence; the engine schedules a bounded exponential-backoff
+  // retry instead of skipping (never crossing the next natural
+  // occurrence). Reset to 0 on success, terminal failure, or budget
+  // exhaustion.
+  `
+  ALTER TABLE schedules ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE rebalance_plans ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3448,6 +3462,10 @@ export interface ScheduleRow {
   strategy: string | null;
   note: string | null;
   run_count: number;
+  /** v32: consecutive transient fire failures for the CURRENT
+   *  occurrence. >0 means next_run_at is a retry slot, not a
+   *  natural cron slot. */
+  retry_count: number;
   last_run_at: string | null;
   last_run_tx_hash: string | null;
   last_run_status: string | null;
@@ -3630,6 +3648,7 @@ export function recordScheduleFire(
        last_error_code = NULL,
        last_error_message = NULL,
        run_count = run_count + 1,
+       retry_count = 0,
        total_base_filled = ?,
        total_quote_spent = ?
      WHERE id = ?`,
@@ -3670,9 +3689,37 @@ export function recordScheduleError(
        last_run_at = ?,
        last_run_status = 'failed',
        last_error_code = ?,
-       last_error_message = ?
+       last_error_message = ?,
+       retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+/** v32: record a TRANSIENT fire failure and park the schedule on a
+ *  bounded-backoff retry slot instead of skipping the occurrence.
+ *  next_run_at = retryAt (must be BEFORE the next natural cron slot —
+ *  the caller guarantees that); retry_count increments so the next
+ *  failure backs off further. last_run_status='retry_pending'
+ *  distinguishes the state from a terminal 'failed'. */
+export function recordScheduleRetry(
+  id: number,
+  retryAt: string,
+  errorCode: string,
+  errorMessage: string,
+): void {
+  const db = openDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE schedules SET
+       updated_at = ?,
+       next_run_at = ?,
+       last_run_at = ?,
+       last_run_status = 'retry_pending',
+       last_error_code = ?,
+       last_error_message = ?,
+       retry_count = retry_count + 1
+     WHERE id = ?`,
+  ).run(now, retryAt, now, errorCode, capAuditText(errorMessage), id);
 }
 
 export function pauseSchedule(id: number): number {
@@ -3770,6 +3817,9 @@ export interface RebalanceRow {
   strategy: string | null;
   note: string | null;
   run_count: number;
+  /** v32: consecutive transient failures for the CURRENT occurrence
+   *  (see ScheduleRow.retry_count). */
+  retry_count: number;
   last_run_at: string | null;
   last_run_status: string | null;
   last_run_executed_count: number | null;
@@ -4009,7 +4059,8 @@ export function recordRebalanceRun(
        last_run_max_drift_pct = ?,
        last_error_code = NULL,
        last_error_message = NULL,
-       run_count = run_count + 1
+       run_count = run_count + 1,
+       retry_count = 0
      WHERE id = ?`,
   ).run(
     newStatus, now, run.nextRunAt, now, run.status,
@@ -4039,9 +4090,32 @@ export function recordRebalanceError(
        last_run_at = ?,
        last_run_status = 'failed',
        last_error_code = ?,
-       last_error_message = ?
+       last_error_message = ?,
+       retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+/** v32: rebalance counterpart of recordScheduleRetry. */
+export function recordRebalanceRetry(
+  id: number,
+  retryAt: string,
+  errorCode: string,
+  errorMessage: string,
+): void {
+  const db = openDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE rebalance_plans SET
+       updated_at = ?,
+       next_run_at = ?,
+       last_run_at = ?,
+       last_run_status = 'retry_pending',
+       last_error_code = ?,
+       last_error_message = ?,
+       retry_count = retry_count + 1
+     WHERE id = ?`,
+  ).run(now, retryAt, now, errorCode, capAuditText(errorMessage), id);
 }
 
 export function pauseRebalancePlan(id: number): number {
@@ -5059,6 +5133,7 @@ export function pruneAlertEvents(beforeIso: string): number {
 export type ScheduleCheckDecision =
   | "fired"
   | "fire_failed"
+  | "retry_scheduled"
   | "skipped_locked"
   | "skipped_pre_start"
   | "retired_end_at"
@@ -5136,6 +5211,7 @@ export function pruneScheduleCheckLog(beforeIso: string): number {
 export type RebalanceCheckDecision =
   | "in_band"
   | "fired"
+  | "retry_scheduled"
   | "partial_failure"
   | "failed"
   | "dry_run"

@@ -64,7 +64,7 @@ vi.mock("./wallet.js", async (importOriginal) => {
 const WETH = "0x4200000000000000000000000000000000000006";
 const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
-const { runScheduleTick } = await import("./schedules.js");
+const { runScheduleTick, planTransientRetry } = await import("./schedules.js");
 const {
   openDb,
   closeDb,
@@ -534,4 +534,173 @@ describe("runScheduleTick — multi-leg bracket hook", () => {
     // No half-bracket survives: leg 1 was rolled back to cancelled.
     expect(listOrders({ status: "active" })).toHaveLength(0);
   });
+});
+
+// ── v32: transient fire retry ────────────────────────────────
+
+describe("planTransientRetry — pure planner", () => {
+  const NAT = new Date(Date.now() + 6 * 3_600_000); // natural slot 6h out
+  const cfg = () => loadConfig();
+
+  it("terminal codes never retry", () => {
+    expect(planTransientRetry({ code: "INSUFFICIENT_BALANCE", retryCount: 0, nowMs: Date.now(), naturalNextAt: NAT, endAt: null, config: cfg() })).toBeNull();
+    expect(planTransientRetry({ code: "WALLET_NOT_FOUND", retryCount: 0, nowMs: Date.now(), naturalNextAt: NAT, endAt: null, config: cfg() })).toBeNull();
+  });
+
+  it("exponential backoff doubles per attempt (5m → 10m → 20m)", () => {
+    const now = Date.now();
+    const r1 = planTransientRetry({ code: "RPC_FAILED", retryCount: 0, nowMs: now, naturalNextAt: NAT, endAt: null, config: cfg() })!;
+    const r2 = planTransientRetry({ code: "RPC_FAILED", retryCount: 1, nowMs: now, naturalNextAt: NAT, endAt: null, config: cfg() })!;
+    const r3 = planTransientRetry({ code: "RPC_FAILED", retryCount: 2, nowMs: now, naturalNextAt: NAT, endAt: null, config: cfg() })!;
+    expect(r1.retryAt.getTime() - now).toBe(5 * 60_000);
+    expect(r2.retryAt.getTime() - now).toBe(10 * 60_000);
+    expect(r3.retryAt.getTime() - now).toBe(20 * 60_000);
+    expect(r1.attempt).toBe(1);
+    expect(r3.attempt).toBe(3);
+  });
+
+  it("budget exhausted (attempt > maxAttempts) returns null", () => {
+    expect(planTransientRetry({ code: "RPC_FAILED", retryCount: 3, nowMs: Date.now(), naturalNextAt: NAT, endAt: null, config: cfg() })).toBeNull();
+  });
+
+  it("never crosses the next natural occurrence", () => {
+    const soon = new Date(Date.now() + 2 * 60_000); // natural slot in 2m < 5m backoff
+    expect(planTransientRetry({ code: "RPC_FAILED", retryCount: 0, nowMs: Date.now(), naturalNextAt: soon, endAt: null, config: cfg() })).toBeNull();
+  });
+
+  it("never crosses end_at", () => {
+    const endAt = new Date(Date.now() + 60_000).toISOString();
+    expect(planTransientRetry({ code: "RPC_FAILED", retryCount: 0, nowMs: Date.now(), naturalNextAt: NAT, endAt, config: cfg() })).toBeNull();
+  });
+});
+
+describe("runScheduleTick — v32 transient retry", () => {
+  async function withFireRetry<T>(over: Record<string, unknown>, fn: () => Promise<T>): Promise<T> {
+    const { saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, fireRetry: { ...cfg.engine.fireRetry, ...over } } } as never);
+    try {
+      return await fn();
+    } finally {
+      saveConfig(cfg);
+    }
+  }
+
+  it("a transient wallet failure parks the schedule on a retry slot", async () => {
+    seedQuoteBalance("10000");
+    const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+    mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+    const id = seedSchedule(); // cron 0 */6 * * * — natural slot hours out
+    const before = Date.now();
+    const report = await tick();
+    expect(report.failed).toBe(0);
+    expect(report.retried).toBe(1);
+    const fire = report.fires[0];
+    expect(fire.status).toBe("retry_pending");
+    expect(fire.retryAttempt).toBe(1);
+    const row = getScheduleById(id)!;
+    expect(row.status).toBe("active");
+    expect(row.retry_count).toBe(1);
+    expect(row.last_run_status).toBe("retry_pending");
+    const delta = Date.parse(row.next_run_at) - before;
+    expect(delta).toBeGreaterThan(4 * 60_000);
+    expect(delta).toBeLessThan(6 * 60_000);
+    // run_count untouched — the occurrence hasn't happened yet.
+    expect(row.run_count).toBe(0);
+  });
+
+  it("consecutive failures back off exponentially (2nd attempt ≈ 10m)", async () => {
+    seedQuoteBalance("10000");
+    const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+    mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+    const id = seedSchedule();
+    await tick(); // attempt 1 → retry_count = 1, next_run_at +5m (future)
+    // Force the retry slot due now to simulate the retry tick.
+    const { setScheduleNextRunAt } = await import("./db.js");
+    setScheduleNextRunAt(id, PAST);
+    const before = Date.now();
+    const report = await tick();
+    expect(report.retried).toBe(1);
+    const row = getScheduleById(id)!;
+    expect(row.retry_count).toBe(2);
+    const delta = Date.parse(row.next_run_at) - before;
+    expect(delta).toBeGreaterThan(9 * 60_000);
+    expect(delta).toBeLessThan(11 * 60_000);
+  });
+
+  it("budget exhaustion loses the occurrence: natural slot + reset counter + failed status", async () => {
+    seedQuoteBalance("10000");
+    const err = Object.assign(new Error("rpc still down"), { code: "RPC_FAILED" });
+    mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+    const id = seedSchedule();
+    openDb().prepare(`UPDATE schedules SET retry_count = 3 WHERE id = ?`).run(id);
+    const report = await tick();
+    expect(report.retried).toBe(0);
+    expect(report.failed).toBe(1);
+    const row = getScheduleById(id)!;
+    expect(row.retry_count).toBe(0); // reset for the next occurrence
+    expect(row.last_run_status).toBe("failed");
+    // Advanced to the natural 6h cron slot, not a backoff slot.
+    expect(Date.parse(row.next_run_at) - Date.now()).toBeGreaterThan(30 * 60_000);
+  });
+
+  it("a successful fire resets a lingering retry counter", async () => {
+    seedQuoteBalance("10000");
+    const id = seedSchedule();
+    openDb().prepare(`UPDATE schedules SET retry_count = 2 WHERE id = ?`).run(id);
+    const report = await tick();
+    expect(report.fired).toBe(1);
+    expect(getScheduleById(id)!.retry_count).toBe(0);
+  });
+
+  it("a tight cron (every minute) never retries — the next occurrence supersedes", async () => {
+    seedQuoteBalance("10000");
+    const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+    mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+    const id = seedSchedule({ cron_expr: "* * * * *" });
+    const report = await tick();
+    expect(report.retried).toBe(0);
+    expect(report.failed).toBe(1);
+    expect(getScheduleById(id)!.retry_count).toBe(0);
+  });
+
+  it("fireRetry.enabled=false restores pre-v32 behavior", async () => {
+    await withFireRetry({ enabled: false }, async () => {
+      seedQuoteBalance("10000");
+      const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+      mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+      const id = seedSchedule();
+      const report = await tick();
+      expect(report.retried).toBe(0);
+      expect(report.failed).toBe(1);
+      expect(getScheduleById(id)!.retry_count).toBe(0);
+    });
+  });
+
+  it("journals retry_scheduled with the attempt counter", async () => {
+    await withJournal2(async () => {
+      seedQuoteBalance("10000");
+      const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
+      mockedReadOnlyWallet.mockImplementation(() => { throw err; });
+      const id = seedSchedule();
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("retry_scheduled");
+      expect(entries[0].error_code).toBe("RPC_FAILED");
+      expect(entries[0].notes).toMatch(/attempt 1\/3/);
+    });
+  });
+
+  async function withJournal2<T>(fn: () => Promise<T>): Promise<T> {
+    const { saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, scheduleJournal: { enabled: true } } } as never);
+    try {
+      return await fn();
+    } finally {
+      saveConfig(cfg);
+    }
+  }
 });

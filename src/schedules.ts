@@ -12,13 +12,18 @@
 //   cancelled  → operator-cancelled; terminal
 //
 // Failure handling:
-//   - Transient (RPC down, rate limit): advance next_run_at one period and
-//     leave active. Operators running a daily DCA don't want a 1-tick blip
-//     to reset their schedule.
-//   - Terminal (revert, SAFEGUARD_TRIGGERED, INSUFFICIENT_BALANCE): same —
-//     advance next_run_at, leave active. The failure is recorded on the row
-//     (last_error_*) AND emitted via `schedule.failed`. The DCA semantic is
-//     "try each occurrence independently"; operators wanting strict
+//   - Transient (RPC down, rate limit): v32 — bounded-backoff retry.
+//     The row parks on next_run_at = now + backoffMinutes × 2^attempt
+//     (engine.fireRetry, default 5m/10m/20m up to 3 attempts) so one
+//     bad RPC second doesn't cost a weekly DCA its whole occurrence.
+//     The retry never crosses the next NATURAL cron slot (the next
+//     occurrence supersedes); budget exhaustion falls through to the
+//     advance-and-record path with an escalated notification.
+//   - Terminal (revert, SAFEGUARD_TRIGGERED, INSUFFICIENT_BALANCE):
+//     advance next_run_at, leave active — retrying would fail
+//     identically. The failure is recorded on the row (last_error_*)
+//     AND emitted via `schedule.failed`. The DCA semantic is "try each
+//     occurrence independently"; operators wanting strict
 //     halt-on-error pause the schedule from their notification callback.
 //   - Cron error (impossible expression after the engine reaches an edge):
 //     terminal — mark completed with last_error_code so the operator sees
@@ -38,6 +43,7 @@ import {
   setScheduleNextRunAt,
   recordScheduleFire,
   recordScheduleError,
+  recordScheduleRetry,
   insertScheduleCheckEntry,
   lastScheduleCheckDecision,
   type ScheduleCheckDecision,
@@ -310,11 +316,13 @@ export interface ScheduleTickArgs {
 export interface ScheduleFireReport {
   scheduleId: number;
   name: string | null;
-  status: "fired" | "failed" | "skipped" | "completed";
+  status: "fired" | "failed" | "skipped" | "completed" | "retry_pending";
   txHash?: string;
   errorCode?: string;
   errorMessage?: string;
   nextRunAt?: string;
+  /** v32: present on retry_pending — which attempt this failure was. */
+  retryAttempt?: number;
 }
 
 export interface ScheduleTickReport {
@@ -327,6 +335,9 @@ export interface ScheduleTickReport {
   failed: number;
   completed: number;
   skipped: number;
+  /** v32: transient failures parked on a bounded-backoff retry slot
+   *  this tick (occurrence NOT lost yet). */
+  retried: number;
   fires: ScheduleFireReport[];
   recommendedActions: NextAction[];
 }
@@ -343,6 +354,35 @@ function isTransientErrorCode(code: string): boolean {
     code === "QUOTE_FAILED" ||
     code === "AGGREGATOR_FAILED"
   );
+}
+
+/** v32: decide whether a fire failure earns a bounded-backoff retry
+ *  instead of losing the occurrence. Returns null for terminal codes,
+ *  disabled config, exhausted budget, or when the backoff slot would
+ *  land at/after the next NATURAL occurrence (the next occurrence
+ *  supersedes — retrying then would double-fire) or past end_at.
+ *  Shared by the schedule AND rebalance engines (same failure shapes,
+ *  same transient-code list). Exported for tests. */
+export function planTransientRetry(args: {
+  code: string;
+  /** Consecutive transient failures already recorded for this occurrence. */
+  retryCount: number;
+  nowMs: number;
+  /** The next NATURAL cron occurrence (what next_run_at would advance to). */
+  naturalNextAt: Date;
+  endAt: string | null;
+  config: Config;
+}): { retryAt: Date; attempt: number; maxAttempts: number } | null {
+  if (!isTransientErrorCode(args.code)) return null;
+  const cfg = args.config.engine?.fireRetry ?? { enabled: true, maxAttempts: 3, backoffMinutes: 5 };
+  if (!cfg.enabled) return null;
+  const attempt = args.retryCount + 1;
+  if (attempt > cfg.maxAttempts) return null;
+  const backoffMs = cfg.backoffMinutes * 60_000 * 2 ** (attempt - 1);
+  const retryAt = new Date(args.nowMs + backoffMs);
+  if (retryAt.getTime() >= args.naturalNextAt.getTime()) return null;
+  if (args.endAt != null && retryAt.getTime() > Date.parse(args.endAt)) return null;
+  return { retryAt, attempt, maxAttempts: cfg.maxAttempts };
 }
 
 /**
@@ -366,6 +406,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
   const fires: ScheduleFireReport[] = [];
   let fired = 0;
   let failed = 0;
+  let retried = 0;
   let completed = 0;
   let skipped = 0;
 
@@ -628,6 +669,36 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "WALLET_LOCKED";
+      // RPC-shaped wallet failures earn the v32 bounded retry; config /
+      // password problems (WALLET_*) are terminal for this occurrence.
+      const retry = planTransientRetry({
+        code,
+        retryCount: schedule.retry_count ?? 0,
+        nowMs: Date.now(),
+        naturalNextAt: nextAt,
+        endAt: schedule.end_at,
+        config,
+      });
+      if (retry) {
+        recordScheduleRetry(schedule.id, retry.retryAt.toISOString(), code, msg);
+        journal({
+          scheduleId: schedule.id,
+          decision: "retry_scheduled",
+          errorCode: code,
+          notes: `attempt ${retry.attempt}/${retry.maxAttempts}, retrying at ${retry.retryAt.toISOString()}: ${msg.slice(0, 140)}`,
+        });
+        retried += 1;
+        fires.push({
+          scheduleId: schedule.id,
+          name: schedule.name,
+          status: "retry_pending",
+          errorCode: code,
+          errorMessage: msg,
+          nextRunAt: retry.retryAt.toISOString(),
+          retryAttempt: retry.attempt,
+        });
+        continue;
+      }
       // Wallet load is a config / password problem. Record on the row but
       // ALSO advance next_run_at — otherwise the engine re-tries every tick.
       recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
@@ -703,10 +774,70 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "INTERNAL_ERROR";
-      // Transient AND terminal both advance next_run_at — DCA's per-occurrence
-      // semantic. The error trail stays on the row for diagnosis.
+      // v32: transient failures earn a bounded-backoff retry — the
+      // occurrence isn't lost until the budget is exhausted or the
+      // next natural slot supersedes.
+      const retry = planTransientRetry({
+        code,
+        retryCount: schedule.retry_count ?? 0,
+        nowMs: Date.now(),
+        naturalNextAt: nextAt,
+        endAt: schedule.end_at,
+        config,
+      });
+      if (retry) {
+        recordScheduleRetry(schedule.id, retry.retryAt.toISOString(), code, msg);
+        journal({
+          scheduleId: schedule.id,
+          decision: "retry_scheduled",
+          errorCode: code,
+          notes: `attempt ${retry.attempt}/${retry.maxAttempts}, retrying at ${retry.retryAt.toISOString()}: ${msg.slice(0, 140)}`,
+        });
+        retried += 1;
+        fires.push({
+          scheduleId: schedule.id,
+          name: schedule.name,
+          status: "retry_pending",
+          errorCode: code,
+          errorMessage: msg,
+          nextRunAt: retry.retryAt.toISOString(),
+          retryAttempt: retry.attempt,
+        });
+        await tryNotify(
+          {
+            event: "schedule.failed",
+            severity: "warn",
+            title: `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} failed: ${code} — retrying (attempt ${retry.attempt}/${retry.maxAttempts})`,
+            body: `${msg}
+
+Transient failure — the occurrence is NOT lost yet. Next attempt at ${retry.retryAt.toISOString()}.`,
+            fields: {
+              id: schedule.id,
+              chain: schedule.chain,
+              account: schedule.account,
+              errorCode: code,
+              retryAt: retry.retryAt.toISOString(),
+              attempt: retry.attempt,
+              maxAttempts: retry.maxAttempts,
+            },
+            dedupKey: `schedule.failed:${schedule.id}:${code}:retry${retry.attempt}`,
+          },
+          config,
+          args.logger,
+        );
+        continue;
+      }
+      // Transient-budget exhausted OR terminal: advance next_run_at —
+      // DCA's per-occurrence semantic. The error trail stays on the row.
+      const attemptsMade = schedule.retry_count ?? 0;
+      const exhausted = isTransientErrorCode(code) && attemptsMade > 0;
       recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
-      journal({ scheduleId: schedule.id, decision: "fire_failed", errorCode: code, notes: msg.slice(0, 200) });
+      journal({
+        scheduleId: schedule.id,
+        decision: "fire_failed",
+        errorCode: code,
+        notes: exhausted ? `occurrence skipped after ${attemptsMade + 1} attempts: ${msg.slice(0, 150)}` : msg.slice(0, 200),
+      });
       failed += 1;
       fires.push({
         scheduleId: schedule.id,
@@ -717,12 +848,16 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         nextRunAt: nextAt.toISOString(),
       });
       // critical severity for terminal errors (safeguard, balance) so
-      // pageable channels light up; warn for transient.
+      // pageable channels light up; warn for transient — EXCEPT when
+      // the retry budget just ran out (the occurrence is genuinely
+      // lost — that deserves the page the individual retries didn't).
       await tryNotify(
         {
           event: "schedule.failed",
-          severity: isTransientErrorCode(code) ? "warn" : "critical",
-          title: `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} failed: ${code}`,
+          severity: isTransientErrorCode(code) && !exhausted ? "warn" : "critical",
+          title: exhausted
+            ? `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} occurrence LOST after ${attemptsMade + 1} attempts: ${code}`
+            : `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} failed: ${code}`,
           body: msg,
           fields: {
             id: schedule.id,
@@ -730,6 +865,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
             account: schedule.account,
             errorCode: code,
             nextRunAt: nextAt.toISOString(),
+            attemptsMade: attemptsMade + 1,
           },
           dedupKey: `schedule.failed:${schedule.id}:${code}`,
         },
@@ -989,6 +1125,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
     failed,
     completed,
     skipped,
+    retried,
     fires,
     recommendedActions,
   };

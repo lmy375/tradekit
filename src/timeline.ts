@@ -425,7 +425,7 @@ export function collectScheduleJournalEvents(args: {
     if (!kindAllowed("schedule.journal", args.filter.kinds)) continue;
     const severity: EventSeverity =
       r.decision === "fire_failed" ? "critical" :
-      r.decision === "hook_failed" || r.decision === "skipped_locked" ? "warn" :
+      r.decision === "hook_failed" || r.decision === "skipped_locked" || r.decision === "retry_scheduled" ? "warn" :
       "info";
     if (!severityAllowed(severity, args.filter.minSeverity)) continue;
     const run = r.run_number != null ? ` (run #${r.run_number})` : "";
@@ -462,7 +462,7 @@ export function collectRebalanceJournalEvents(args: {
     if (!kindAllowed("rebalance.journal", args.filter.kinds)) continue;
     const severity: EventSeverity =
       r.decision === "failed" || r.decision === "partial_failure" ? "critical" :
-      r.decision === "fired" || r.decision === "skipped_locked" ? "warn" :
+      r.decision === "fired" || r.decision === "skipped_locked" || r.decision === "retry_scheduled" ? "warn" :
       "info";
     if (!severityAllowed(severity, args.filter.minSeverity)) continue;
     const drift =
