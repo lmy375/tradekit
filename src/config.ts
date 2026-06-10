@@ -706,6 +706,9 @@ const dbRetentionSchema = z
     orderCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep engine_events. NULL = never prune. */
     engineEventsDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** Days to keep alert_events (v28 strategy-alert transition journal).
+     *  NULL = never prune. */
+    alertEventsDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep TERMINAL FAILED trades. NULL = never prune.
      *  Successful trades are NEVER auto-pruned — they're tax-relevant
      *  for most operators. To prune successes, use direct SQL or
@@ -719,6 +722,7 @@ const dbRetentionSchema = z
     paperTradesDays: null,
     orderCheckLogDays: null,
     engineEventsDays: null,
+    alertEventsDays: null,
     failedTradesDays: null,
   });
 
@@ -764,6 +768,7 @@ const dbSchema = z
       paperTradesDays: null,
       orderCheckLogDays: null,
       engineEventsDays: null,
+      alertEventsDays: null,
       failedTradesDays: null,
     },
     backup: { enabled: false, intervalHours: 24, destDir: "backups", retainCount: 7 },

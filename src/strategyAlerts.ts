@@ -52,6 +52,7 @@ import {
   getStrategyAlertState,
   listStrategyAlertStates,
   upsertStrategyAlertState,
+  insertAlertEvent,
   recentTrades,
   listPaperTrades,
   listDistinctStrategies,
@@ -720,6 +721,23 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
             lastEvaluatedAt,
             lastValueJson,
           });
+          // v28: durable transition journal — the timeline reads this
+          // instead of reconstructing fires from the state row. Best-
+          // effort: a journal hiccup must not break the alert tick
+          // (the notification + state write above are the contract).
+          try {
+            insertAlertEvent({
+              at: lastEvaluatedAt,
+              tag,
+              ruleType: ev.ruleType,
+              event: "fired",
+              severity: notification.severity,
+              message: ev.message,
+              valueJson: lastValueJson,
+            });
+          } catch (e) {
+            args.logger.debug(`alert_events journal write failed (fired ${tag}/${ev.ruleType}): ${(e as Error).message}`);
+          }
           break;
         }
         case "resolve": {
@@ -742,6 +760,24 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
             lastEvaluatedAt,
             lastValueJson,
           });
+          // v28: durable transition journal (see the fire branch).
+          // duration mirrors the notification's durationSeconds field.
+          try {
+            const ft = t.previousState.first_triggered_at;
+            const ftMs = ft ? Date.parse(ft) : NaN;
+            insertAlertEvent({
+              at: lastEvaluatedAt,
+              tag,
+              ruleType: ev.ruleType,
+              event: "resolved",
+              severity: "info",
+              message: ev.message,
+              valueJson: lastValueJson,
+              durationSeconds: Number.isFinite(ftMs) ? Math.max(0, Math.floor((now.getTime() - ftMs) / 1000)) : null,
+            });
+          } catch (e) {
+            args.logger.debug(`alert_events journal write failed (resolved ${tag}/${ev.ruleType}): ${(e as Error).message}`);
+          }
           break;
         }
         case "still_active": {

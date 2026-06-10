@@ -52,6 +52,7 @@ import {
   pruneTerminalTradesBefore,
   pruneOrderCheckLog,
   pruneEngineEvents,
+  pruneAlertEvents,
   type DbFileStats,
 } from "./db.js";
 import { DATA_DIR } from "./constants.js";
@@ -133,6 +134,7 @@ const RETENTION_TABLES: Array<{
   { table: "paper_trades", daysField: "paperTradesDays", pruneFn: pruneOldPaperTradesBefore },
   { table: "order_check_log", daysField: "orderCheckLogDays", pruneFn: pruneOrderCheckLog },
   { table: "engine_events", daysField: "engineEventsDays", pruneFn: pruneEngineEvents },
+  { table: "alert_events", daysField: "alertEventsDays", pruneFn: pruneAlertEvents },
   { table: "trades", daysField: "failedTradesDays", pruneFn: pruneTerminalTradesBefore },
 ];
 

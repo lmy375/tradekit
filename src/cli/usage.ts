@@ -300,6 +300,13 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy alerts reset [--tag X] [--rule TYPE] [--yes] [--json]
         Clear alert state rows. Re-arms the rule so the next violation will
         emit a fresh fire notification. Interactive confirmation unless --yes.
+  strategy alerts history [--tag X] [--rule TYPE] [--event fired|resolved]
+                          [--since ISO] [--until ISO] [--limit N] [--json]
+        Page the durable alert_events journal (v28): every fired/resolved
+        transition with exact timestamps, the violated value, and (for
+        resolves) the alerting duration. Unlike 'list' (current state) this
+        is the FULL history — repeated fire/resolve cycles all appear.
+        Prunable via db.retention.alertEventsDays.
   Configuration (in config.json under safety.strategyAlerts):
     enabled: true
     rules:  [{type: "staleness", thresholdSeconds: 172800},

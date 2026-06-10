@@ -39,6 +39,7 @@ beforeEach(() => {
   db.exec("DELETE FROM paper_trades");
   db.exec("DELETE FROM order_check_log");
   db.exec("DELETE FROM engine_events");
+  db.exec("DELETE FROM alert_events");
   db.exec("DELETE FROM trades");
   db.exec("DELETE FROM orders");
 });
@@ -53,6 +54,7 @@ const defaultDb: DbConfig = {
     paperTradesDays: null,
     orderCheckLogDays: null,
     engineEventsDays: null,
+    alertEventsDays: null,
     failedTradesDays: null,
   },
   backup: { enabled: false, intervalHours: 24, destDir: "backups", retainCount: 7 },
@@ -217,6 +219,30 @@ describe("pruneByRetention", () => {
     });
     const r = pruneByRetention(withRetention({ enabled: true, orderCheckLogDays: 30 }));
     expect(r.tables.find((t) => t.table === "order_check_log")?.rowsRemoved).toBe(1);
+  });
+
+  it("alert_events retention works (v28)", async () => {
+    const { insertAlertEvent } = await import("./db.js");
+    insertAlertEvent({
+      at: new Date(Date.now() - 60 * 86400 * 1000).toISOString(),
+      tag: "dca-eth",
+      ruleType: "staleness",
+      event: "fired",
+      severity: "warn",
+    });
+    insertAlertEvent({
+      at: new Date().toISOString(),
+      tag: "dca-eth",
+      ruleType: "staleness",
+      event: "resolved",
+      severity: "info",
+      durationSeconds: 60,
+    });
+    const r = pruneByRetention(withRetention({ enabled: true, alertEventsDays: 30 }));
+    expect(r.tables.find((t) => t.table === "alert_events")?.rowsRemoved).toBe(1);
+    const db = openDb();
+    const left = (db.prepare("SELECT COUNT(*) AS n FROM alert_events").get() as { n: number }).n;
+    expect(left).toBe(1);
   });
 });
 

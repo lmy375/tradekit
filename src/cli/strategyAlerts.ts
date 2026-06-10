@@ -20,13 +20,22 @@
 //   reset [--tag X] [--rule TYPE] [--yes] [--json]
 //        Manually clear alert state rows. Re-arms the rule so the
 //        next violation will emit a fresh fire notification.
+//
+//   history [--tag X] [--rule TYPE] [--event fired|resolved]
+//           [--since ISO] [--until ISO] [--limit N] [--json]
+//        v28: page the durable alert_events journal — every
+//        fired/resolved transition with exact timestamps, the
+//        violated value, and (for resolves) the alerting duration.
+//        Unlike `list` (current state), this is the full history.
 
 import { ToolError } from "../errors.js";
 import { loadConfig } from "../config.js";
 import {
   listStrategyAlertStates,
   resetStrategyAlertState,
+  listAlertEvents,
   type StrategyAlertStateRow,
+  type ListAlertEventsFilter,
 } from "../db.js";
 import {
   runAlertTick,
@@ -292,6 +301,52 @@ export async function strategyAlertsResetCommand(flags: Record<string, string>) 
   console.log(`Removed ${removed} state row(s).`);
 }
 
+// ── history (v28) ───────────────────────────────────────────
+
+export async function strategyAlertsHistoryCommand(flags: Record<string, string>) {
+  const filter: ListAlertEventsFilter = { limit: 100 };
+  if (flags["tag"]) filter.tag = flags["tag"];
+  if (flags["rule"]) filter.ruleType = flags["rule"];
+  if (flags["event"]) {
+    const ev = flags["event"];
+    if (ev !== "fired" && ev !== "resolved") {
+      throw new ToolError("INVALID_PARAMS", `--event must be fired or resolved (got "${ev}").`);
+    }
+    filter.event = ev;
+  }
+  if (flags["since"]) filter.sinceIso = flags["since"];
+  if (flags["until"]) filter.untilIso = flags["until"];
+  if (flags["limit"]) {
+    const n = parseInt(flags["limit"], 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new ToolError("INVALID_PARAMS", `--limit must be a positive integer (got "${flags["limit"]}").`);
+    }
+    filter.limit = n;
+  }
+  const rows = listAlertEvents(filter);
+
+  if (flags["json"] === "true") {
+    printJson({ ok: true, count: rows.length, events: rows });
+    return;
+  }
+  if (rows.length === 0) {
+    console.log("No alert transitions recorded.");
+    console.log("");
+    console.log("The journal fills as the alert watcher fires/resolves rules (v28+).");
+    console.log("Current state (incl. pre-v28 alerts): tradekit strategy alerts list");
+    return;
+  }
+  console.log(`${rows.length} alert transition(s), newest first:`);
+  for (const r of rows) {
+    const marker = r.event === "fired" ? (r.severity === "critical" ? "🔴" : "🟠") : "🟢";
+    const dur = r.event === "resolved" && r.duration_seconds != null ? `  (was alerting ${Math.floor(r.duration_seconds / 60)}m)` : "";
+    console.log(`  ${marker} ${r.at}  ${r.event.toUpperCase().padEnd(8)} ${r.tag} / ${r.rule_type}${dur}`);
+    if (r.event === "fired" && r.message) {
+      console.log(`       ${r.message}`);
+    }
+  }
+}
+
 // ── dispatch ────────────────────────────────────────────────
 
 export async function strategyAlertsCommand(
@@ -313,7 +368,10 @@ export async function strategyAlertsCommand(
     case "reset":
       await strategyAlertsResetCommand(flags);
       break;
+    case "history":
+      await strategyAlertsHistoryCommand(flags);
+      break;
     default:
-      throw subcommandError("strategy alerts", action, ["list", "show-rules", "run", "reset"]);
+      throw subcommandError("strategy alerts", action, ["list", "show-rules", "run", "reset", "history"]);
   }
 }

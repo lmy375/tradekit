@@ -418,6 +418,61 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── alert_history (v28) ─────────────────────────────────────
+  server.tool(
+    "alert_history",
+    "Durable journal of strategy-alert transitions (v28 alert_events table): one row per fired/resolved transition, written at the moment the watcher emitted the notification — exact timestamps, the violated value, and (for resolves) the alerting duration in seconds. Unlike the strategy_report alerts section (CURRENT state only) this is the full history: an alert that fired+resolved 5 times shows all 10 transitions. Returns { ok, count, events: [{ id, at, tag, rule_type, event, severity, message, value_json, duration_seconds }], elapsedMs }, newest-first. Filters (all optional): `tag` (strategy tag), `rule` (rule type, e.g. failure_streak), `event` (fired|resolved), `since` (duration shorthand like 7d or ISO), `until` (ISO), `limit` (default 100). Transitions recorded before the v28 migration aren't in the journal — use timeline_query (which falls back to state-row reconstruction) for those. Read-only.",
+    {
+      tag: z.string().optional().describe("Strategy tag filter (e.g. playbook:3, dca-eth)."),
+      rule: z.string().optional().describe("Rule type filter: staleness | slippage_trend | success_rate_drop | failure_streak | budget_approach | drawdown_threshold | trigger_proximity."),
+      event: z.enum(["fired", "resolved"]).optional(),
+      since: z.string().optional().describe("Lower bound — duration shorthand (4h, 7d) or ISO timestamp. Default: unbounded."),
+      until: z.string().optional().describe("Upper bound — ISO timestamp. Default: unbounded."),
+      limit: z.number().int().min(1).max(10_000).default(100),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("alert_history", rt.opts, input, undefined, async () => {
+            const t0 = Date.now();
+            const { listAlertEvents } = await import("../db.js");
+            const { parseSinceDuration } = await import("../timeline.js");
+            let sinceIso: string | undefined;
+            if (input.since) {
+              const parsed = parseSinceDuration(input.since);
+              if (!parsed) {
+                throw new ToolError(
+                  "INVALID_PARAMS",
+                  `'since' must be a duration (4h, 30m, 2d) or ISO timestamp; got "${input.since}".`,
+                );
+              }
+              sinceIso = parsed;
+            }
+            let untilIso: string | undefined;
+            if (input.until) {
+              const t = Date.parse(input.until);
+              if (!Number.isFinite(t)) {
+                throw new ToolError("INVALID_PARAMS", `'until' must be valid ISO-8601; got "${input.until}".`);
+              }
+              untilIso = new Date(t).toISOString();
+            }
+            const rows = listAlertEvents({
+              sinceIso,
+              untilIso,
+              tag: input.tag,
+              ruleType: input.rule,
+              event: input.event,
+              limit: input.limit,
+            });
+            return { count: rows.length, events: rows, elapsedMs: Date.now() - t0 };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── price_stats (iter38) ────────────────────────────────────
   server.tool(
     "price_stats",

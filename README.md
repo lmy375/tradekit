@@ -572,10 +572,14 @@ tradekit strategy alerts run --once           # evaluate now; emits notification
 tradekit strategy alerts run --watch 60       # daemon mode (every 60s); Ctrl-C to stop
 tradekit strategy alerts list --active-only   # which alerts are currently firing
 tradekit strategy alerts reset --tag dca-eth  # re-arm the rules for one strategy
+tradekit strategy alerts history --tag dca-eth --event fired --limit 50
+                                              # v28: full fire/resolve history (durable journal)
 
 # Inline in the report:
 tradekit strategy report 1 --alerts
 ```
+
+**Durable transition journal (v28).** Every fired/resolved transition also lands a row in the `alert_events` table at the moment the notification is emitted — exact timestamp, the violated value, and (for resolves) the alerting duration. `strategy alerts history` (CLI) and `alert_history` (MCP) page it; `timeline_query` reads it for `alert.fired` / `alert.resolved` events (falling back to state-row reconstruction only for pre-v28 windows). Unlike `alerts list` — which shows CURRENT state — the journal keeps the full history: a flapping alert that fired and resolved five times shows all ten transitions. Prunable via `db.retention.alertEventsDays`.
 
 **Configuration** lives at `safety.strategyAlerts` in `~/.tradekit/config.json`:
 
@@ -663,6 +667,7 @@ tradekit db rotate --retain 14
       "paperTradesDays": null,
       "orderCheckLogDays": null,
       "engineEventsDays": null,
+      "alertEventsDays": null,
       "failedTradesDays": null
     },
     "backup": {
@@ -737,6 +742,7 @@ DB stats: /Users/me/.tradekit/tradekit.db
     order_check_log          would prune rows older than 2026-05-01T12:00:00Z
     paper_trades             skipped (db.retention.paperTradesDays=null (unset))
     engine_events            skipped (db.retention.engineEventsDays=null (unset))
+    alert_events             skipped (db.retention.alertEventsDays=null (unset))
     trades                   skipped (db.retention.failedTradesDays=null (unset))
 
   Run `tradekit db prune --dry-run` to see actual counts; `tradekit db prune` to apply.
@@ -816,7 +822,7 @@ The story tells itself end-to-end: the engine ran for 12h, hit a transient RPC d
 
 **v1 limitations.**
 - Heartbeats not persisted (high cardinality; use `engine status` for liveness).
-- `alert.fired` / `alert.resolved` still surface via iter36 heuristic — `engine_events` is intentionally scoped to *engine* events, not per-strategy domain. A future `alert_events` table can close this last gap.
+- `engine_events` is intentionally scoped to *engine* events, not per-strategy domain. The per-strategy gap closed in v28: `alert.fired` / `alert.resolved` now persist to their own `alert_events` table (see *Strategy alerts*).
 - No auto-prune — operator can call `pruneEngineEvents(beforeIso)` via `doctor` or a cron.
 
 #### Price layer overhaul (iter38) — batch fetch + provider stats
@@ -1014,9 +1020,9 @@ The story tells itself: operator edited an order to widen the trail at 13:50, di
 
 **MCP** exposes `timeline_query` with the same filter set. Agents investigating an incident make one MCP call instead of orchestrating 6+ separate queries — and they get back a uniformly-typed `TimelineEvent[]` that can drive autonomous remediation flows.
 
-**v1 limitations.**
-- `alert.resolved` detection is a heuristic (active=0 + last_value_json present + last_evaluated_at in window). 95%+ accurate but theoretically vulnerable to a same-second backoff-deepen-then-resolve corner case. v2 may add an explicit `alert_events` table for 100% precision.
-- Engine lock/unlock + worker.degraded/recovered transitions surface via `audit_log` (the events that triggered them); v2 may add a dedicated `engine_events` table for richer telemetry.
+**v1 limitations — both since closed.**
+- ~~`alert.resolved` detection is a heuristic~~ — v28 added the `alert_events` table: every fired/resolved transition is journaled at the moment the watcher emits the notification, so the timeline reads exact timestamps and full repeat history (an alert that fired+resolved 5 times shows all 10 transitions; the heuristic collapsed them to one of each). The state-row heuristic remains only as the fallback for windows that predate the migration.
+- ~~Engine lock/unlock transitions surface via `audit_log`~~ — iter39 added the dedicated `engine_events` table.
 
 #### Config hot-reload (iter35) — SIGHUP + impact preflight
 
@@ -1933,14 +1939,14 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 106 tools across six groups:
+Starts an MCP stdio server exposing 107 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
 - **Trade & automation** (29) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
 - **Strategy & backtest** (11) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
-- **Observability** (10) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `price_stats`
+- **Observability** (11) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `alert_history`, `price_stats`
 - **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
 Every write tool accepts `simulate: true`. Errors are structured (see *Agent integration* below). Every monitoring/diagnostic tool exposes a top-level `severity` field ('ok' | 'warn' | 'critical' / 'fail') and a `recommendedActions[]` array carrying structured `NextAction[]` dispatch hints — agents branch on `severity` for at-a-glance status and iterate `recommendedActions` to auto-remediate without parsing prose.

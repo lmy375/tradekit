@@ -20,6 +20,7 @@ const {
   collectPaperEvents,
   collectAuditEvents,
   collectAlertEvents,
+  collectAlertEventsLegacy,
   collectJournalEvents,
   resolveWindow,
   parseSinceDuration,
@@ -33,6 +34,7 @@ const {
   insertAudit,
   insertOrderCheckEntry,
   upsertStrategyAlertState,
+  insertAlertEvent,
 } = await import("./db.js");
 
 beforeAll(() => openDb());
@@ -48,6 +50,7 @@ beforeEach(() => {
   db.exec("DELETE FROM orders");
   db.exec("DELETE FROM order_check_log");
   db.exec("DELETE FROM strategy_alert_state");
+  db.exec("DELETE FROM alert_events");
   vi.clearAllMocks();
 });
 
@@ -400,9 +403,9 @@ describe("collectJournalEvents", () => {
 
 // ── collectAlertEvents ──────────────────────────────────────
 
-describe("collectAlertEvents", () => {
+describe("collectAlertEventsLegacy (pre-v28 state-row fallback)", () => {
   it("emits a fired event when first_triggered_at lands in window", () => {
-    const evs = collectAlertEvents({
+    const evs = collectAlertEventsLegacy({
       states: [
         {
           tag: "dca-eth",
@@ -423,7 +426,7 @@ describe("collectAlertEvents", () => {
   });
 
   it("emits a resolved event when active=0 + last_value_json present + last_evaluated in window", () => {
-    const evs = collectAlertEvents({
+    const evs = collectAlertEventsLegacy({
       states: [
         {
           tag: "dca-eth",
@@ -443,7 +446,7 @@ describe("collectAlertEvents", () => {
   });
 
   it("classifies drawdown_threshold as critical, trigger_proximity as info", () => {
-    const evs = collectAlertEvents({
+    const evs = collectAlertEventsLegacy({
       states: [
         { tag: "x", rule_type: "drawdown_threshold", active: 1, first_triggered_at: "2026-05-31T12:00:00Z", last_evaluated_at: "x", last_value_json: null } as never,
         { tag: "x", rule_type: "trigger_proximity", active: 1, first_triggered_at: "2026-05-31T12:00:00Z", last_evaluated_at: "x", last_value_json: null } as never,
@@ -459,7 +462,7 @@ describe("collectAlertEvents", () => {
   });
 
   it("filters by strategy tag", () => {
-    const evs = collectAlertEvents({
+    const evs = collectAlertEventsLegacy({
       states: [
         { tag: "dca-eth", rule_type: "staleness", active: 1, first_triggered_at: "2026-05-31T12:00:00Z", last_evaluated_at: "x", last_value_json: null } as never,
         { tag: "swing-btc", rule_type: "staleness", active: 1, first_triggered_at: "2026-05-31T12:00:00Z", last_evaluated_at: "x", last_value_json: null } as never,
@@ -470,6 +473,93 @@ describe("collectAlertEvents", () => {
     });
     expect(evs).toHaveLength(1);
     expect(evs[0].refs.strategy).toBe("dca-eth");
+  });
+});
+
+// ── collectAlertEvents (v28 journal-driven) ─────────────────
+
+function journalRow(over: Record<string, unknown> = {}) {
+  return {
+    id: 1,
+    at: "2026-05-31T12:00:00Z",
+    tag: "dca-eth",
+    rule_type: "failure_streak",
+    event: "fired",
+    severity: "critical",
+    message: "3 consecutive failures",
+    value_json: '{"streak":3}',
+    duration_seconds: null,
+    ...over,
+  } as never;
+}
+
+describe("collectAlertEvents (v28 journal)", () => {
+  it("maps fired rows with the stored severity + message", () => {
+    const evs = collectAlertEvents({
+      events: [journalRow()],
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(evs).toHaveLength(1);
+    expect(evs[0].kind).toBe("alert.fired");
+    expect(evs[0].severity).toBe("critical");
+    expect(evs[0].at).toBe("2026-05-31T12:00:00Z"); // exact transition time
+    expect(evs[0].summary).toContain("3 consecutive failures");
+  });
+
+  it("maps resolved rows as info with the alerting duration", () => {
+    const evs = collectAlertEvents({
+      events: [journalRow({ event: "resolved", severity: "info", duration_seconds: 720 })],
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(evs).toHaveLength(1);
+    expect(evs[0].kind).toBe("alert.resolved");
+    expect(evs[0].severity).toBe("info");
+    expect(evs[0].summary).toContain("after 12m");
+  });
+
+  it("REPEATED fire/resolve cycles all surface (the legacy reconstruction collapsed them)", () => {
+    const evs = collectAlertEvents({
+      events: [
+        journalRow({ id: 1, at: "2026-05-31T10:00:00Z", event: "fired" }),
+        journalRow({ id: 2, at: "2026-05-31T11:00:00Z", event: "resolved", severity: "info", duration_seconds: 3600 }),
+        journalRow({ id: 3, at: "2026-05-31T12:00:00Z", event: "fired" }),
+        journalRow({ id: 4, at: "2026-05-31T13:00:00Z", event: "resolved", severity: "info", duration_seconds: 3600 }),
+      ],
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(evs).toHaveLength(4);
+    expect(evs.filter((e) => e.kind === "alert.fired")).toHaveLength(2);
+    expect(evs.filter((e) => e.kind === "alert.resolved")).toHaveLength(2);
+  });
+
+  it("respects strategy / kinds / minSeverity filters", () => {
+    const rows = [
+      journalRow({ id: 1, tag: "dca-eth" }),
+      journalRow({ id: 2, tag: "swing-btc", severity: "warn", rule_type: "staleness" }),
+    ];
+    const byTag = collectAlertEvents({
+      events: rows,
+      filter: { strategy: "dca-eth" },
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(byTag).toHaveLength(1);
+    expect(byTag[0].refs.strategy).toBe("dca-eth");
+
+    const bySeverity = collectAlertEvents({
+      events: rows,
+      filter: { minSeverity: "critical" },
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(bySeverity).toHaveLength(1);
+    expect(bySeverity[0].severity).toBe("critical");
   });
 });
 
@@ -588,7 +678,7 @@ describe("collectTimeline — end-to-end against seeded DB", () => {
     expect(evs.filter((e) => e.kind === "paper.fill")).toEqual([]);
   });
 
-  it("alert fired event is collected via the alerts source", () => {
+  it("alert fired event is collected via the LEGACY state-row fallback when the journal is empty", () => {
     upsertStrategyAlertState({
       tag: "dca-eth",
       ruleType: "drawdown_threshold",
@@ -605,6 +695,33 @@ describe("collectTimeline — end-to-end against seeded DB", () => {
     expect(evs).toHaveLength(1);
     expect(evs[0].kind).toBe("alert.fired");
     expect(evs[0].severity).toBe("critical");
+  });
+
+  it("v28: the alert_events journal takes precedence over the state-row heuristic", () => {
+    // Journal has the truth: two full fire/resolve cycles.
+    insertAlertEvent({ at: "2026-05-31T10:30:00Z", tag: "dca-eth", ruleType: "failure_streak", event: "fired", severity: "critical", message: "3 consecutive failures" });
+    insertAlertEvent({ at: "2026-05-31T11:00:00Z", tag: "dca-eth", ruleType: "failure_streak", event: "resolved", severity: "info", durationSeconds: 1800 });
+    insertAlertEvent({ at: "2026-05-31T11:30:00Z", tag: "dca-eth", ruleType: "failure_streak", event: "fired", severity: "critical", message: "3 consecutive failures" });
+    // A state row that the legacy heuristic would have reconstructed
+    // DIFFERENTLY (one fire at 11:30 only) — must be ignored.
+    upsertStrategyAlertState({
+      tag: "dca-eth",
+      ruleType: "failure_streak",
+      active: true,
+      firstTriggeredAt: "2026-05-31T11:30:00Z",
+      lastEvaluatedAt: "2026-05-31T11:30:00Z",
+      lastValueJson: '{"streak":3}',
+    });
+    const evs = collectTimeline({
+      sinceIso: "2026-05-31T10:00:00Z",
+      untilIso: "2026-05-31T12:00:00Z",
+      kinds: ["alert.fired", "alert.resolved"],
+    });
+    // All THREE journal transitions surface; the heuristic would have
+    // produced exactly one.
+    expect(evs).toHaveLength(3);
+    expect(evs.filter((e) => e.kind === "alert.fired")).toHaveLength(2);
+    expect(evs.filter((e) => e.kind === "alert.resolved")).toHaveLength(1);
   });
 
   it("journal source — order edits surface in the timeline", () => {

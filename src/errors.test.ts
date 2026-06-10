@@ -487,6 +487,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "price_stats",
     // Iter39: durable engine state transitions.
     "engine_events",
+    // v28: durable strategy-alert transition journal.
+    "alert_history",
     // Iter40: DB lifecycle observability.
     "db_stats", "db_integrity_check",
     // paper-tools.ts: virtual-book management for dry-run strategies

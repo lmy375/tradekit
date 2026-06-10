@@ -41,6 +41,7 @@ const {
   getStrategyAlertState,
   listStrategyAlertStates,
   upsertDrawdownState,
+  listAlertEvents,
 } = await import("./db.js");
 
 beforeAll(() => openDb());
@@ -59,6 +60,7 @@ beforeEach(() => {
   db.exec("DELETE FROM drawdown_state");
   db.exec("DELETE FROM order_check_log");
   db.exec("DELETE FROM strategy_alert_state");
+  db.exec("DELETE FROM alert_events");
   vi.clearAllMocks();
 });
 
@@ -897,6 +899,97 @@ describe("runAlertTick — end-to-end", () => {
     seedRealStrategy("tag-b");
     const tags = enumerateActiveTags();
     expect(tags).toEqual(["tag-a", "tag-b"]);
+  });
+
+  // ── v28: alert_events durable journal ─────────────────────
+
+  it("fire writes a 'fired' journal row; still_active ticks do NOT", async () => {
+    seedRealStrategy("dca-test");
+    for (let i = 0; i < 6; i++) {
+      insertTrade({
+        timestamp: `2026-05-${20 + i}T00:00:00Z`,
+        chain: "base",
+        account: "default",
+        direction: "buy",
+        base_token: ETH,
+        base_symbol: "ETH",
+        base_amount: "0.1",
+        quote_token: USDC,
+        quote_symbol: "USDC",
+        quote_amount: "250",
+        price: "2500",
+        tx_hash: `0x${i}`,
+        status: "success",
+        gas_used: null,
+        gas_price_wei: null,
+        gas_cost_native: null,
+        aggregator: "kyberswap",
+        fee_tier: null,
+        notes: null,
+        strategy: "dca-test",
+        realized_slippage_bps: 200,
+      });
+    }
+    const config = baseConfig({
+      enabled: true,
+      rules: [{ type: "slippage_trend", baselineBps: 50, alertMultiplier: 1.5, minSampleSize: 5 } as never],
+    });
+    await runAlertTick({ config: config as never, logger: silentLogger(), notifyFn: vi.fn(), onlyTags: ["dca-test"] });
+    // Second tick is still_active — must not append a second row.
+    await runAlertTick({ config: config as never, logger: silentLogger(), notifyFn: vi.fn(), onlyTags: ["dca-test"] });
+
+    const events = listAlertEvents({ tag: "dca-test" });
+    expect(events).toHaveLength(1);
+    expect(events[0].event).toBe("fired");
+    expect(events[0].rule_type).toBe("slippage_trend");
+    expect(events[0].severity).toBe("warn");
+    expect(events[0].message).toBeTruthy();
+    expect(events[0].value_json).toBeTruthy();
+    expect(events[0].duration_seconds).toBeNull();
+  });
+
+  it("resolve writes a 'resolved' journal row with the alerting duration", async () => {
+    seedRealStrategy("dca-test");
+    upsertStrategyAlertState({
+      tag: "dca-test",
+      ruleType: "drawdown_threshold",
+      active: true,
+      firstTriggeredAt: "2026-05-29T00:00:00Z",
+      lastEvaluatedAt: "2026-05-30T00:00:00Z",
+      lastValueJson: '{"drawdownPct":15}',
+    });
+    upsertDrawdownState({
+      scopeKey: "strategy:dca-test",
+      peakUsd: 10000,
+      peakAt: "2026-05-01T00:00:00Z",
+      lastValueUsd: 9900,
+      trippedAt: null,
+    });
+    const config = baseConfig({ enabled: true, rules: [{ type: "drawdown_threshold", alertPct: 10 } as never] });
+    await runAlertTick({ config: config as never, logger: silentLogger(), notifyFn: vi.fn(), onlyTags: ["dca-test"] });
+
+    const events = listAlertEvents({ tag: "dca-test", event: "resolved" });
+    expect(events).toHaveLength(1);
+    expect(events[0].rule_type).toBe("drawdown_threshold");
+    expect(events[0].severity).toBe("info");
+    // first_triggered_at was 2026-05-29; duration must be positive.
+    expect(events[0].duration_seconds).toBeGreaterThan(0);
+  });
+
+  it("listAlertEvents filters by tag / event / limit, newest first", async () => {
+    const { insertAlertEvent } = await import("./db.js");
+    insertAlertEvent({ at: "2026-06-01T00:00:00Z", tag: "a", ruleType: "staleness", event: "fired", severity: "warn" });
+    insertAlertEvent({ at: "2026-06-02T00:00:00Z", tag: "a", ruleType: "staleness", event: "resolved", severity: "info", durationSeconds: 60 });
+    insertAlertEvent({ at: "2026-06-03T00:00:00Z", tag: "b", ruleType: "failure_streak", event: "fired", severity: "critical" });
+
+    expect(listAlertEvents({})).toHaveLength(3);
+    expect(listAlertEvents({ tag: "a" })).toHaveLength(2);
+    expect(listAlertEvents({ event: "fired" })).toHaveLength(2);
+    expect(listAlertEvents({ tag: "a", event: "fired" })).toHaveLength(1);
+    const limited = listAlertEvents({ limit: 1 });
+    expect(limited).toHaveLength(1);
+    expect(limited[0].tag).toBe("b"); // newest first
+    expect(listAlertEvents({ sinceIso: "2026-06-02T00:00:00Z", untilIso: "2026-06-02T23:59:59Z" })).toHaveLength(1);
   });
 
   it("multiple strategies + per-rule appliesTo filters", async () => {

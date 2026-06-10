@@ -45,6 +45,8 @@ import {
   listPaperTrades,
   recentAudit,
   listStrategyAlertStates,
+  listAlertEvents,
+  type AlertEventRow,
   listEngineEvents,
   openDb,
   type TradeRow,
@@ -153,6 +155,10 @@ export interface TimelineInjections {
   paperTradesFn?: typeof listPaperTrades;
   auditFn?: typeof recentAudit;
   alertsFn?: typeof listStrategyAlertStates;
+  /** v28: alert_events journal source (exact transitions). When the
+   *  journal has no rows in the window, the collector falls back to
+   *  the legacy state-row heuristic via alertsFn. */
+  alertEventsFn?: typeof listAlertEvents;
   journalFn?: (since: string, until: string, limit: number) => OrderCheckLogRow[];
   /** Iter39: engine_events table source. */
   engineEventsFn?: typeof listEngineEvents;
@@ -396,8 +402,51 @@ export function collectJournalEvents(args: {
 }
 
 /**
- * Collect alert events from strategy_alert_state. Each row in the
- * "active" state corresponds to ONE fired event (at
+ * v28: collect alert events from the durable alert_events journal —
+ * every fired/resolved transition is a row written at the moment the
+ * watcher emitted the notification, so timestamps are exact and
+ * REPEATED transitions inside the window all surface (the legacy
+ * state-row reconstruction collapsed them to at most one of each).
+ */
+export function collectAlertEvents(args: {
+  events: readonly AlertEventRow[];
+  filter: Pick<CollectTimelineArgs, "strategy" | "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const e of args.events) {
+    if (args.filter.strategy && e.tag !== args.filter.strategy) continue;
+    if (e.at < args.sinceIso || e.at > args.untilIso) continue;
+    if (e.event === "fired") {
+      const severity = e.severity as EventSeverity;
+      if (!kindAllowed("alert.fired", args.filter.kinds) || !severityAllowed(severity, args.filter.minSeverity)) continue;
+      out.push({
+        at: e.at,
+        kind: "alert.fired",
+        severity,
+        summary: `ALERT FIRED ${e.tag}: ${e.rule_type}${e.message ? ` — ${e.message}` : ""}`,
+        refs: { type: "alert", id: `${e.tag}/${e.rule_type}`, strategy: e.tag },
+        details: { tag: e.tag, ruleType: e.rule_type, value: e.value_json, message: e.message },
+      });
+    } else {
+      if (!kindAllowed("alert.resolved", args.filter.kinds) || !severityAllowed("info", args.filter.minSeverity)) continue;
+      out.push({
+        at: e.at,
+        kind: "alert.resolved",
+        severity: "info",
+        summary: `ALERT RESOLVED ${e.tag}: ${e.rule_type}${e.duration_seconds != null ? ` (after ${Math.floor(e.duration_seconds / 60)}m)` : ""}`,
+        refs: { type: "alert", id: `${e.tag}/${e.rule_type}`, strategy: e.tag },
+        details: { tag: e.tag, ruleType: e.rule_type, durationSeconds: e.duration_seconds },
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * LEGACY (pre-v28) reconstruction from strategy_alert_state. Each row
+ * in the "active" state corresponds to ONE fired event (at
  * first_triggered_at). Inactive rows in our window with a
  * last_evaluated_at after first_triggered_at correspond to a
  * resolved event — we can't perfectly distinguish the resolution
@@ -405,8 +454,12 @@ export function collectJournalEvents(args: {
  * the moment the reconciler observed the OK transition (i.e. when
  * the resolved notification was emitted), so it's the right
  * timestamp to use.
+ *
+ * Kept as the FALLBACK for windows with no alert_events rows —
+ * transitions that happened before the v28 migration are only
+ * reconstructible this way.
  */
-export function collectAlertEvents(args: {
+export function collectAlertEventsLegacy(args: {
   states: readonly StrategyAlertStateRow[];
   filter: Pick<CollectTimelineArgs, "strategy" | "kinds" | "minSeverity">;
   sinceIso: string;
@@ -680,10 +733,24 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   });
   const auditEvents = collectAuditEvents({ audit: auditRows, filter, sinceIso, untilIso });
 
-  const alertRows = (args.injects?.alertsFn ?? listStrategyAlertStates)({
-    tag: args.strategy,
+  // v28: prefer the durable alert_events journal (exact transition
+  // timestamps, full repeat history). Fall back to the legacy
+  // state-row reconstruction ONLY when the journal has nothing in
+  // the window — that's the pre-migration-history case.
+  const alertJournalRows = (args.injects?.alertEventsFn ?? listAlertEvents)({
+    sinceIso,
+    untilIso,
+    ...(args.strategy ? { tag: args.strategy } : {}),
   });
-  const alertEvents = collectAlertEvents({ states: alertRows, filter, sinceIso, untilIso });
+  let alertEvents: TimelineEvent[];
+  if (alertJournalRows.length > 0) {
+    alertEvents = collectAlertEvents({ events: alertJournalRows, filter, sinceIso, untilIso });
+  } else {
+    const alertRows = (args.injects?.alertsFn ?? listStrategyAlertStates)({
+      tag: args.strategy,
+    });
+    alertEvents = collectAlertEventsLegacy({ states: alertRows, filter, sinceIso, untilIso });
+  }
 
   // Journal source: no public helper for "last N order_check_log
   // rows in a window". The injection hook covers tests; the

@@ -1043,6 +1043,38 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE rebalance_plans ADD COLUMN paper INTEGER NOT NULL DEFAULT 0;
   `,
+
+  // v28 — alert_events: durable journal of strategy-alert transitions.
+  //
+  // Pre-v28, alert.fired / alert.resolved had no history of their own —
+  // the timeline reconstructed them heuristically from the
+  // strategy_alert_state row (95%+ accurate, but the state row only
+  // remembers the LAST transition: an alert that fired+resolved 5
+  // times in a window reconstructed as at most one fired + one
+  // resolved, the resolve timestamp was approximated by
+  // last_evaluated_at, and a same-second backoff-deepen-then-resolve
+  // could mis-classify). This table records every transition at the
+  // moment the watcher emits the notification — same side-by-side
+  // pattern as v26 engine_events.
+  //
+  // 'fired' rows carry the rule's violated value + severity;
+  // 'resolved' rows carry the alerting duration. Low write volume
+  // (transitions only — still_active/still_ok ticks don't write).
+  `
+  CREATE TABLE IF NOT EXISTS alert_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    at               TEXT    NOT NULL,
+    tag              TEXT    NOT NULL,
+    rule_type        TEXT    NOT NULL,
+    event            TEXT    NOT NULL,
+    severity         TEXT    NOT NULL,
+    message          TEXT,
+    value_json       TEXT,
+    duration_seconds INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_alert_events_at  ON alert_events (at DESC);
+  CREATE INDEX IF NOT EXISTS idx_alert_events_tag ON alert_events (tag, at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4708,6 +4740,112 @@ export function listEngineEvents(filter: ListEngineEventsFilter = {}): EngineEve
 export function pruneEngineEvents(beforeIso: string): number {
   const db = openDb();
   const r = db.prepare(`DELETE FROM engine_events WHERE timestamp < ?`).run(beforeIso);
+  return Number(r.changes ?? 0);
+}
+
+// ── alert_events (v28) ───────────────────────────────────────
+//
+// Durable journal of strategy-alert transitions. One row per
+// fired/resolved transition, written by runAlertTick at the moment
+// the notification is emitted. The timeline reads this instead of
+// reconstructing transitions from strategy_alert_state heuristics.
+
+export interface AlertEventRow {
+  id: number;
+  /** ISO timestamp of the transition. */
+  at: string;
+  /** Strategy tag the alert watches (e.g. "playbook:3" / "dca-eth"). */
+  tag: string;
+  /** Rule type (staleness / failure_streak / drawdown_threshold / …). */
+  rule_type: string;
+  event: "fired" | "resolved";
+  /** Notification severity at transition time. 'resolved' is always info. */
+  severity: "info" | "warn" | "critical";
+  /** Human summary — the fire message, e.g. "3 consecutive failures". */
+  message: string | null;
+  /** JSON-encoded rule value observed at the transition. */
+  value_json: string | null;
+  /** Resolves only: how long the alert was active, in seconds. */
+  duration_seconds: number | null;
+}
+
+export interface InsertAlertEventArgs {
+  at: string;
+  tag: string;
+  ruleType: string;
+  event: "fired" | "resolved";
+  severity: "info" | "warn" | "critical";
+  message?: string | null;
+  valueJson?: string | null;
+  durationSeconds?: number | null;
+}
+
+export function insertAlertEvent(args: InsertAlertEventArgs): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO alert_events
+         (at, tag, rule_type, event, severity, message, value_json, duration_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      args.at,
+      args.tag,
+      args.ruleType,
+      args.event,
+      args.severity,
+      args.message ?? null,
+      args.valueJson ?? null,
+      args.durationSeconds ?? null,
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export interface ListAlertEventsFilter {
+  /** Lower bound on `at` (inclusive). */
+  sinceIso?: string;
+  /** Upper bound on `at` (inclusive). */
+  untilIso?: string;
+  tag?: string;
+  ruleType?: string;
+  event?: "fired" | "resolved";
+  /** Max rows, newest-first. Default unbounded. */
+  limit?: number;
+}
+
+export function listAlertEvents(filter: ListAlertEventsFilter = {}): AlertEventRow[] {
+  const db = openDb();
+  const where: string[] = [];
+  const args: (string | number)[] = [];
+  if (filter.sinceIso) {
+    where.push("at >= ?");
+    args.push(filter.sinceIso);
+  }
+  if (filter.untilIso) {
+    where.push("at <= ?");
+    args.push(filter.untilIso);
+  }
+  if (filter.tag) {
+    where.push("tag = ?");
+    args.push(filter.tag);
+  }
+  if (filter.ruleType) {
+    where.push("rule_type = ?");
+    args.push(filter.ruleType);
+  }
+  if (filter.event) {
+    where.push("event = ?");
+    args.push(filter.event);
+  }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const limitClause = filter.limit != null ? `LIMIT ${Math.max(1, Math.floor(filter.limit))}` : "";
+  const sql = `SELECT * FROM alert_events ${whereClause} ORDER BY at DESC, id DESC ${limitClause}`;
+  return db.prepare(sql).all(...args) as unknown as AlertEventRow[];
+}
+
+export function pruneAlertEvents(beforeIso: string): number {
+  const db = openDb();
+  const r = db.prepare(`DELETE FROM alert_events WHERE at < ?`).run(beforeIso);
   return Number(r.changes ?? 0);
 }
 
