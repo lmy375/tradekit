@@ -30,6 +30,10 @@ import {
   listSchedules,
   listRebalancePlans,
   listDrawdownStates,
+  listAlertEvents,
+  listStrategyAlertStates,
+  listPaperTrades,
+  openDb,
   type TradeRow,
   type OrderRow,
   type ScheduleRow,
@@ -100,6 +104,21 @@ export interface FiresSection {
   schedulesFired: number;
   /** Rebalance plans that ran during the window. */
   rebalanceRuns: number;
+  /** v29 journal-exact counts. The legacy schedulesFired /
+   *  rebalanceRuns fields count PRIMITIVES with ≥1 run (last_run_at
+   *  approximation — a busy schedule that fired 10× shows as 1).
+   *  When the decision journals are enabled these carry the EXACT
+   *  per-decision counts inside the window. They read the journal
+   *  tables directly, so they're 0 (not null) when the journals are
+   *  off — disambiguate via the *JournalEnabled flags. */
+  scheduleJournalEnabled: boolean;
+  scheduleFireCount: number;
+  scheduleFireFailures: number;
+  scheduleHookFailures: number;
+  rebalanceJournalEnabled: boolean;
+  rebalanceExecutedCount: number;
+  rebalanceInBandCount: number;
+  rebalanceFailureCount: number;
   /** Most recently fired orders (top 5). */
   recentFills: Array<{
     orderId: number;
@@ -138,11 +157,37 @@ export interface ErrorsSection {
   topErrors: Array<{ code: string; count: number; lastSeen: string }>;
 }
 
+/** v28: strategy-alert transitions inside the window, from the
+ *  durable alert_events journal — exact counts, full repeat history. */
+export interface AlertsSection {
+  fired: number;
+  resolved: number;
+  /** Snapshot at digest time (not window-scoped). */
+  currentlyActive: number;
+  /** Top rule types by fired count in the window. */
+  topRules: Array<{ ruleType: string; fired: number }>;
+}
+
+/** Paper-trading activity inside the window — the digest previously
+ *  counted only REAL trades, leaving dry-run strategies invisible in
+ *  the daily summary. */
+export interface PaperSection {
+  fills: number;
+  buys: number;
+  sells: number;
+  /** Sum of quote_amount across window fills (USD ≈ stable quote). */
+  quoteVolume: number;
+  topStrategies: Array<{ strategy: string; count: number }>;
+}
+
 export interface ComparisonDelta {
   trades: number;
   usdVolume: number;
   ordersFilled: number;
   errorRows: number;
+  /** v28/v29 additions. */
+  alertsFired: number;
+  paperFills: number;
 }
 
 export interface DigestReport {
@@ -161,6 +206,8 @@ export interface DigestReport {
   fires: FiresSection;
   safety: SafetyEventsSection;
   errors: ErrorsSection;
+  alerts: AlertsSection;
+  paper: PaperSection;
   /** When `--compare` was set, the same digest for the immediately-
    *  prior window with the same length. */
   comparison: {
@@ -205,22 +252,27 @@ function gatherWindow(args: {
   const windowStart = new Date(args.nowMs - args.windowMs).toISOString();
 
   const trades = gatherTrades({ since: windowStart });
-  const fires = gatherFires({ since: windowStart });
+  const fires = gatherFires({ since: windowStart, config: args.config });
   const safety = gatherSafety({ since: windowStart, config: args.config });
   const errors = gatherErrors({ since: windowStart });
+  const alerts = gatherAlerts({ since: windowStart });
+  const paper = gatherPaper({ since: windowStart });
 
-  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors });
+  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper });
 
   let comparison: DigestReport["comparison"] = null;
   if (args.includeComparison) {
     const priorEnd = new Date(args.nowMs - args.windowMs).toISOString();
     const priorStart = new Date(args.nowMs - 2 * args.windowMs).toISOString();
     const priorTrades = gatherTrades({ since: priorStart, until: priorEnd });
-    const priorFires = gatherFiresWithUntil({ since: priorStart, until: priorEnd });
+    const priorFires = gatherFiresWithUntil({ since: priorStart, until: priorEnd, config: args.config });
     const priorErrors = gatherErrors({ since: priorStart, until: priorEnd });
     const priorSafety = gatherSafety({ since: priorStart, until: priorEnd, config: args.config });
+    const priorAlerts = gatherAlerts({ since: priorStart, until: priorEnd });
+    const priorPaper = gatherPaper({ since: priorStart, until: priorEnd });
     const priorVerdict = classifyVerdict({
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
+      alerts: priorAlerts, paper: priorPaper,
     });
     const prior: DigestReport = {
       generatedAt: windowStart,
@@ -230,6 +282,7 @@ function gatherWindow(args: {
       verdict: priorVerdict.verdict,
       verdictReasons: priorVerdict.verdictReasons,
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
+      alerts: priorAlerts, paper: priorPaper,
       comparison: null,
     };
     comparison = {
@@ -239,6 +292,8 @@ function gatherWindow(args: {
         usdVolume: trades.usdVolume - prior.trades.usdVolume,
         ordersFilled: fires.ordersFilled - prior.fires.ordersFilled,
         errorRows: errors.errorRows - prior.errors.errorRows,
+        alertsFired: alerts.fired - prior.alerts.fired,
+        paperFills: paper.fills - prior.paper.fills,
       },
     };
   }
@@ -254,6 +309,8 @@ function gatherWindow(args: {
     fires,
     safety,
     errors,
+    alerts,
+    paper,
     comparison,
   };
 }
@@ -306,11 +363,56 @@ function gatherTrades(args: { since: string; until?: string }): TradesSection {
 
 // ── fires section ────────────────────────────────────────────
 
-function gatherFires(args: { since: string }): FiresSection {
-  return gatherFiresWithUntil({ since: args.since });
+function gatherFires(args: { since: string; config: Config }): FiresSection {
+  return gatherFiresWithUntil({ since: args.since, config: args.config });
 }
 
-function gatherFiresWithUntil(args: { since: string; until?: string }): FiresSection {
+/** v29 journal-exact decision counts inside the window. Direct SQL —
+ *  the journal tables are indexed on checked_at. */
+function journalCounts(args: { since: string; until?: string }): {
+  scheduleFireCount: number;
+  scheduleFireFailures: number;
+  scheduleHookFailures: number;
+  rebalanceExecutedCount: number;
+  rebalanceInBandCount: number;
+  rebalanceFailureCount: number;
+} {
+  // Lexical ISO comparison: the max JS date renders as "+275760-…",
+  // which sorts BEFORE "2026-…" — use a plain far-future literal.
+  const until = args.until ?? "9999-12-31T23:59:59.999Z";
+  try {
+    const db = openDb();
+    const count = (sql: string, ...binds: string[]): number =>
+      (db.prepare(sql).get(args.since, until, ...binds) as { n: number }).n;
+    return {
+      scheduleFireCount: count(
+        `SELECT COUNT(*) AS n FROM schedule_check_log WHERE checked_at >= ? AND checked_at < ? AND decision = 'fired'`,
+      ),
+      scheduleFireFailures: count(
+        `SELECT COUNT(*) AS n FROM schedule_check_log WHERE checked_at >= ? AND checked_at < ? AND decision = 'fire_failed'`,
+      ),
+      scheduleHookFailures: count(
+        `SELECT COUNT(*) AS n FROM schedule_check_log WHERE checked_at >= ? AND checked_at < ? AND decision = 'hook_failed'`,
+      ),
+      rebalanceExecutedCount: count(
+        `SELECT COUNT(*) AS n FROM rebalance_check_log WHERE checked_at >= ? AND checked_at < ? AND decision = 'fired'`,
+      ),
+      rebalanceInBandCount: count(
+        `SELECT COUNT(*) AS n FROM rebalance_check_log WHERE checked_at >= ? AND checked_at < ? AND decision = 'in_band'`,
+      ),
+      rebalanceFailureCount: count(
+        `SELECT COUNT(*) AS n FROM rebalance_check_log WHERE checked_at >= ? AND checked_at < ? AND decision IN ('failed', 'partial_failure')`,
+      ),
+    };
+  } catch {
+    return {
+      scheduleFireCount: 0, scheduleFireFailures: 0, scheduleHookFailures: 0,
+      rebalanceExecutedCount: 0, rebalanceInBandCount: 0, rebalanceFailureCount: 0,
+    };
+  }
+}
+
+function gatherFiresWithUntil(args: { since: string; until?: string; config: Config }): FiresSection {
   // Orders: filter by filled_at / updated_at in window for the
   // terminal-state counters. We pull all orders + filter in JS
   // because listOrders doesn't support a time predicate on a
@@ -362,11 +464,58 @@ function gatherFiresWithUntil(args: { since: string; until?: string }): FiresSec
     if (p.last_run_at && inWindow(p.last_run_at, args)) rebalanceRuns++;
   }
 
+  const jc = journalCounts({ since: args.since, until: args.until });
   return {
     ordersFilled, ordersCancelled, ordersExpired, ordersFailed,
     schedulesFired, rebalanceRuns,
+    scheduleJournalEnabled: args.config.engine.scheduleJournal?.enabled === true,
+    rebalanceJournalEnabled: args.config.engine.rebalanceJournal?.enabled === true,
+    ...jc,
     recentFills,
   };
+}
+
+// ── alerts section (v28) ─────────────────────────────────────
+
+function gatherAlerts(args: { since: string; until?: string }): AlertsSection {
+  const events = listAlertEvents({ sinceIso: args.since, untilIso: args.until });
+  let fired = 0, resolved = 0;
+  const byRule = new Map<string, number>();
+  for (const e of events) {
+    if (e.event === "fired") {
+      fired++;
+      byRule.set(e.rule_type, (byRule.get(e.rule_type) ?? 0) + 1);
+    } else {
+      resolved++;
+    }
+  }
+  const topRules = Array.from(byRule.entries())
+    .map(([ruleType, n]) => ({ ruleType, fired: n }))
+    .sort((a, b) => b.fired - a.fired)
+    .slice(0, 5);
+  const currentlyActive = listStrategyAlertStates({ active: true }).length;
+  return { fired, resolved, currentlyActive, topRules };
+}
+
+// ── paper section ────────────────────────────────────────────
+
+function gatherPaper(args: { since: string; until?: string }): PaperSection {
+  const rows = listPaperTrades({ sinceIso: args.since, untilIso: args.until, limit: 5000 });
+  let buys = 0, sells = 0, quoteVolume = 0;
+  const byStrategy = new Map<string, number>();
+  for (const r of rows) {
+    if (r.direction === "buy") buys++;
+    else sells++;
+    const q = parseFloat(r.quote_amount);
+    if (Number.isFinite(q)) quoteVolume += q;
+    const tag = r.strategy ?? "(unattributed)";
+    byStrategy.set(tag, (byStrategy.get(tag) ?? 0) + 1);
+  }
+  const topStrategies = Array.from(byStrategy.entries())
+    .map(([strategy, count]) => ({ strategy, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+  return { fills: rows.length, buys, sells, quoteVolume, topStrategies };
 }
 
 function inWindow(iso: string, args: { since: string; until?: string }): boolean {
@@ -499,6 +648,8 @@ export function classifyVerdict(args: {
   fires: FiresSection;
   safety: SafetyEventsSection;
   errors: ErrorsSection;
+  alerts: AlertsSection;
+  paper: PaperSection;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
@@ -535,6 +686,27 @@ export function classifyVerdict(args: {
   }
   if (args.fires.ordersFailed > 0) {
     reasons.push(`${args.fires.ordersFailed} order${args.fires.ordersFailed === 1 ? "" : "s"} failed during window`);
+    attention = true;
+  }
+  // v29: journal-exact engine failures — these catch failures the
+  // legacy counters can't see (a schedule that failed then later
+  // succeeded leaves no trace on last_run_status).
+  if (args.fires.scheduleFireFailures > 0) {
+    reasons.push(`${args.fires.scheduleFireFailures} schedule fire failure${args.fires.scheduleFireFailures === 1 ? "" : "s"} during window`);
+    attention = true;
+  }
+  if (args.fires.rebalanceFailureCount > 0) {
+    reasons.push(`${args.fires.rebalanceFailureCount} rebalance failure${args.fires.rebalanceFailureCount === 1 ? "" : "s"} during window`);
+    attention = true;
+  }
+  // v28: a strategy alert firing inside the window is by definition
+  // worth attention — that's what the operator configured it for.
+  if (args.alerts.fired > 0) {
+    reasons.push(`${args.alerts.fired} strategy alert${args.alerts.fired === 1 ? "" : "s"} fired during window`);
+    attention = true;
+  }
+  if (args.alerts.currentlyActive > 0) {
+    reasons.push(`${args.alerts.currentlyActive} strategy alert${args.alerts.currentlyActive === 1 ? "" : "s"} currently active`);
     attention = true;
   }
 

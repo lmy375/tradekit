@@ -67,6 +67,10 @@ function renderText(r: DigestReport): string {
   lines.push(``);
   lines.push(renderSafetyText(r.safety));
   lines.push(``);
+  lines.push(renderAlertsText(r.alerts));
+  lines.push(``);
+  lines.push(renderPaperText(r.paper));
+  lines.push(``);
   lines.push(renderErrorsText(r.errors));
   if (r.comparison) {
     lines.push(``);
@@ -75,6 +79,8 @@ function renderText(r: DigestReport): string {
     lines.push(`  USD volume:    ${fmtUsd(r.trades.usdVolume)} (${fmtSignedUsd(r.comparison.delta.usdVolume)})`);
     lines.push(`  Orders filled: ${r.fires.ordersFilled} (${fmtSigned(r.comparison.delta.ordersFilled)})`);
     lines.push(`  Audit errors:  ${r.errors.errorRows} (${fmtSigned(r.comparison.delta.errorRows)})`);
+    lines.push(`  Alerts fired:  ${r.alerts.fired} (${fmtSigned(r.comparison.delta.alertsFired)})`);
+    lines.push(`  Paper fills:   ${r.paper.fills} (${fmtSigned(r.comparison.delta.paperFills)})`);
   }
   return lines.join("\n");
 }
@@ -114,8 +120,19 @@ function renderFiresText(f: FiresSection, prior?: FiresSection): string {
   if (f.ordersCancelled > 0) lines.push(`  Orders cancelled: ${f.ordersCancelled}`);
   if (f.ordersExpired > 0) lines.push(`  Orders expired:   ${f.ordersExpired}`);
   if (f.ordersFailed > 0) lines.push(`  Orders failed:    ${f.ordersFailed}  ⚠`);
-  if (f.schedulesFired > 0) lines.push(`  Schedules fired:  ${f.schedulesFired}`);
-  if (f.rebalanceRuns > 0) lines.push(`  Rebalance runs:   ${f.rebalanceRuns}`);
+  if (f.schedulesFired > 0) {
+    const exact = f.scheduleJournalEnabled ? `  (${f.scheduleFireCount} fire${f.scheduleFireCount === 1 ? "" : "s"} exact)` : "";
+    lines.push(`  Schedules fired:  ${f.schedulesFired}${exact}`);
+  }
+  if (f.scheduleFireFailures > 0) lines.push(`  Schedule failures: ${f.scheduleFireFailures}  ⚠`);
+  if (f.scheduleHookFailures > 0) lines.push(`  Hook failures:    ${f.scheduleHookFailures}  ⚠`);
+  if (f.rebalanceRuns > 0) {
+    const exact = f.rebalanceJournalEnabled
+      ? `  (${f.rebalanceExecutedCount} fired / ${f.rebalanceInBandCount} in-band exact)`
+      : "";
+    lines.push(`  Rebalance runs:   ${f.rebalanceRuns}${exact}`);
+  }
+  if (f.rebalanceFailureCount > 0) lines.push(`  Rebalance failures: ${f.rebalanceFailureCount}  ⚠`);
   if (f.recentFills.length > 0) {
     lines.push(`  Recent fills:`);
     for (const fill of f.recentFills) {
@@ -123,6 +140,36 @@ function renderFiresText(f: FiresSection, prior?: FiresSection): string {
       const pair = `${fill.base ?? "?"}/${fill.quote ?? "?"}`;
       lines.push(`    #${String(fill.orderId).padEnd(4)} ${fill.side.padEnd(4)} ${pair.padEnd(10)} ${price.padStart(10)}  ${shorten(fill.filledAt)}`);
     }
+  }
+  return lines.join("\n");
+}
+
+function renderAlertsText(a: import("../digest.js").AlertsSection): string {
+  const lines: string[] = [];
+  lines.push(`ALERTS`);
+  if (a.fired === 0 && a.resolved === 0 && a.currentlyActive === 0) {
+    lines.push(`  No alert activity in window.`);
+    return lines.join("\n");
+  }
+  lines.push(`  Fired:    ${a.fired}${a.fired > 0 ? "  ⚠" : ""}`);
+  lines.push(`  Resolved: ${a.resolved}`);
+  lines.push(`  Active:   ${a.currentlyActive}${a.currentlyActive > 0 ? "  ⚠" : ""}`);
+  if (a.topRules.length > 0) {
+    lines.push(`  Top rules: ${a.topRules.map((t) => `${t.ruleType}×${t.fired}`).join("  ")}`);
+  }
+  return lines.join("\n");
+}
+
+function renderPaperText(p: import("../digest.js").PaperSection): string {
+  const lines: string[] = [];
+  lines.push(`PAPER`);
+  if (p.fills === 0) {
+    lines.push(`  No paper fills in window.`);
+    return lines.join("\n");
+  }
+  lines.push(`  Fills:    ${p.fills}  (${p.buys} buy${p.buys === 1 ? "" : "s"}, ${p.sells} sell${p.sells === 1 ? "" : "s"})  ${fmtUsd(p.quoteVolume)} volume`);
+  if (p.topStrategies.length > 0) {
+    lines.push(`  Top strategies: ${p.topStrategies.map((t) => `${t.strategy}×${t.count}`).join("  ")}`);
   }
   return lines.join("\n");
 }
@@ -210,10 +257,20 @@ function renderSlack(r: DigestReport): string {
   if (r.fires.ordersFailed > 0) firesParts.push(`*${r.fires.ordersFailed} failed* ⚠`);
   if (r.fires.schedulesFired > 0) firesParts.push(`${r.fires.schedulesFired} schedule${r.fires.schedulesFired === 1 ? "" : "s"} fired`);
   if (r.fires.rebalanceRuns > 0) firesParts.push(`${r.fires.rebalanceRuns} rebalance${r.fires.rebalanceRuns === 1 ? "" : "s"}`);
+  if (r.fires.scheduleFireFailures > 0) firesParts.push(`*${r.fires.scheduleFireFailures} schedule failure${r.fires.scheduleFireFailures === 1 ? "" : "s"}* ⚠`);
+  if (r.fires.rebalanceFailureCount > 0) firesParts.push(`*${r.fires.rebalanceFailureCount} rebalance failure${r.fires.rebalanceFailureCount === 1 ? "" : "s"}* ⚠`);
   if (firesParts.length > 0) {
     lines.push(`*Strategy fires:* ${firesParts.join(" · ")}`);
   } else {
     lines.push(`*Strategy fires:* none`);
+  }
+  const alertParts: string[] = [];
+  if (r.alerts.fired > 0) alertParts.push(`*${r.alerts.fired} fired* ⚠`);
+  if (r.alerts.resolved > 0) alertParts.push(`${r.alerts.resolved} resolved`);
+  if (r.alerts.currentlyActive > 0) alertParts.push(`*${r.alerts.currentlyActive} active* ⚠`);
+  if (alertParts.length > 0) lines.push(`*Alerts:* ${alertParts.join(" · ")}`);
+  if (r.paper.fills > 0) {
+    lines.push(`*Paper:* ${r.paper.fills} fill${r.paper.fills === 1 ? "" : "s"} · ${fmtUsd(r.paper.quoteVolume)} volume`);
   }
 
   // Safety section — show only when there's something to surface.

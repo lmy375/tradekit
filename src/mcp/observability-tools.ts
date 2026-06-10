@@ -61,7 +61,7 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
   // ── digest_summary ─────────────────────────────────────────
   server.tool(
     "digest_summary",
-    "Windowed activity digest: trades + strategy fires + safety events + top errors over the last N hours/days. Computes a 3-tier health verdict (healthy/attention/critical) with cumulative reasons. Optional `compare` adds prior-window deltas (trades, USD volume, fills, errors). Window range [1min, 90d]. Pairs with status_dashboard (right-now vs windowed). Errors: INVALID_PARAMS (bad window format).",
+    "Windowed activity digest: trades + strategy fires (journal-exact schedule/rebalance counts when the v29 decision journals are enabled, incl. failure counts the legacy last_run approximation misses) + alert transitions (v28 — fired/resolved in window + currently-active snapshot) + paper-trading activity + safety events + top errors over the last N hours/days. Computes a 3-tier health verdict (healthy/attention/critical) with cumulative reasons. Optional `compare` adds prior-window deltas (trades, USD volume, fills, errors). Window range [1min, 90d]. Pairs with status_dashboard (right-now vs windowed). Errors: INVALID_PARAMS (bad window format).",
     {
       window: z.string().default("24h").describe("Window — '1h', '24h', '7d', '30d' (m/h/d units; min 1 minute, max 90 days)."),
       compare: z.boolean().optional().describe("Include immediately-prior window of same length with delta math; default false."),

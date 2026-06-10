@@ -35,6 +35,11 @@ const {
   insertRebalancePlan,
   upsertDrawdownState,
   insertAudit,
+  insertScheduleCheckEntry,
+  insertRebalanceCheckEntry,
+  insertAlertEvent,
+  recordPaperTrade,
+  upsertStrategyAlertState,
   markOrderFilled,
   cancelOrder,
   markOrderExpired,
@@ -54,6 +59,11 @@ beforeEach(() => {
   db.exec("DELETE FROM rebalance_plans");
   db.exec("DELETE FROM drawdown_state");
   db.exec("DELETE FROM audit_log");
+  db.exec("DELETE FROM schedule_check_log");
+  db.exec("DELETE FROM rebalance_check_log");
+  db.exec("DELETE FROM alert_events");
+  db.exec("DELETE FROM strategy_alert_state");
+  db.exec("DELETE FROM paper_trades");
 });
 
 // ── parseWindowMs ────────────────────────────────────────────
@@ -316,8 +326,12 @@ const emptyTrades = () => ({
 const emptyFires = () => ({
   ordersFilled: 0, ordersCancelled: 0, ordersExpired: 0, ordersFailed: 0,
   schedulesFired: 0, rebalanceRuns: 0,
+  scheduleJournalEnabled: false, scheduleFireCount: 0, scheduleFireFailures: 0, scheduleHookFailures: 0,
+  rebalanceJournalEnabled: false, rebalanceExecutedCount: 0, rebalanceInBandCount: 0, rebalanceFailureCount: 0,
   recentFills: [],
 });
+const emptyAlerts = () => ({ fired: 0, resolved: 0, currentlyActive: 0, topRules: [] });
+const emptyPaper = () => ({ fills: 0, buys: 0, sells: 0, quoteVolume: 0, topStrategies: [] });
 const emptySafety = () => ({
   drawdownTrips: 0, drawdownCurrentlyTripped: [] as { scope: string; trippedAt: string; drawdownPct: number | null }[],
   budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0,
@@ -331,7 +345,7 @@ const emptyErrors = () => ({
 describe("classifyVerdict", () => {
   it("healthy on clean state", () => {
     const r = classifyVerdict({
-      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(),
+      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("healthy");
     expect(r.verdictReasons).toEqual([]);
@@ -341,7 +355,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(),
       safety: { ...emptySafety(), drawdownTrips: 1 },
-      errors: emptyErrors(),
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("critical");
   });
@@ -350,7 +364,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(),
       safety: { ...emptySafety(), drawdownCurrentlyTripped: [{ scope: "global", trippedAt: "x", drawdownPct: 20 }] },
-      errors: emptyErrors(),
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("critical");
   });
@@ -359,6 +373,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(),
       errors: { ...emptyErrors(), errorRatePct: 30, totalAuditRows: 10, errorRows: 3 },
+      alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("critical");
   });
@@ -367,6 +382,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(),
       errors: { ...emptyErrors(), errorRatePct: 15, totalAuditRows: 20, errorRows: 3 },
+      alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("attention");
   });
@@ -375,7 +391,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(),
       safety: { ...emptySafety(), budgetWarnings: [{ tag: "playbook:*", window: "lifetime", utilizationPct: 85 }] },
-      errors: emptyErrors(),
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("attention");
   });
@@ -384,7 +400,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(),
       safety: { ...emptySafety(), positionLimitBlocks: 2 },
-      errors: emptyErrors(),
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("attention");
   });
@@ -393,7 +409,7 @@ describe("classifyVerdict", () => {
     const r = classifyVerdict({
       trades: emptyTrades(),
       fires: { ...emptyFires(), ordersFailed: 1 },
-      safety: emptySafety(), errors: emptyErrors(),
+      safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("attention");
   });
@@ -403,6 +419,7 @@ describe("classifyVerdict", () => {
       trades: emptyTrades(), fires: emptyFires(),
       safety: { ...emptySafety(), drawdownTrips: 1, positionLimitBlocks: 1, budgetWarnings: [{ tag: "x", window: "daily", utilizationPct: 90 }] },
       errors: { ...emptyErrors(), errorRatePct: 30, totalAuditRows: 10, errorRows: 3 },
+      alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("critical");
     // Multiple reasons accumulate even when the verdict is critical.
@@ -479,3 +496,83 @@ describe("gatherDigest — full shape", () => {
 
 void insertSchedule;
 void insertRebalancePlan;
+
+// ── v28/v29 sections ─────────────────────────────────────────
+
+describe("gatherDigest — alerts / paper / journal-exact fires", () => {
+  const now = new Date("2026-05-30T12:00:00Z");
+  const win = { windowLabel: "24h", windowMs: 24 * 3_600_000, now };
+
+  it("alerts section counts window transitions + currently-active snapshot", () => {
+    insertAlertEvent({ at: "2026-05-30T10:00:00Z", tag: "a", ruleType: "failure_streak", event: "fired", severity: "critical" });
+    insertAlertEvent({ at: "2026-05-30T11:00:00Z", tag: "a", ruleType: "failure_streak", event: "resolved", severity: "info", durationSeconds: 3600 });
+    insertAlertEvent({ at: "2026-05-30T11:30:00Z", tag: "b", ruleType: "staleness", event: "fired", severity: "warn" });
+    insertAlertEvent({ at: "2026-05-28T00:00:00Z", tag: "c", ruleType: "staleness", event: "fired", severity: "warn" }); // outside window
+    upsertStrategyAlertState({
+      tag: "b", ruleType: "staleness", active: true,
+      firstTriggeredAt: "2026-05-30T11:30:00Z", lastEvaluatedAt: "2026-05-30T11:30:00Z", lastValueJson: null,
+    });
+
+    const r = gatherDigest(win);
+    expect(r.alerts.fired).toBe(2);
+    expect(r.alerts.resolved).toBe(1);
+    expect(r.alerts.currentlyActive).toBe(1);
+    expect(r.alerts.topRules[0]).toMatchObject({ fired: 1 });
+    // Alert in window → attention verdict with the reason named.
+    expect(r.verdict).not.toBe("healthy");
+    expect(r.verdictReasons.some((x) => x.includes("strategy alert"))).toBe(true);
+  });
+
+  it("paper section counts window fills with strategy breakdown", () => {
+    const mk = (ts: string, dir: "buy" | "sell", strategy: string | null) =>
+      recordPaperTrade({
+        timestamp: ts, source_type: "schedule", source_id: 1, chain: "base", account: "default",
+        direction: dir, base_token: "0xw", base_symbol: "ETH", base_amount: "0.1",
+        quote_token: "0xu", quote_symbol: "USDC", quote_amount: "200", price: "2000",
+        slippage_bps: 0, strategy, notes: null,
+      });
+    mk("2026-05-30T10:00:00Z", "buy", "dca");
+    mk("2026-05-30T11:00:00Z", "sell", "dca");
+    mk("2026-05-29T00:00:00Z", "buy", "dca"); // outside window
+    const r = gatherDigest(win);
+    expect(r.paper.fills).toBe(2);
+    expect(r.paper.buys).toBe(1);
+    expect(r.paper.sells).toBe(1);
+    expect(r.paper.quoteVolume).toBeCloseTo(400, 6);
+    expect(r.paper.topStrategies[0]).toMatchObject({ strategy: "dca", count: 2 });
+  });
+
+  it("journal-exact fire counts: a busy schedule shows its true count (legacy shows 1)", () => {
+    const id = insertSchedule({
+      name: "busy", cron_expr: "0 * * * *", next_run_at: "2026-05-30T13:00:00Z",
+      side: "buy", chain: "base", account: "default",
+      base_token: "0xw", base_symbol: "ETH", quote_token: "0xu", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100", slippage_bps: null, auto_slippage: false,
+      start_at: null, end_at: null, max_runs: null, strategy: "t", note: null,
+    });
+    openDb().prepare(`UPDATE schedules SET last_run_at = '2026-05-30T11:00:00Z' WHERE id = ?`).run(id);
+    for (const h of ["08", "09", "10"]) {
+      insertScheduleCheckEntry({ scheduleId: id, checkedAt: `2026-05-30T${h}:00:00Z`, decision: "fired", runNumber: 1 });
+    }
+    insertScheduleCheckEntry({ scheduleId: id, checkedAt: "2026-05-30T11:00:00Z", decision: "fire_failed", errorCode: "X" });
+    insertRebalanceCheckEntry({ planId: 9, checkedAt: "2026-05-30T10:30:00Z", decision: "in_band", maxDriftPct: 2 });
+    insertRebalanceCheckEntry({ planId: 9, checkedAt: "2026-05-30T11:30:00Z", decision: "partial_failure", errorCode: "PARTIAL_FAILURE" });
+
+    const r = gatherDigest(win);
+    expect(r.fires.schedulesFired).toBe(1); // legacy approximation unchanged
+    expect(r.fires.scheduleFireCount).toBe(3); // journal truth
+    expect(r.fires.scheduleFireFailures).toBe(1);
+    expect(r.fires.rebalanceInBandCount).toBe(1);
+    expect(r.fires.rebalanceFailureCount).toBe(1);
+    expect(r.verdictReasons.some((x) => x.includes("schedule fire failure"))).toBe(true);
+    expect(r.verdictReasons.some((x) => x.includes("rebalance failure"))).toBe(true);
+  });
+
+  it("comparison delta includes alertsFired + paperFills", () => {
+    insertAlertEvent({ at: "2026-05-30T10:00:00Z", tag: "a", ruleType: "staleness", event: "fired", severity: "warn" });
+    insertAlertEvent({ at: "2026-05-29T06:00:00Z", tag: "a", ruleType: "staleness", event: "fired", severity: "warn" }); // prior window
+    const r = gatherDigest({ ...win, compare: true });
+    expect(r.comparison?.delta.alertsFired).toBe(0); // 1 now vs 1 prior
+    expect(r.comparison?.prior?.alerts.fired).toBe(1);
+  });
+});

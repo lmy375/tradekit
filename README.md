@@ -1867,7 +1867,7 @@ LAST 24H  (47 audit rows, 3 errors)
 - **`status`** answers "what is the engine doing **right now**".
 - **`digest`** answers "what happened over the last **N hours/days**".
 
-Composes trades + strategy fires + safety events + top errors over a window into a single operator-facing report. Three formats:
+Composes trades + strategy fires + alerts + paper activity + safety events + top errors over a window into a single operator-facing report. Three formats:
 
 ```bash
 tradekit digest --window 24h                       # text (terminal)
@@ -1886,6 +1886,8 @@ tradekit digest --window 24h --strict              # exit 2 on 🔴 critical ver
 ```
 
 The slack format uses Slack's mrkdwn (`*bold*`, `_italic_`, `\`code\``) for direct rendering in a channel — no JSON-wrapping required.
+
+**v28/v29 awareness.** The digest reads the durable journals directly: an **ALERTS** section counts exact fired/resolved transitions in the window (plus the currently-active snapshot and top rule types), a **PAPER** section makes dry-run strategies visible in the daily report, and the fires section adds journal-exact schedule/rebalance counts when `engine.scheduleJournal` / `rebalanceJournal` are enabled — the legacy `last_run_at` approximation can't distinguish "fired once" from "fired 10×", and *can't see a failure that was followed by a success at all*. Journal failure counts and window alert activity feed the health verdict (`attention` reasons), so the cron'd Slack digest pages on the things the legacy counters silently missed.
 
 **Example output (slack format):**
 
