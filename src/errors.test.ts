@@ -488,6 +488,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "runway",
     // Equity curve from portfolio snapshots (read-only).
     "equity_curve",
+    // Realized-gains report (read-only, deterministic).
+    "gains_report",
     // Iter36: forensic timeline (cross-strategy chronological events).
     "timeline_query",
     // Iter38: per-provider price-fetch observability.

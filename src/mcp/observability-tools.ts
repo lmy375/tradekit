@@ -569,6 +569,50 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── realized gains ────────────────────────────────────────
+  server.tool(
+    "gains_report",
+    "v36: realized-gains report — every cost-basis realization (per-sell: date, amount, proceeds, cost basis, gain, avg cost, tx hash) from the SAME weighted-average engine all P&L surfaces share. Deterministic (pure fill-journal walk, no oracle). The cost-basis walk always sees FULL history; since/until filter the OUTPUT records only — a 2025 buy correctly funds a 2026 sell's basis. Method caveats baked into the contract: weighted-average (not FIFO/specific-lot), stablecoin-quote fills only (skipped count reported), gas excluded, untracked sells (no basis) reported separately and never folded into gains. Not tax advice. CSV export lives on the CLI (`tradekit export gains --year N --out file.csv`). Returns { mode, sinceIso, untilIso, records[], totalGainQuote, totalProceedsQuote, totalCostBasisQuote, totalUntrackedProceedsQuote, skippedNonStableQuote }.",
+    {
+      mode: z.enum(["real", "paper"]).optional().describe("Default real (success trades). paper walks the virtual fills."),
+      year: z.number().int().min(2000).max(2100).optional().describe("UTC calendar-year window shorthand. Mutually exclusive with since/until."),
+      since: z.string().optional().describe("ISO lower bound on realization timestamps."),
+      until: z.string().optional().describe("ISO upper bound."),
+      account: z.string().optional(),
+      chain: z.string().optional(),
+      strategy: z.string().optional(),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("gains_report", rt.opts, input, input.chain, async () => {
+            const { gatherRealizedGains, yearWindow } = await import("../gains.js");
+            let sinceIso = input.since;
+            let untilIso = input.until;
+            if (input.year != null) {
+              if (input.since || input.until) {
+                throw new ToolError("INVALID_PARAMS", "Use year OR since/until, not both.");
+              }
+              const w = yearWindow(input.year);
+              sinceIso = w.sinceIso;
+              untilIso = w.untilIso;
+            }
+            return await gatherRealizedGains({
+              mode: input.mode ?? "real",
+              account: input.account,
+              chain: input.chain,
+              strategy: input.strategy,
+              sinceIso,
+              untilIso,
+            });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── equity curve ──────────────────────────────────────────
   server.tool(
     "equity_curve",

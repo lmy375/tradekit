@@ -283,6 +283,20 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+EXPORT (v36 — realized gains, tax season)
+  export gains [--year N | --since ISO --until ISO] [--mode real|paper]
+               [--account L] [--chain X] [--strategy TAG]
+               [--out FILE | --json]
+        Per-sell cost-basis realizations as CSV (stdout, pipeable; summary +
+        disclaimers go to stderr): date, amount sold, proceeds, cost basis,
+        gain, avg cost, tx hash. Same weighted-average engine every P&L
+        surface shares — deterministic, pure fill-journal walk, no oracle.
+        The basis walk always sees FULL history; --year/--since filter the
+        OUTPUT rows only (a 2025 buy correctly funds a 2026 sell's basis).
+        Caveats on every export: weighted-average (not FIFO/specific-lot),
+        stablecoin-quote fills only, gas excluded, untracked sells reported
+        separately. Not tax advice. MCP: gains_report (JSON).
+
 SIGNALS (v35 — event-driven orders)
   signal fire <name> [--payload '<json>'] [--json]
         Drop a signal event in the inbox — the manual/test twin of the

@@ -583,6 +583,13 @@ async function main() {
         break;
       }
 
+      // v36: realized-gains export (tax season).
+      case "export": {
+        const { exportCommand } = await import("./cli/export.js");
+        await exportCommand(action, flags);
+        break;
+      }
+
       // v35: external signal events — fire / inspect the inbox that
       // drives signal-armed orders.
       case "signal": {
@@ -753,7 +760,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

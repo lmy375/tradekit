@@ -1721,6 +1721,19 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Orders chain too (v31).** The same hook attaches to conditional orders — `order create … --on-fill '{...}'` (or `onFill` in playbook order entries / MCP `order_create`): a limit buy at \$1,800 that fills auto-creates the trailing stop for exactly the bought amount. One fire per order (`fireNumber` is always 1); `order replay` shows `hook_created` / `hook_failed` alongside the fill; `order edit --on-fill/--unset on-fill` mutates it in place; the playbook backtest simulates order hooks the same way it does schedule hooks.
 
+#### Realized-gains export (v36) — tax season, one command
+
+```bash
+tradekit export gains --year 2026 --out gains-2026.csv
+#   42 realization(s) in 2026-01-01 → 2026-12-31 (real)
+#   total gain 1,284.31 · proceeds 18,402.77 · cost basis 17,118.46
+#   method: WEIGHTED-AVERAGE cost basis · gas excluded · not tax advice
+```
+
+Every P&L surface already shares one weighted-average cost-basis engine; the walker computed per-sell realizations internally and threw them away. v36 exposes them: each realizing sell becomes a record (date, amount sold, proceeds, cost basis, gain, avg cost at sale, tx hash) — CSV to stdout (pipeable; summary + disclaimers on stderr so they never corrupt the stream) or `--out FILE`; `--json` and MCP `gains_report` for structured consumers. Deterministic: a pure fill-journal walk, no oracle, so the same window always exports identical rows.
+
+**The subtlety that matters:** cost basis is path-dependent, so the walk always sees **full history** and the window filters only the *output* records — a 2025 buy correctly funds a 2026 sell's basis instead of surfacing as a bogus untracked sell. Method caveats stamped on every export: weighted-average (not FIFO/specific-lot — some jurisdictions require otherwise), stablecoin-quote fills only (skips counted), gas excluded (`tradekit pnl` owns gas accounting), sells without a tracked basis reported separately and never folded into gains. Not tax advice.
+
 #### Signal-triggered orders (v35) — event-driven execution
 
 The fourth trigger type. Instead of polling price, the order fires when a named **external signal** arrives — the TradingView-alert integration pattern:

@@ -131,11 +131,40 @@ export interface PaperPnlMtmSummary extends PaperPnlSummary {
   realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }>;
 }
 
+/** v36: one cost-basis realization — emitted per realizing SELL by
+ *  the MTM walk. The tax-export building block: weighted-average
+ *  cost basis (not FIFO / specific-lot), stablecoin-quote fills
+ *  only, gas excluded. Deterministic (no oracle involved). */
+export interface RealizationRecord {
+  at: string;
+  strategy: string;
+  chain: string;
+  token: string;
+  symbol: string | null;
+  /** Base sold WITH a tracked cost basis. */
+  soldAmount: number;
+  /** Sale price per unit (quote/base). */
+  sellPriceQuote: number;
+  /** Weighted-average cost per unit at the moment of sale. */
+  avgCostQuote: number;
+  proceedsQuote: number;
+  costBasisQuote: number;
+  gainQuote: number;
+  /** Base sold WITHOUT a tracked basis (oversell of deposit-seeded
+   *  inventory / pre-journal holdings). Proceeds excluded from
+   *  gainQuote — reported for transparency. */
+  untrackedAmount: number;
+  untrackedProceedsQuote: number;
+  txHash: string | null;
+}
+
 export interface PaperPnlMtmReport {
   /** ISO timestamp the price marks were fetched — the moment the
    *  unrealized numbers refer to. */
   timestamp: string;
   summaries: PaperPnlMtmSummary[];
+  /** v36: every realizing sell across all strategies, chronological. */
+  realizations: RealizationRecord[];
 }
 
 interface PosAcc {
@@ -192,6 +221,7 @@ export async function computePaperPnlMtm(
   }
 
   // Walk cost basis per strategy bucket.
+  const allRealizations: RealizationRecord[] = [];
   const buckets = new Map<string, { positions: Map<string, PosAcc>; skippedNonStableQuote: number; realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }> }>();
   for (const [strategy, fills] of grouped) {
     const positions = new Map<string, PosAcc>();
@@ -238,6 +268,24 @@ export async function computePaperPnlMtm(
         const untracked = baseAmt - sold;
         const realizedDelta = (sellPricePerUnit - avgCost) * sold;
         acc.realized += realizedDelta;
+        if (sold > FLAT_EPSILON || untracked > FLAT_EPSILON) {
+          allRealizations.push({
+            at: r.timestamp,
+            strategy,
+            chain: r.chain,
+            token: r.base_token,
+            symbol: r.base_symbol ?? acc.symbol,
+            soldAmount: sold > FLAT_EPSILON ? sold : 0,
+            sellPriceQuote: sellPricePerUnit,
+            avgCostQuote: avgCost,
+            proceedsQuote: sold > FLAT_EPSILON ? sellPricePerUnit * sold : 0,
+            costBasisQuote: sold > FLAT_EPSILON ? avgCost * sold : 0,
+            gainQuote: sold > FLAT_EPSILON ? realizedDelta : 0,
+            untrackedAmount: untracked > FLAT_EPSILON ? untracked : 0,
+            untrackedProceedsQuote: untracked > FLAT_EPSILON ? sellPricePerUnit * untracked : 0,
+            txHash: (r as { tx_hash?: string | null }).tx_hash ?? null,
+          });
+        }
         if (sold > FLAT_EPSILON) {
           bucketRealized += realizedDelta;
           realizedTimeline.push({ at: r.timestamp, cumulativeRealizedQuote: bucketRealized });
@@ -339,7 +387,8 @@ export async function computePaperPnlMtm(
 
   // Same ordering contract as summarizePaperPnl: busiest strategy first.
   summaries.sort((a, b) => b.fills - a.fills);
-  return { timestamp: opts?.nowIso ?? new Date().toISOString(), summaries };
+  allRealizations.sort((a, z) => a.at.localeCompare(z.at));
+  return { timestamp: opts?.nowIso ?? new Date().toISOString(), summaries, realizations: allRealizations };
 }
 
 /**
