@@ -589,6 +589,73 @@ export async function playbookReplaceCommand(flags: Record<string, string>, posi
   console.log(`  New hash:   ${result.newHash.slice(0, 16)}…`);
 }
 
+// ── promote (paper ⇄ real) ───────────────────────────────────
+
+/**
+ * Flip a deployed playbook between paper and real trading IN PLACE —
+ * trailing HWM, run counters, and drift telemetry survive (vs the old
+ * destroy + redeploy guidance, which reset all of it). Symmetric:
+ * --to paper demotes a live strategy back to the sandbox.
+ */
+export async function playbookPromoteCommand(flags: Record<string, string>, positional: string[]) {
+  const idArg = positional[2];
+  if (!idArg) throw new ToolError("INVALID_PARAMS", `Usage: tradekit playbook promote <id> [--to real|paper] [--yes]`);
+  const id = parseInt(idArg, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new ToolError("INVALID_PARAMS", `<id> must be a positive integer (got "${idArg}").`);
+  }
+  const to = flags["to"] ?? "real";
+  if (to !== "real" && to !== "paper") {
+    throw new ToolError("INVALID_PARAMS", `--to must be real or paper (got "${to}").`);
+  }
+  const existing = getPlaybookById(id);
+  if (!existing) throw new ToolError("INVALID_PARAMS", `No playbook with id ${id}.`);
+
+  if (
+    to === "real" &&
+    flags["yes"] !== "true" &&
+    flags["json"] !== "true" &&
+    process.stdin.isTTY
+  ) {
+    console.log(`Promote playbook #${id} "${existing.name}" to REAL trading.`);
+    console.log(`  Every live paper primitive flips in place — HWM / run counters survive.`);
+    console.log(`  ⚠ Real funds: the engine will fire actual trades from the next tick.`);
+    console.log(`  ⚠ Ensure the real wallet covers the strategy's amounts (tradekit trade preflight).`);
+    const reply = await prompt(`Type 'promote' to continue: `);
+    if (reply.trim().toLowerCase() !== "promote") {
+      throw new ToolError("INVALID_PARAMS", "Promote aborted — confirmation phrase didn't match.");
+    }
+  }
+
+  const { promotePlaybook } = await import("../playbooks.js");
+  const result = promotePlaybook({ playbookId: id, to });
+
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...result });
+    return;
+  }
+  if (result.alreadyInTarget) {
+    console.log(`Playbook #${id} "${existing.name}" — every live primitive is already ${to}. Nothing to flip.`);
+  } else {
+    console.log(`Promoted playbook #${id} "${existing.name}" → ${to.toUpperCase()}`);
+    console.log(`  Flipped in place (state preserved):`);
+    for (const f of result.flipped) {
+      console.log(`    ${f.type.padEnd(10)} #${f.rowId}`);
+    }
+  }
+  if (result.skipped.length > 0) {
+    console.log(`  Skipped:`);
+    for (const sk of result.skipped) {
+      console.log(`    ${sk.type.padEnd(10)} #${sk.rowId}  (${sk.reason})`);
+    }
+  }
+  if (to === "real" && !result.alreadyInTarget) {
+    console.log("");
+    console.log(`  Live from the next engine tick. Sanity-check funding with \`tradekit holdings\`;`);
+    console.log(`  preview the next fire with \`tradekit strategy report ${id} --sections forward\`.`);
+  }
+}
+
 // ── dispatch ─────────────────────────────────────────────────
 
 export async function playbookCommand(
@@ -618,8 +685,11 @@ export async function playbookCommand(
     case "replace":
       await playbookReplaceCommand(flags, positional);
       break;
+    case "promote":
+      await playbookPromoteCommand(flags, positional);
+      break;
     default:
-      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace"]);
+      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace", "promote"]);
   }
 }
 

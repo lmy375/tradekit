@@ -1262,10 +1262,13 @@ tradekit paper balances
 tradekit paper pnl          # realized only (deterministic)
 tradekit paper pnl --mtm    # + open positions marked at current prices
 
-# 5. If the strategy looks good, destroy + redeploy without --paper for real
-tradekit playbook destroy 1
-tradekit playbook deploy ./eth-strategy.json
+# 5. If the strategy looks good, PROMOTE it to real trading IN PLACE —
+#    trailing HWM, run counters, and drift telemetry all survive
+#    (destroy + redeploy would reset exactly the state the paper run built).
+tradekit playbook promote 1
 ```
+
+**Promote / demote.** `playbook promote <id>` flips every live primitive between paper and real through the same in-place edit machinery as `order edit` / `schedule edit` / `rebalance edit`: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real, and the flip lands an `edited_by_operator` row in the order journal. `--to paper` demotes a live strategy back to the sandbox (e.g. after a config scare) — symmetric, state-preserving. Terminal primitives are skipped with reasons; promotion to real requires interactive confirmation (or `--yes`) and prints a funding reminder — real balances are deliberately NOT pre-checked (same fire-time failure surface as any real primitive). MCP: `playbook_promote` with `yes: true`.
 
 **Per-primitive flag.** `--paper` is also available on `order create` / `schedule create` / `rebalance create` for one-off paper primitives. `playbook deploy --paper` cascades the flag across every order/schedule/rebalance entry in the spec.
 
@@ -1970,13 +1973,13 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 111 tools across six groups:
+Starts an MCP stdio server exposing 112 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
 - **Trade & automation** (30) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_edit`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
-- **Strategy & backtest** (12) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_rebalance`, `backtest_compare`, `strategy_report`
+- **Strategy & backtest** (13) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_promote`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_rebalance`, `backtest_compare`, `strategy_report`
 - **Observability** (13) — `status_dashboard`, `digest_summary`, `order_replay`, `schedule_replay`, `rebalance_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `alert_history`, `price_stats`
 - **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
@@ -2241,7 +2244,7 @@ Tools exposed via the `tradekit mcp` server, grouped by domain:
 - `paper_reset` is destructive (wipes balances + fill journal for a scope) and requires `confirm: true`; omitting both `account` and `chain` wipes the whole book
 
 **Iter26 — strategy lifecycle (playbooks + backtests):**
-- **Playbook management:** `playbook_validate` `playbook_deploy` `playbook_list` `playbook_show` `playbook_diff` `playbook_replace` `playbook_destroy`
+- **Playbook management:** `playbook_validate` `playbook_deploy` `playbook_list` `playbook_show` `playbook_diff` `playbook_replace` `playbook_promote` `playbook_destroy`
   - All accept structured JSON specs directly (no file paths required)
   - Template support: pass `vars: { NAME: value }` to render `{{NAME}}` placeholders before validation
   - `playbook_deploy` is atomic (mid-deploy failure rolls back), idempotent on spec hash, and takes `paper: true` to deploy the whole strategy against the virtual book — the complete dry-run loop over MCP (deploy paper → watch `paper_trades` → read `paper_pnl mtm:true` → `playbook_replace` to iterate → redeploy real)

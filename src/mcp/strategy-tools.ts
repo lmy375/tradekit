@@ -286,6 +286,33 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── playbook_promote ───────────────────────────────────────
+  server.tool(
+    "playbook_promote",
+    "Flip a deployed playbook between paper and real trading IN PLACE — the dry-run loop's graduation step. Every live primitive (active orders; active+paused schedules/rebalance plans) routes through the same edit machinery as order_edit/schedule_edit/rebalance_edit, so trailing HWM water marks, run counters, and drift telemetry ALL survive: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real. Symmetric: to='paper' demotes a live strategy back to the sandbox without losing state. Rows already in the target mode (or terminal) are reported in skipped[] with reasons; alreadyInTarget=true means nothing flipped. Real balances are NOT pre-checked (same fire-time failure surface as any real primitive) — sanity-check funding with holdings + preview the next fire via strategy_report sections=['forward']. Destructive direction (to real fires actual trades from the next engine tick) requires `yes: true`. Errors: INVALID_PARAMS (id not found, not deployed, no owned primitives, yes missing).",
+    {
+      id: z.number().int().positive().describe("Deployed playbook id."),
+      to: z.enum(["real", "paper"]).default("real").describe("Target mode. Default real (graduate the dry-run)."),
+      yes: z.literal(true).describe("Confirmation — promotion to real fires actual trades from the next tick; must be `true`."),
+    },
+    async ({ id, to, yes }) => {
+      try {
+        return ok(
+          await runTool("playbook_promote", rt.opts, { id, to, yes }, undefined, async () => {
+            if (yes !== true) {
+              throw new ToolError("INVALID_PARAMS", `Confirmation flag required: pass yes=true.`);
+            }
+            const { promotePlaybook } = await import("../playbooks.js");
+            const result = promotePlaybook({ playbookId: id, to });
+            return { ok: true, ...result };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── playbook_destroy ───────────────────────────────────────
   server.tool(
     "playbook_destroy",

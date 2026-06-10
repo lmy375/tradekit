@@ -473,7 +473,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     // Iter26: strategy lifecycle (playbooks + backtests) exposed for agent control.
     // v2: playbook_diff + playbook_replace — strategy iteration over MCP.
     "playbook_validate", "playbook_deploy", "playbook_list", "playbook_show", "playbook_destroy",
-    "playbook_diff", "playbook_replace",
+    "playbook_diff", "playbook_replace", "playbook_promote",
     "backtest_order", "backtest_playbook", "backtest_compare", "backtest_rebalance",
     // Iter26: observability — status dashboard, windowed digest, forensic order replay,
     // backtest history retrieval.

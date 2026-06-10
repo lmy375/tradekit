@@ -465,6 +465,13 @@ PLAYBOOKS (declarative strategy bundles)
         Read-only preview of what 'playbook replace' would change. Classifies each primitive
         as unchanged / modified / added / removed; lists field-level changes for modified
         plus the apply mode (edit-in-place vs cancel+recreate). Useful in CI for spec PRs.
+  playbook promote <id> [--to real|paper] [--yes] [--json]
+        Flip every live primitive between paper and real IN PLACE — trailing HWM,
+        run counters, drift telemetry all survive (vs destroy+redeploy, which
+        resets them). The dry-run loop's graduation step; --to paper demotes a
+        live strategy back to the sandbox. Promotion to real asks for the
+        'promote' confirmation phrase unless --yes; real balances are NOT
+        pre-checked — sanity-check with 'tradekit holdings' + trade preflight.
   playbook replace <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH]
                    [--fresh-state] [--yes] [--json]
         Atomically apply a new playbook spec. Modified primitives whose changes are all

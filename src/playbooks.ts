@@ -41,6 +41,9 @@ import { resolveTradePair } from "./chains.js";
 import { createOrderRow, cancelOrderById, type CreateOrderArgs } from "./orders.js";
 import { createScheduleRow, cancelScheduleById, type CreateScheduleArgs } from "./schedules.js";
 import { parseOnFillSpec } from "./scheduleHooks.js";
+import { editOrder } from "./orderEdit.js";
+import { editSchedule } from "./scheduleEdit.js";
+import { editRebalancePlan } from "./rebalanceEdit.js";
 import { createRebalancePlanRow, cancelRebalancePlanById, type CreateRebalancePlanArgs } from "./rebalance.js";
 import {
   insertPlaybook,
@@ -837,6 +840,132 @@ function handleOnePrimitive(
 }
 
 // ── show / list helpers (CLI-facing) ─────────────────────────
+
+// ── promote (paper ⇄ real, in place) ─────────────────────────
+
+export interface PromoteResult {
+  playbookId: number;
+  /** Target mode after the promotion. */
+  to: "real" | "paper";
+  /** Primitives whose paper flag was flipped IN PLACE — same row id,
+   *  trailing HWM / run counters / drift telemetry all preserved. */
+  flipped: Array<{ type: "order" | "schedule" | "rebalance"; rowId: number }>;
+  /** Primitives left untouched, with the reason (already in the
+   *  target mode, or in a terminal/non-editable status). */
+  skipped: Array<{ type: "order" | "schedule" | "rebalance"; rowId: number; reason: string }>;
+  /** True when every live primitive was already in the target mode —
+   *  the promote was a no-op. */
+  alreadyInTarget: boolean;
+}
+
+/**
+ * Flip a deployed playbook between paper and real trading IN PLACE.
+ *
+ * Closes the dry-run loop's last manual step. The documented v1 path
+ * was "destroy + redeploy without --paper" — which throws away
+ * exactly the state the paper validation accumulated: trailing HWM
+ * water marks, schedule run counters, rebalance drift telemetry.
+ * Promote routes every live primitive through the SAME in-place edit
+ * machinery operators use directly (orderEdit / scheduleEdit /
+ * rebalanceEdit), so the strategy goes live mid-stride: a trailing
+ * stop that tracked a $3,500 HWM in paper keeps protecting from
+ * $3,500 the moment it's real.
+ *
+ * Scope rules:
+ *   - orders: ACTIVE rows only (orders have no paused state; terminal
+ *     rows are history, not strategy)
+ *   - schedules + rebalance plans: ACTIVE + PAUSED (paused rows are
+ *     legitimate promote targets — operator may resume later)
+ *   - rows already in the target mode are reported as skipped
+ *
+ * Direction is symmetric: `to: "paper"` demotes a live strategy back
+ * to the sandbox (e.g. after a config scare) without losing state.
+ *
+ * NOT checked here (deliberately): real balances. A paper strategy
+ * may reference amounts the real wallet can't cover — that's the
+ * same failure mode any real primitive has, surfaced at fire time
+ * with the usual error trail + notifications. The CLI prints a
+ * preflight reminder instead of hard-gating.
+ */
+export function promotePlaybook(args: {
+  playbookId: number;
+  to: "real" | "paper";
+  config?: Config;
+}): PromoteResult {
+  const config = args.config ?? loadConfig();
+  const playbook = getPlaybookById(args.playbookId);
+  if (!playbook) {
+    throw new ToolError("INVALID_PARAMS", `No playbook with id ${args.playbookId}.`);
+  }
+  if (playbook.status !== "deployed") {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `Playbook #${args.playbookId} is "${playbook.status}" — only deployed playbooks can be promoted.`,
+    );
+  }
+  const targetPaper = args.to === "paper";
+  const strategyTag = `playbook:${args.playbookId}`;
+  const orders = listOrders({ status: "all", strategy: strategyTag });
+  const schedules = listSchedules({ status: "all", strategy: strategyTag });
+  const rebalances = listRebalancePlans({ status: "all", strategy: strategyTag });
+
+  if (orders.length + schedules.length + rebalances.length === 0) {
+    throw new ToolError("INVALID_PARAMS", `Playbook #${args.playbookId} owns no primitives.`);
+  }
+
+  const flipped: PromoteResult["flipped"] = [];
+  const skipped: PromoteResult["skipped"] = [];
+
+  for (const o of orders) {
+    if (o.id == null) continue;
+    if (o.status !== "active") {
+      skipped.push({ type: "order", rowId: o.id, reason: `status ${o.status}` });
+      continue;
+    }
+    if ((o.paper ?? 0) === (targetPaper ? 1 : 0)) {
+      skipped.push({ type: "order", rowId: o.id, reason: `already ${args.to}` });
+      continue;
+    }
+    // editOrder journals the flip as edited_by_operator — the order's
+    // forensic timeline shows exactly when it went live.
+    editOrder({ id: o.id, changes: { paper: targetPaper }, config });
+    flipped.push({ type: "order", rowId: o.id });
+  }
+  for (const sc of schedules) {
+    if (sc.id == null) continue;
+    if (sc.status !== "active" && sc.status !== "paused") {
+      skipped.push({ type: "schedule", rowId: sc.id, reason: `status ${sc.status}` });
+      continue;
+    }
+    if ((sc.paper ?? 0) === (targetPaper ? 1 : 0)) {
+      skipped.push({ type: "schedule", rowId: sc.id, reason: `already ${args.to}` });
+      continue;
+    }
+    editSchedule({ id: sc.id, changes: { paper: targetPaper }, config });
+    flipped.push({ type: "schedule", rowId: sc.id });
+  }
+  for (const rb of rebalances) {
+    if (rb.id == null) continue;
+    if (rb.status !== "active" && rb.status !== "paused") {
+      skipped.push({ type: "rebalance", rowId: rb.id, reason: `status ${rb.status}` });
+      continue;
+    }
+    if ((rb.paper ?? 0) === (targetPaper ? 1 : 0)) {
+      skipped.push({ type: "rebalance", rowId: rb.id, reason: `already ${args.to}` });
+      continue;
+    }
+    editRebalancePlan({ id: rb.id, changes: { paper: targetPaper }, config });
+    flipped.push({ type: "rebalance", rowId: rb.id });
+  }
+
+  return {
+    playbookId: args.playbookId,
+    to: args.to,
+    flipped,
+    skipped,
+    alreadyInTarget: flipped.length === 0,
+  };
+}
 
 export interface PlaybookDetail {
   row: PlaybookRow;

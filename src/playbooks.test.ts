@@ -716,3 +716,110 @@ describe("playbook on_fill hooks", () => {
     expect(hook.spec.note).toBe("bracket after fire {{filled.fireNumber}}");
   });
 });
+
+// ── promote (paper ⇄ real) ───────────────────────────────────
+
+describe("promotePlaybook", () => {
+  function deployPaperBundle() {
+    const spec = parsePlaybookSpec({
+      name: "promote-test",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }] },
+      ],
+    });
+    return deployPlaybook({ spec, sourcePath: null, paper: true });
+  }
+
+  it("flips all three primitive types to real IN PLACE — state preserved", async () => {
+    const { promotePlaybook } = await import("./playbooks.js");
+    const deploy = deployPaperBundle();
+    const db = openDb();
+    const before = getPlaybookDetail(deploy.playbookId);
+    const orderId = before.orders[0].id!;
+    const schedId = before.schedules[0].id!;
+    const planId = before.rebalances[0].id!;
+    // Accumulated paper-validation state that destroy+redeploy would lose.
+    db.prepare(`UPDATE orders SET water_mark_usd = 3500 WHERE id = ?`).run(orderId);
+    db.prepare(`UPDATE schedules SET run_count = 4, total_quote_spent = '400' WHERE id = ?`).run(schedId);
+    db.prepare(`UPDATE rebalance_plans SET run_count = 2, last_run_max_drift_pct = 4.2 WHERE id = ?`).run(planId);
+
+    const result = promotePlaybook({ playbookId: deploy.playbookId, to: "real" });
+
+    expect(result.alreadyInTarget).toBe(false);
+    expect(result.flipped).toHaveLength(3);
+    expect(result.flipped.map((f) => f.type).sort()).toEqual(["order", "rebalance", "schedule"]);
+
+    const after = getPlaybookDetail(deploy.playbookId);
+    // Same rows, real mode, state intact.
+    expect(after.orders[0].id).toBe(orderId);
+    expect(after.orders[0].paper).toBe(0);
+    expect(after.orders[0].water_mark_usd).toBe(3500);
+    expect(after.schedules[0].id).toBe(schedId);
+    expect(after.schedules[0].paper).toBe(0);
+    expect(after.schedules[0].run_count).toBe(4);
+    expect(after.rebalances[0].id).toBe(planId);
+    expect(after.rebalances[0].paper).toBe(0);
+    expect(after.rebalances[0].run_count).toBe(2);
+    expect(after.rebalances[0].last_run_max_drift_pct).toBe(4.2);
+
+    // The order edit journaled the flip.
+    const journal = db
+      .prepare(`SELECT decision, notes FROM order_check_log WHERE order_id = ? ORDER BY id DESC LIMIT 1`)
+      .get(orderId) as { decision: string; notes: string } | undefined;
+    expect(journal?.decision).toBe("edited_by_operator");
+    expect(journal?.notes).toContain("paper");
+  });
+
+  it("second promote is a no-op: everything skipped as already real", async () => {
+    const { promotePlaybook } = await import("./playbooks.js");
+    const deploy = deployPaperBundle();
+    promotePlaybook({ playbookId: deploy.playbookId, to: "real" });
+    const second = promotePlaybook({ playbookId: deploy.playbookId, to: "real" });
+    expect(second.alreadyInTarget).toBe(true);
+    expect(second.flipped).toEqual([]);
+    expect(second.skipped).toHaveLength(3);
+    expect(second.skipped.every((s) => s.reason === "already real")).toBe(true);
+  });
+
+  it("demote (real → paper) is symmetric", async () => {
+    const { promotePlaybook } = await import("./playbooks.js");
+    const deploy = deployPaperBundle();
+    promotePlaybook({ playbookId: deploy.playbookId, to: "real" });
+    const demoted = promotePlaybook({ playbookId: deploy.playbookId, to: "paper" });
+    expect(demoted.flipped).toHaveLength(3);
+    const detail = getPlaybookDetail(deploy.playbookId);
+    expect(detail.orders[0].paper).toBe(1);
+    expect(detail.schedules[0].paper).toBe(1);
+    expect(detail.rebalances[0].paper).toBe(1);
+  });
+
+  it("terminal primitives are skipped with the status reason; paused schedules still flip", async () => {
+    const { promotePlaybook } = await import("./playbooks.js");
+    const deploy = deployPaperBundle();
+    const db = openDb();
+    const detail = getPlaybookDetail(deploy.playbookId);
+    db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ?`).run(detail.orders[0].id!);
+    db.prepare(`UPDATE schedules SET status = 'paused' WHERE id = ?`).run(detail.schedules[0].id!);
+
+    const result = promotePlaybook({ playbookId: deploy.playbookId, to: "real" });
+    expect(result.flipped.map((f) => f.type).sort()).toEqual(["rebalance", "schedule"]);
+    expect(result.skipped).toEqual([
+      { type: "order", rowId: detail.orders[0].id!, reason: "status cancelled" },
+    ]);
+    expect(getPlaybookDetail(deploy.playbookId).schedules[0].paper).toBe(0); // paused row flipped
+  });
+
+  it("rejects non-deployed playbooks and empty bundles", async () => {
+    const { promotePlaybook } = await import("./playbooks.js");
+    expect(() => promotePlaybook({ playbookId: 99_999, to: "real" })).toThrow(/No playbook/);
+
+    const deploy = deployPaperBundle();
+    const db = openDb();
+    db.prepare(`UPDATE playbooks SET status = 'destroyed' WHERE id = ?`).run(deploy.playbookId);
+    expect(() => promotePlaybook({ playbookId: deploy.playbookId, to: "real" })).toThrow(/destroyed/);
+  });
+});
