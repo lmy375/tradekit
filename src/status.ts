@@ -233,12 +233,12 @@ export interface AlertsStatusSection {
     firstTriggeredAt: string | null;
     lastValueJson: string | null;
   }>;
-  /** Last 5 fired/resolved transitions from the v28 journal (24h). */
+  /** Last 5 transitions from the v28 journal (24h). */
   recentTransitions: Array<{
     at: string;
     tag: string;
     ruleType: string;
-    event: "fired" | "resolved";
+    event: "fired" | "resolved" | "breaker_paused";
   }>;
 }
 

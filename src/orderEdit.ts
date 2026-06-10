@@ -117,10 +117,10 @@ export function validateOrderEdit(args: {
 } {
   const { order, changes, config, now } = args;
 
-  if (order.status !== "active") {
+  if (order.status !== "active" && order.status !== "paused") {
     throw new ToolError(
       "INVALID_PARAMS",
-      `Order #${order.id} is ${order.status}; only active orders are editable. To start over, cancel + create a new one.`,
+      `Order #${order.id} is ${order.status}; only active or paused orders are editable. To start over, cancel + create a new one.`,
       { details: { id: order.id, status: order.status } },
     );
   }
@@ -378,7 +378,7 @@ export function editOrder(args: EditOrderArgs): EditOrderResult {
     const after = getOrderById(args.id);
     throw new ToolError(
       "INVALID_PARAMS",
-      `Order #${args.id} is no longer active (status ${after?.status ?? "(deleted)"}); edit aborted to avoid silently overwriting engine state.`,
+      `Order #${args.id} is no longer editable (status ${after?.status ?? "(deleted)"}); edit aborted to avoid silently overwriting engine state.`,
       { details: { id: args.id, currentStatus: after?.status ?? null } },
     );
   }

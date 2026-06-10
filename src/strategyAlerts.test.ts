@@ -1163,3 +1163,116 @@ describe("runAlertTick — drift_proximity end-to-end", () => {
     expect(call.title).toContain("90% of its 5% threshold");
   });
 });
+
+// ── circuit breaker (rule action: "pause") ──────────────────
+
+describe("runAlertTick — circuit breaker", () => {
+  const ETH = "0x4200000000000000000000000000000000000006";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  function seedBreakerFixture(tag: string) {
+    // One active order owned by the tag (the primitive the breaker pauses).
+    insertOrder({
+      side: "sell", trigger_type: "price_below", target_price_usd: 1900, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: ETH, base_symbol: "ETH", quote_token: USDC, quote_symbol: "USDC",
+      base_amount: "1", quote_amount: null, slippage_bps: 50, auto_slippage: false,
+      expires_at: null, strategy: tag, note: null, group_id: null,
+    });
+    // Six high-slippage trades so slippage_trend fires.
+    for (let i = 0; i < 6; i++) {
+      insertTrade({
+        timestamp: `2026-05-${20 + i}T00:00:00Z`,
+        chain: "base", account: "default", direction: "buy",
+        base_token: ETH, base_symbol: "ETH", base_amount: "0.1",
+        quote_token: USDC, quote_symbol: "USDC", quote_amount: "250",
+        price: "2500", tx_hash: `0xbrk${i}`, status: "success",
+        gas_used: null, gas_price_wei: null, gas_cost_native: null,
+        aggregator: "kyberswap", fee_tier: null, notes: null,
+        strategy: tag, realized_slippage_bps: 200,
+      });
+    }
+  }
+
+  const breakerRules = [
+    { type: "slippage_trend", baselineBps: 50, alertMultiplier: 1.5, minSampleSize: 5, action: "pause" } as never,
+  ];
+
+  it("fire with action=pause pauses the strategy's primitives + notifies + journals", async () => {
+    seedBreakerFixture("dca-test");
+    const { getOrderById } = await import("./db.js");
+    const config = baseConfig({ enabled: true, rules: breakerRules });
+    const notifyFn = vi.fn();
+    const r = await runAlertTick({
+      config: config as never,
+      logger: silentLogger(),
+      notifyFn,
+      onlyTags: ["dca-test"],
+    });
+    expect(r.fired).toBe(1);
+    expect(r.breakers).toHaveLength(1);
+    expect(r.breakers[0].tag).toBe("dca-test");
+    expect(r.breakers[0].orders).toHaveLength(1);
+    expect(r.breakers[0].total).toBe(1);
+    expect(r.breakers[0].error).toBeUndefined();
+
+    // The owned order is actually paused.
+    expect(getOrderById(r.breakers[0].orders[0])?.status).toBe("paused");
+
+    // Two notifications: the alert fire + the breaker (critical).
+    expect(notifyFn).toHaveBeenCalledTimes(2);
+    const breakerCall = notifyFn.mock.calls[1][0];
+    expect(breakerCall.event).toBe("strategy.alert.circuit_breaker");
+    expect(breakerCall.severity).toBe("critical");
+    expect(breakerCall.body).toMatch(/strategy resume dca-test/);
+
+    // Journal: a breaker_paused event alongside the fired event.
+    const events = listAlertEvents({ tag: "dca-test" });
+    const kinds = events.map((e) => e.event).sort();
+    expect(kinds).toContain("fired");
+    expect(kinds).toContain("breaker_paused");
+  });
+
+  it("still_active does NOT re-pause — an operator's resume sticks while the rule stays violated", async () => {
+    seedBreakerFixture("dca-test");
+    const { getOrderById } = await import("./db.js");
+    const { resumeStrategyPrimitives } = await import("./strategyControl.js");
+    const config = baseConfig({ enabled: true, rules: breakerRules });
+    const notifyFn = vi.fn();
+    const r1 = await runAlertTick({
+      config: config as never, logger: silentLogger(), notifyFn, onlyTags: ["dca-test"],
+    });
+    expect(r1.breakers).toHaveLength(1);
+    const orderId = r1.breakers[0].orders[0];
+
+    // Operator investigates + deliberately resumes.
+    resumeStrategyPrimitives("dca-test");
+    expect(getOrderById(orderId)?.status).toBe("active");
+
+    // Rule is STILL violated on the next tick → still_active, no re-pause.
+    notifyFn.mockClear();
+    const r2 = await runAlertTick({
+      config: config as never, logger: silentLogger(), notifyFn, onlyTags: ["dca-test"],
+    });
+    expect(r2.fired).toBe(0);
+    expect(r2.stillActive).toBe(1);
+    expect(r2.breakers).toHaveLength(0);
+    expect(notifyFn).not.toHaveBeenCalled();
+    expect(getOrderById(orderId)?.status).toBe("active");
+  });
+
+  it("action omitted (default notify) never touches primitives", async () => {
+    seedBreakerFixture("dca-test");
+    const { listOrders } = await import("./db.js");
+    const config = baseConfig({
+      enabled: true,
+      rules: [{ type: "slippage_trend", baselineBps: 50, alertMultiplier: 1.5, minSampleSize: 5 } as never],
+    });
+    const r = await runAlertTick({
+      config: config as never, logger: silentLogger(), notifyFn: vi.fn(), onlyTags: ["dca-test"],
+    });
+    expect(r.fired).toBe(1);
+    expect(r.breakers).toHaveLength(0);
+    expect(listOrders({ status: "paused" })).toHaveLength(0);
+  });
+});

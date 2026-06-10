@@ -44,6 +44,8 @@ import {
   markOrderFailed,
   markOrderExpired,
   cancelOrder as dbCancelOrder,
+  pauseOrder as dbPauseOrder,
+  resumeOrder as dbResumeOrder,
   cancelOcoPeers,
   setOrderError,
   orderCountsByStatus,
@@ -452,6 +454,45 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
   return row;
 }
 
+// ── pause / resume ──────────────────────────────────────────
+
+/** Pause an active order: the engine stops evaluating its trigger until
+ *  resumed. Expiry still applies (a paused order whose expires_at passes
+ *  is retired as expired on the next tick) and OCO peers can still
+ *  cancel it (a paused bracket arm dies when its sibling fires).
+ *  Trailing watermarks are preserved across the pause. */
+export function pauseOrderById(id: number): OrderRow {
+  const existing = getOrderById(id);
+  if (!existing) throw new ToolError("INVALID_PARAMS", `Order #${id} not found.`, { details: { orderId: id } });
+  const r = dbPauseOrder(id);
+  if (r === -1) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `Order #${id} is ${existing.status} — only active orders can be paused.`,
+      { details: { orderId: id, currentStatus: existing.status } },
+    );
+  }
+  return getOrderById(id) ?? existing;
+}
+
+/** Resume a paused order: the engine evaluates it again from the next
+ *  tick. The trailing high-water mark continues from where the pause
+ *  left it (a stop that fires immediately because price fell during
+ *  the pause is correct stop behavior, not a bug). */
+export function resumeOrderById(id: number): OrderRow {
+  const existing = getOrderById(id);
+  if (!existing) throw new ToolError("INVALID_PARAMS", `Order #${id} not found.`, { details: { orderId: id } });
+  const r = dbResumeOrder(id);
+  if (r === -1) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `Order #${id} is ${existing.status} — only paused orders can be resumed.`,
+      { details: { orderId: id, currentStatus: existing.status } },
+    );
+  }
+  return getOrderById(id) ?? existing;
+}
+
 // ── cancellation / inspection ───────────────────────────────
 
 /** Operator-initiated cancel. Wraps db.cancelOrder with the proper structured
@@ -701,6 +742,19 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       firedReason: `expires_at ${order.expires_at}`,
     });
   };
+
+  // Paused orders are skipped for evaluation, but expiry still applies:
+  // expires_at bounds the order's VALIDITY, not its activity. Without
+  // this sweep a paused order would outlive its expiry and re-arm stale
+  // when resumed months later. Same retirement path as active expiry
+  // (journal + notify + OCO cascade).
+  const pausedRows = listOrders({ status: "paused", chain: args.chain, account: args.account });
+  for (const paused of pausedRows) {
+    if (paused.id == null) continue;
+    if (isOrderExpired(paused)) {
+      await retireExpired(paused, null);
+    }
+  }
 
   for (const order of orders) {
     if (order.id == null) continue;

@@ -513,3 +513,48 @@ describe("runOrderTick — multi-leg bracket hook", () => {
     expect(triggers).toEqual(["price_above", "price_below"]);
   });
 });
+
+// ── paused orders ────────────────────────────────────────────
+
+describe("runOrderTick — paused orders", () => {
+  it("a paused order is not evaluated (trigger would otherwise fire)", async () => {
+    seedQuoteBalance("10000");
+    const { pauseOrder, getOrderById } = await import("./db.js");
+    // Mock price 2000 ≤ 2100 → would trigger if active.
+    const id = seedOrder({ paper: true });
+    pauseOrder(id);
+    const report = await tick();
+    expect(report.filled).toBe(0);
+    expect(getOrderById(id)?.status).toBe("paused");
+  });
+
+  it("a paused order still expires when expires_at passes", async () => {
+    const { pauseOrder, getOrderById } = await import("./db.js");
+    const id = seedOrder({ expires_at: "2026-01-01T00:00:00.000Z" });
+    pauseOrder(id);
+    const report = await tick();
+    expect(report.expiredCount).toBe(1);
+    expect(getOrderById(id)?.status).toBe("expired");
+  });
+
+  it("an OCO peer fire cancels the PAUSED sibling too", async () => {
+    seedQuoteBalance("10000");
+    const { pauseOrder, getOrderById } = await import("./db.js");
+    // TP leg triggers (mock price 2000 ≤ 2100), SL leg paused.
+    const tp = seedOrder({ group_id: "bracket-1", paper: true });
+    const sl = seedOrder({
+      group_id: "bracket-1",
+      target_price_usd: 900, // far from trigger
+      paper: true,
+    });
+    pauseOrder(sl);
+    const report = await tick();
+    expect(report.filled).toBe(1);
+    expect(getOrderById(tp)?.status).toBe("filled");
+    // The paused arm died with its sibling — resuming it later would
+    // have re-armed an exit for a position that already closed.
+    const slRow = getOrderById(sl)!;
+    expect(slRow.status).toBe("cancelled");
+    expect(slRow.last_error_code).toBe("OCO_PEER_FIRED");
+  });
+});

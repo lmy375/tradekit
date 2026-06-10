@@ -111,6 +111,20 @@ export interface AlertTickReport {
   resolved: number;
   stillActive: number;
   skipped: number;
+  /** Circuit-breaker actions taken this tick (rules with action:
+   *  "pause" that fired). Empty array when no breaker tripped. */
+  breakers: Array<{
+    tag: string;
+    ruleType: string;
+    orders: number[];
+    schedules: number[];
+    rebalances: number[];
+    total: number;
+    /** Set when the pause itself errored — the alert still fired +
+     *  notified; the breaker failure escalates via its own critical
+     *  notification. */
+    error?: string;
+  }>;
 }
 
 // ── tag matching (mirrors strategyBudget.ts) ────────────────
@@ -696,6 +710,7 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
     resolved: 0,
     stillActive: 0,
     skipped: 0,
+    breakers: [],
   };
 
   if (!cfg || !cfg.enabled || cfg.rules.length === 0) {
@@ -788,6 +803,90 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
             });
           } catch (e) {
             args.logger.debug(`alert_events journal write failed (fired ${tag}/${ev.ruleType}): ${(e as Error).message}`);
+          }
+          // Circuit breaker: rules with action="pause" don't just
+          // notify — they bulk-pause every primitive the strategy
+          // owns. ONLY on the fire transition: a still-violated rule
+          // never re-pauses, so an operator's deliberate resume
+          // sticks until the rule resolves and fires fresh. Pausing
+          // is non-destructive (no cancels) — safe to automate.
+          if ((ev.rule.action ?? "notify") === "pause") {
+            try {
+              const { pauseStrategyPrimitives } = await import("./strategyControl.js");
+              const paused = pauseStrategyPrimitives(tag);
+              report.breakers.push({
+                tag,
+                ruleType: ev.ruleType,
+                orders: paused.orders,
+                schedules: paused.schedules,
+                rebalances: paused.rebalances,
+                total: paused.total,
+              });
+              args.logger.warn(
+                `circuit breaker: ${tag}/${ev.ruleType} paused ${paused.total} primitive(s) ` +
+                `(orders [${paused.orders.join(", ")}], schedules [${paused.schedules.join(", ")}], rebalance [${paused.rebalances.join(", ")}])`,
+              );
+              await notify(
+                {
+                  event: `${cfg.eventPrefix}.circuit_breaker`,
+                  severity: "critical",
+                  title: `Circuit breaker tripped: ${displayName} paused (${ev.ruleType})`,
+                  body:
+                    `${ev.message}\n\nPaused ${paused.total} primitive(s) owned by ${tag}: ` +
+                    `${paused.orders.length} order(s), ${paused.schedules.length} schedule(s), ${paused.rebalances.length} rebalance plan(s). ` +
+                    `Nothing was cancelled. Investigate, then resume with \`tradekit strategy resume ${tag}\`.`,
+                  fields: {
+                    tag,
+                    rule: ev.ruleType,
+                    ordersPaused: paused.orders.join(",") || null,
+                    schedulesPaused: paused.schedules.join(",") || null,
+                    rebalancesPaused: paused.rebalances.join(",") || null,
+                    totalPaused: paused.total,
+                  },
+                  dedupKey: `${cfg.eventPrefix}.circuit_breaker:${tag}:${ev.ruleType}:${lastEvaluatedAt}`,
+                },
+                args.config,
+                args.logger,
+              );
+              try {
+                insertAlertEvent({
+                  at: lastEvaluatedAt,
+                  tag,
+                  ruleType: ev.ruleType,
+                  event: "breaker_paused",
+                  severity: "critical",
+                  message: `paused ${paused.total} primitive(s): orders [${paused.orders.join(", ")}], schedules [${paused.schedules.join(", ")}], rebalance [${paused.rebalances.join(", ")}]`,
+                  valueJson: JSON.stringify({
+                    orders: paused.orders,
+                    schedules: paused.schedules,
+                    rebalances: paused.rebalances,
+                  }),
+                });
+              } catch (e) {
+                args.logger.debug(`alert_events journal write failed (breaker ${tag}/${ev.ruleType}): ${(e as Error).message}`);
+              }
+            } catch (e) {
+              // Breaker failure must not break the tick — the alert
+              // already fired + notified. Escalate loudly: the
+              // operator believes the system protects itself.
+              const msg = (e as Error).message;
+              report.breakers.push({
+                tag, ruleType: ev.ruleType, orders: [], schedules: [], rebalances: [], total: 0, error: msg,
+              });
+              args.logger.error(`circuit breaker FAILED for ${tag}/${ev.ruleType}: ${msg}`);
+              await notify(
+                {
+                  event: `${cfg.eventPrefix}.circuit_breaker_failed`,
+                  severity: "critical",
+                  title: `Circuit breaker FAILED for ${displayName} (${ev.ruleType}) — strategy still running`,
+                  body: `The rule fired with action="pause" but pausing errored:\n\n${msg}\n\nPause manually: \`tradekit strategy pause ${tag}\``,
+                  fields: { tag, rule: ev.ruleType, error: msg.slice(0, 300) },
+                  dedupKey: `${cfg.eventPrefix}.circuit_breaker_failed:${tag}:${ev.ruleType}:${lastEvaluatedAt}`,
+                },
+                args.config,
+                args.logger,
+              );
+            }
           }
           break;
         }

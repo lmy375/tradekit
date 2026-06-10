@@ -278,6 +278,11 @@ CONDITIONAL ORDERS
         --group filters to one OCO group (useful to inspect peer state).
   order show <id> [--json]                                Full detail incl. fill / error trail + OCO peer state when group_id set
   order cancel <id> [--yes] [--cascade] [--json]          Cancel an active order. --cascade also cancels the rest of the OCO group with reason OCO_OPERATOR_CASCADE
+  order pause <id> [--json]                               Pause: the engine stops evaluating the trigger until resumed.
+        Non-destructive (vs cancel). While paused: expires_at STILL retires the
+        order, and an OCO peer fire STILL cancels it (a paused bracket arm must
+        die with its sibling). Trailing HWM is preserved across the pause.
+  order resume <id> [--json]                              Resume a paused order (re-evaluated from the next tick)
   order edit <id> [--target-price N] [--trail-pct N]
                   [--base-amount A | --quote-amount A] [--slippage-bps N]
                   [--auto-slippage true|false] [--expires-in 7d | --expires-at ISO]
@@ -331,6 +336,15 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy list [--chain X] [--account L] [--json]
         Alias for \`strategies list\` — surfaces every distinct strategy tag in the
         trades table with fill counts and last-seen timestamps.
+  strategy pause <tag> [--json]
+        Bulk-pause EVERY active primitive (orders / schedules / rebalance plans)
+        owned by the strategy tag in one command. Non-destructive — nothing is
+        cancelled; run counters / trailing HWMs / OCO groups all survive. This is
+        the manual twin of the alert circuit breaker (rule action: "pause").
+  strategy resume <tag> [--json]
+        Bulk-resume every paused primitive owned by the tag. Schedules + rebalance
+        plans recompute next_run_at from now (skip missed windows, don't backfill).
+        Blanket by tag — also resumes primitives paused individually by hand.
   strategy alerts list [--tag X] [--active-only] [--json]
         List every (tag, ruleType) alert state row recorded by the watcher.
         --active-only filters to currently-firing alerts; useful in cron checks.
@@ -341,6 +355,13 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
         Run the watcher: enumerate strategies, evaluate every applicable rule,
         emit notifications on OK↔active transitions. --once is the default;
         --watch N runs forever at N-second cadence (N ≥ 5).
+        CIRCUIT BREAKER: a rule with "action": "pause" doesn't just notify on
+        fire — it bulk-pauses every primitive the strategy owns (same machinery
+        as 'strategy pause') and emits a critical *.circuit_breaker notification
+        with the paused ids. Fire-transition only: a still-violated rule never
+        re-pauses, so a deliberate 'strategy resume' sticks until the rule
+        resolves and fires fresh. Breaker failures escalate via
+        *.circuit_breaker_failed (the strategy is still running!).
   strategy alerts reset [--tag X] [--rule TYPE] [--yes] [--json]
         Clear alert state rows. Re-arms the rule so the next violation will
         emit a fresh fire notification. Interactive confirmation unless --yes.

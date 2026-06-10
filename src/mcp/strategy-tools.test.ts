@@ -100,7 +100,7 @@ function parseResult(result: { content: { type: "text"; text: string }[] }): unk
 // ── registration ─────────────────────────────────────────────
 
 describe("registerStrategyTools — tool registration", () => {
-  it("registers all 13 expected tools", () => {
+  it("registers all 15 expected tools", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
     const names = Array.from(registered.keys());
@@ -119,7 +119,10 @@ describe("registerStrategyTools — tool registration", () => {
     expect(names).toContain("backtest_compare");
     // Iter31: unified strategy observability.
     expect(names).toContain("strategy_report");
-    expect(names.length).toBe(13);
+    // Strategy-level bulk control (manual circuit breaker).
+    expect(names).toContain("strategy_pause");
+    expect(names).toContain("strategy_resume");
+    expect(names.length).toBe(15);
   });
 
   it("every tool has a non-empty description", () => {

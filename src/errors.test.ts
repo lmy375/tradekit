@@ -448,7 +448,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     // trade-tools.ts: quote, buy, sell, import_trade, transfer, preview_trade, preflight_trade, sweep_balances
     "quote", "buy", "sell", "import_trade", "transfer", "preview_trade", "preflight_trade", "sweep_balances",
     // Conditional / limit orders surface (order create/list/show/cancel/run).
-    "order_create", "order_list", "order_show", "order_cancel", "order_edit", "order_run",
+    "order_create", "order_list", "order_show", "order_cancel", "order_pause", "order_resume", "order_edit", "order_run",
     // Notification / webhook channels surface (notify list/test).
     "notify_list", "notify_test",
     // Scheduled / recurring trades surface (schedule create/list/show/pause/resume/cancel/run).
@@ -481,6 +481,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "backtest_list", "backtest_show", "backtest_compare_list", "backtest_compare_show",
     // Iter31: unified strategy observability report.
     "strategy_report",
+    // Strategy-level bulk control (manual circuit breaker).
+    "strategy_pause", "strategy_resume",
     // Iter36: forensic timeline (cross-strategy chronological events).
     "timeline_query",
     // Iter38: per-provider price-fetch observability.

@@ -896,4 +896,45 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
       }
     },
   );
+
+  // ── strategy_pause / strategy_resume ──────────────────────
+  server.tool(
+    "strategy_pause",
+    "CIRCUIT BREAKER (manual): bulk-pause every active primitive (orders / schedules / rebalance plans) owned by a strategy tag in one call. Non-destructive — nothing is cancelled; trailing watermarks, run counters, and OCO groups all survive. Paused orders still expire on their expiresAt and still die to OCO peer fires. This is the same machinery alert rules with `action: \"pause\"` invoke automatically when they fire. Idempotent: re-pausing reports zero transitions (skipped counts already-paused rows). Returns { tag, action, orders: number[], schedules: number[], rebalances: number[], total, skipped }. Errors: INVALID_PARAMS (empty tag).",
+    {
+      tag: z.string().min(1).describe("Strategy tag whose primitives to pause (e.g. 'playbook:42' or a custom tag). Exact match — wildcards not supported here."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("strategy_pause", rt.opts, input, undefined, async () => {
+            const { pauseStrategyPrimitives } = await import("../strategyControl.js");
+            return pauseStrategyPrimitives(input.tag);
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "strategy_resume",
+    "Bulk-resume every paused primitive owned by a strategy tag. Schedules + rebalance plans recompute next_run_at from now (missed windows are skipped, not backfilled); orders re-enter trigger evaluation on the next engine tick with trailing watermarks preserved. Blanket by tag: it cannot distinguish breaker-paused from hand-paused primitives — both resume. After a circuit breaker trip, the breaker does NOT re-pause while its rule stays violated (it acts only on fresh fire transitions), so a deliberate resume sticks until the rule resolves and fires again. Returns the same shape as strategy_pause. Errors: INVALID_PARAMS (empty tag).",
+    {
+      tag: z.string().min(1).describe("Strategy tag whose paused primitives to resume."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("strategy_resume", rt.opts, input, undefined, async () => {
+            const { resumeStrategyPrimitives } = await import("../strategyControl.js");
+            return resumeStrategyPrimitives(input.tag);
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
 };

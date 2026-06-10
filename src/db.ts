@@ -2833,7 +2833,7 @@ export function dailyUsdVolume(account: string, chain?: string): number {
 // engine in src/orders.ts polls active rows on each tick, fires the trade
 // via executeTrade when triggered, then writes back the outcome here.
 
-export type OrderStatus = "active" | "filled" | "cancelled" | "expired" | "failed";
+export type OrderStatus = "active" | "paused" | "filled" | "cancelled" | "expired" | "failed";
 export type OrderSide = "buy" | "sell";
 /** Trigger semantics:
  *   price_below — fires when current_price <= target_price_usd
@@ -2990,8 +2990,12 @@ export function insertOrder(args: InsertOrderArgs): number {
 export function findActiveGroupPeers(orderId: number, groupId: string | null | undefined): OrderRow[] {
   if (!groupId) return [];
   const db = openDb();
+  // Paused peers are still OCO-bound: when a peer fires, a paused
+  // bracket arm must be cancelled too — otherwise an operator who
+  // resumes it later re-arms an exit for a position that already
+  // closed (double-sell).
   return db
-    .prepare(`SELECT * FROM orders WHERE group_id = ? AND id != ? AND status = 'active'`)
+    .prepare(`SELECT * FROM orders WHERE group_id = ? AND id != ? AND status IN ('active', 'paused')`)
     .all(groupId, orderId) as unknown as OrderRow[];
 }
 
@@ -3023,7 +3027,7 @@ export function cancelOcoPeers(
   const cancelled: number[] = [];
   const stmt = db.prepare(
     `UPDATE orders SET status = 'cancelled', updated_at = ?, last_error_code = ?, last_error_message = ?
-     WHERE id = ? AND status = 'active'`,
+     WHERE id = ? AND status IN ('active', 'paused')`,
   );
   for (const peer of peers) {
     if (peer.id == null) continue;
@@ -3173,6 +3177,36 @@ export function cancelOrder(id: number): number {
   return Number(r.changes);
 }
 
+/** Pause an active order: the engine skips evaluation until resumed, but
+ *  expiry still applies (a paused order whose expires_at passes flips to
+ *  expired — time bounds are about the order's validity, not its activity)
+ *  and OCO peers can still cancel it. Returns 0 if not found, -1 if the
+ *  current status isn't active, else the change count. */
+export function pauseOrder(id: number): number {
+  const db = openDb();
+  const existing = getOrderById(id);
+  if (!existing) return 0;
+  if (existing.status !== "active") return -1;
+  const now = new Date().toISOString();
+  const r = db.prepare(`UPDATE orders SET status = 'paused', updated_at = ? WHERE id = ?`).run(now, id);
+  return Number(r.changes);
+}
+
+/** Resume a paused order. Trailing watermarks are preserved across the
+ *  pause (the high-water mark reflects the position's real history, and a
+ *  resumed stop that fires immediately on a price that fell during the
+ *  pause is correct stop behavior). Returns 0 if not found, -1 if the
+ *  current status isn't paused, else the change count. */
+export function resumeOrder(id: number): number {
+  const db = openDb();
+  const existing = getOrderById(id);
+  if (!existing) return 0;
+  if (existing.status !== "paused") return -1;
+  const now = new Date().toISOString();
+  const r = db.prepare(`UPDATE orders SET status = 'active', updated_at = ? WHERE id = ?`).run(now, id);
+  return Number(r.changes);
+}
+
 /** Stamp an order with a non-terminal error encountered on a tick (e.g. RPC
  *  flake, transient simulation revert). Status stays active so the next tick
  *  retries; the error trail surfaces via `order show` / `order list --json`. */
@@ -3285,7 +3319,7 @@ export function updateOrderEditable(
   // engine has just flipped the row to filled/failed/expired —
   // caller treats `changes=0` as a race-loss + reports the
   // current status to the operator.
-  const sql = `UPDATE orders SET ${sets.join(", ")} WHERE id = ? AND status = 'active'`;
+  const sql = `UPDATE orders SET ${sets.join(", ")} WHERE id = ? AND status IN ('active', 'paused')`;
   const r = db.prepare(sql).run(...args);
   return Number(r.changes ?? 0);
 }
@@ -3690,7 +3724,7 @@ export function orderCountsByStatus(): Record<OrderStatus, number> {
   const rows = db
     .prepare(`SELECT status, COUNT(*) AS n FROM orders GROUP BY status`)
     .all() as Array<{ status: OrderStatus; n: number }>;
-  const out: Record<OrderStatus, number> = { active: 0, filled: 0, cancelled: 0, expired: 0, failed: 0 };
+  const out: Record<OrderStatus, number> = { active: 0, paused: 0, filled: 0, cancelled: 0, expired: 0, failed: 0 };
   for (const r of rows) out[r.status] = r.n;
   return out;
 }
@@ -4924,7 +4958,7 @@ export interface AlertEventRow {
   tag: string;
   /** Rule type (staleness / failure_streak / drawdown_threshold / …). */
   rule_type: string;
-  event: "fired" | "resolved";
+  event: "fired" | "resolved" | "breaker_paused";
   /** Notification severity at transition time. 'resolved' is always info. */
   severity: "info" | "warn" | "critical";
   /** Human summary — the fire message, e.g. "3 consecutive failures". */
@@ -4939,7 +4973,7 @@ export interface InsertAlertEventArgs {
   at: string;
   tag: string;
   ruleType: string;
-  event: "fired" | "resolved";
+  event: "fired" | "resolved" | "breaker_paused";
   severity: "info" | "warn" | "critical";
   message?: string | null;
   valueJson?: string | null;
@@ -4974,7 +5008,7 @@ export interface ListAlertEventsFilter {
   untilIso?: string;
   tag?: string;
   ruleType?: string;
-  event?: "fired" | "resolved";
+  event?: "fired" | "resolved" | "breaker_paused";
   /** Max rows, newest-first. Default unbounded. */
   limit?: number;
 }

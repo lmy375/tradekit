@@ -34,6 +34,7 @@ const VALID_KINDS: EventKind[] = [
   "audit.error",
   "alert.fired",
   "alert.resolved",
+  "alert.breaker",
 ];
 
 function parseKinds(raw: string | undefined): EventKind[] | undefined {

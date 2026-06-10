@@ -610,7 +610,7 @@ tradekit strategy report 1 --mtm
         { "type": "staleness",          "thresholdSeconds": 172800 },
         { "type": "slippage_trend",     "baselineBps": 50, "alertMultiplier": 1.5, "minSampleSize": 5 },
         { "type": "success_rate_drop",  "minRate": 0.8, "minSampleSize": 10 },
-        { "type": "failure_streak",     "alertCount": 3 },
+        { "type": "failure_streak",     "alertCount": 3, "action": "pause" },
         { "type": "budget_approach",    "warnPct": 0.8 },
         { "type": "drawdown_threshold", "alertPct": 10 },
         { "type": "trigger_proximity",  "alertDistancePct": 2, "appliesTo": ["playbook:*"] },
@@ -621,7 +621,7 @@ tradekit strategy report 1 --mtm
 }
 ```
 
-**Seven rule types**:
+**Eight rule types**:
 
 | Rule                  | Triggers when…                                                              |
 |-----------------------|------------------------------------------------------------------------------|
@@ -632,16 +632,38 @@ tradekit strategy report 1 --mtm
 | `budget_approach`     | Any matching budget consumed ≥ `warnPct` (early warn vs hard limit)         |
 | `drawdown_threshold`  | Per-strategy drawdown ≥ `alertPct` (early warn vs portfolio breaker)        |
 | `trigger_proximity`   | Any active order within `alertDistancePct` of firing (heads-up)             |
+| `drift_proximity`     | Any owned rebalance plan's last drift ≥ `alertPctOfThreshold`% of its threshold |
 
-Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) to scope thresholds per strategy, and `note` for free-text rationale that ships in the notification body.
+Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) to scope thresholds per strategy, `note` for free-text rationale that ships in the notification body, and `action` to choose what a fire DOES (see the circuit breaker below).
 
 **Fire-once-per-transition.** State is persisted in `strategy_alert_state` (v25 migration). When a rule transitions OK→active the watcher fires ONE notification; the next tick recognizes the state row and stays silent. When the condition clears, a paired `strategy.alert.resolved.<rule_type>` event fires with the alert's lifetime duration. No notification storms.
 
 **Inapplicable rules are silent.** When a rule can't be evaluated (insufficient sample size, no live price for `trigger_proximity`, no per-strategy drawdown configured), it neither fires nor resolves — the prior state row stays intact for the next tick. This avoids both false positives (one bad fill triggers slippage_trend) and false negatives (evaluation failed silently marked as "resolved").
 
-**Operational pattern.** Run `strategy alerts run --watch 60` as a sidecar to the engine supervisor. The watcher is a pure read-side process — it builds cheap section-filtered `StrategyReport`s, evaluates rules, dispatches notifications, and writes the dedup state. It does NOT submit trades or modify engine state, so the failure modes are bounded: a watcher crash never affects the trading engine, and vice versa.
+**Operational pattern.** Run `strategy alerts run --watch 60` as a sidecar to the engine supervisor. The watcher is a read-side process — it builds cheap section-filtered `StrategyReport`s, evaluates rules, dispatches notifications, and writes the dedup state. It never submits trades; the only engine state it can touch is the non-destructive pause flip when a circuit-breaker rule fires. Failure modes stay bounded: a watcher crash never affects the trading engine, and vice versa.
 
 **Resetting after acknowledgment.** When the operator has investigated + addressed an alert, `tradekit strategy alerts reset --tag X --rule Y` clears the state row so the rule re-arms. The next violation emits a fresh fire notification — useful when the underlying issue gets re-triggered later.
+
+#### Circuit breaker — alerts that act, not just notify
+
+A notification at 3am is only useful if someone is awake to read it. Any alert rule can carry `"action": "pause"` — when it fires, the watcher doesn't just notify: it **bulk-pauses every primitive the strategy owns** (orders, schedules, rebalance plans) and emits a critical `strategy.alert.circuit_breaker` notification listing exactly what was paused. The system protects itself first; the operator investigates at a humane hour.
+
+```jsonc
+{ "type": "failure_streak", "alertCount": 3, "action": "pause", "appliesTo": ["playbook:*"] }
+```
+
+**Why pausing (and not cancelling) is safe to automate.** Pause is fully reversible: run counters, trailing high-water marks, OCO groups, and `next_run_at` semantics all survive. A false-positive breaker trip costs missed fires, never destroyed state. Cancellation stays a human decision.
+
+**Fire-transition-only.** The breaker acts when the rule transitions OK → violated, never on `still_active` ticks. After investigating, `tradekit strategy resume <tag>` brings everything back — and the still-violated rule will NOT immediately re-pause (your resume is a deliberate override). Only after the rule resolves and fires fresh does the breaker act again.
+
+**Paused-state semantics** (designed so a breaker trip can't strand dangerous state):
+- Paused **orders** still expire on their `expires_at` (time bounds validity, not activity) and still die to OCO peer fires — a paused stop-loss is cancelled the moment its take-profit sibling fills, so resuming it later can't re-arm an exit for a closed position.
+- Paused **schedules / rebalance plans** recompute `next_run_at` from now on resume — missed windows are skipped, not backfilled.
+- Trailing watermarks freeze across the pause; a stop that fires immediately on resume because price fell meanwhile is correct stop behavior.
+
+**Manual twin.** `tradekit strategy pause <tag>` / `strategy resume <tag>` (MCP: `strategy_pause` / `strategy_resume`) run the same machinery by hand — one command to take a whole strategy offline while you investigate, instead of hand-pausing 12 orders, 2 schedules, and a rebalance plan. Individual orders gained pause/resume parity too: `order pause <id>` / `order resume <id>` (MCP: `order_pause` / `order_resume`).
+
+**Failure escalation.** If the pause itself errors, the alert still fires but a `strategy.alert.circuit_breaker_failed` critical notification escalates — the operator must know the system did NOT protect itself. Breaker trips are journaled to `alert_events` (`event: "breaker_paused"`, with the paused ids) and surface in the unified timeline as `alert.breaker` events.
 
 #### DB lifecycle (iter40) — integrity / retention / auto-backup
 

@@ -719,10 +719,10 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
 
   server.tool(
     "order_list",
-    "List conditional orders with pre-aggregated status counts in `summary`. Default status='active'; pass 'all' to see every order ever created. Use this to verify the engine is doing its job — `last_checked_at` + `last_checked_price` on each active row let agents tell at a glance whether the engine has ticked recently and what price it last observed. Filter combinations: chain + account + strategy + group (OCO group id). The group filter is exact-match — useful for inspecting the state of a specific OCO group ('which peers are still active in group X'). Returns { ok, summary: { total, byStatus: {active, filled, cancelled, expired, failed} }, items: OrderRow[] }.",
+    "List conditional orders with pre-aggregated status counts in `summary`. Default status='active'; pass 'all' to see every order ever created. Use this to verify the engine is doing its job — `last_checked_at` + `last_checked_price` on each active row let agents tell at a glance whether the engine has ticked recently and what price it last observed. Filter combinations: chain + account + strategy + group (OCO group id). The group filter is exact-match — useful for inspecting the state of a specific OCO group ('which peers are still active in group X'). Returns { ok, summary: { total, byStatus: {active, paused, filled, cancelled, expired, failed} }, items: OrderRow[] }.",
     {
       status: z
-        .enum(["all", "active", "filled", "cancelled", "expired", "failed"])
+        .enum(["all", "active", "paused", "filled", "cancelled", "expired", "failed"])
         .optional()
         .describe("Status filter (default: 'active')."),
       chain: z.string().optional(),
@@ -796,6 +796,46 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
             const { cancelOrderById } = await import("../orders.js");
             const row = cancelOrderById(input.id, { cascade: input.cascade });
             return { order: row };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "order_pause",
+    "Pause an active order: the engine stops evaluating its trigger until resumed. Non-destructive — pause/resume is the safe way to take an order offline while investigating (vs cancel, which is terminal). While paused: expiry STILL applies (a paused order whose expiresAt passes is retired as expired — time bounds the order's validity, not its activity) and OCO peers can STILL cancel it (a paused bracket arm dies when its sibling fires — otherwise resuming it later would re-arm an exit for a position that already closed). Trailing watermarks are preserved. Bulk variant: strategy_pause pauses every primitive owned by a tag. Errors: INVALID_PARAMS (unknown id, status not active).",
+    {
+      id: z.number().int().positive().describe("Order id to pause."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("order_pause", rt.opts, input, undefined, async () => {
+            const { pauseOrderById } = await import("../orders.js");
+            return { order: pauseOrderById(input.id) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "order_resume",
+    "Resume a paused order: the engine evaluates its trigger again from the next tick. The trailing high-water mark continues from where the pause left it — a stop that fires immediately because price fell during the pause is correct stop behavior. Errors: INVALID_PARAMS (unknown id, status not paused).",
+    {
+      id: z.number().int().positive().describe("Order id to resume."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("order_resume", rt.opts, input, undefined, async () => {
+            const { resumeOrderById } = await import("../orders.js");
+            return { order: resumeOrderById(input.id) };
           }),
         );
       } catch (e) {

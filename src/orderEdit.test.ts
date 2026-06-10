@@ -152,7 +152,7 @@ describe("validateOrderEdit — rejection paths", () => {
     const id = seedTrailing();
     const order = { ...getOrderById(id)!, status: "filled" } as OrderRow;
     expect(() => validateOrderEdit({ order, changes: { trailPct: 7 }, config, now })).toThrow(
-      /only active orders are editable/,
+      /only active or paused orders are editable/,
     );
   });
 
@@ -276,11 +276,23 @@ describe("editOrder — end-to-end", () => {
     expect(replayOrderEntries(id)).toHaveLength(0);
   });
 
+  it("paused orders are editable (tune the stop while the strategy is offline)", async () => {
+    const id = seedTrailing({ trailPct: 5 });
+    const { pauseOrder } = await import("./db.js");
+    pauseOrder(id);
+    const result = editOrder({ id, changes: { trailPct: 8 } });
+    expect(result.diff).toHaveLength(1);
+    expect(result.diff[0].field).toBe("trailPct");
+    const after = getOrderById(id)!;
+    expect(after.trail_pct).toBe(8);
+    expect(after.status).toBe("paused"); // edit never flips status
+  });
+
   it("rejects edit on a terminal order with a useful error", () => {
     const id = seedTrailing();
     markOrderFilled(id, { tx_hash: "0xabc", fill_price: 2100, base_amount: "1", quote_amount: "2100" });
     expect(() => editOrder({ id, changes: { trailPct: 7 } })).toThrow(
-      /only active orders are editable/,
+      /only active or paused orders are editable/,
     );
   });
 
@@ -304,7 +316,7 @@ describe("editOrder — end-to-end", () => {
     // pass. Verify via the manual flow:
     cancelOrder(id);
     expect(() => editOrder({ id, changes: { trailPct: 7 } })).toThrow(
-      /only active orders are editable/,
+      /only active or paused orders are editable/,
     );
   });
 

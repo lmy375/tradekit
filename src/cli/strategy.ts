@@ -574,6 +574,12 @@ export async function strategyCommand(
     case "list":
       await strategiesListCommand(flags);
       break;
+    case "pause":
+      await strategyPauseCommand(flags, positional);
+      break;
+    case "resume":
+      await strategyResumeCommand(flags, positional);
+      break;
     case "alerts": {
       // Nested subcommand: `tradekit strategy alerts <action>`.
       // The action sits at positional[2] because positional[0] is
@@ -590,6 +596,58 @@ export async function strategyCommand(
       break;
     }
     default:
-      throw subcommandError("strategy", action, ["report", "list", "alerts"]);
+      throw subcommandError("strategy", action, ["report", "list", "pause", "resume", "alerts"]);
   }
+}
+
+/** `tradekit strategy pause <tag>` — bulk-pause every active primitive
+ *  (orders / schedules / rebalance plans) owned by the strategy tag.
+ *  Non-destructive: nothing is cancelled; resume with `strategy resume`.
+ *  Same machinery the alert circuit breaker (rule action: "pause") uses. */
+export async function strategyPauseCommand(flags: Record<string, string>, positional: string[]) {
+  const tag = requireTagArg(positional[2], "pause");
+  const { pauseStrategyPrimitives } = await import("../strategyControl.js");
+  const result = pauseStrategyPrimitives(tag);
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...result });
+    return;
+  }
+  if (result.total === 0) {
+    console.log(`Nothing to pause for "${tag}"${result.skipped > 0 ? ` (${result.skipped} already paused)` : " (no active primitives match the tag)"}.`);
+    return;
+  }
+  console.log(`Paused ${result.total} primitive(s) owned by "${tag}":`);
+  if (result.orders.length) console.log(`  orders:     #${result.orders.join(", #")}`);
+  if (result.schedules.length) console.log(`  schedules:  #${result.schedules.join(", #")}`);
+  if (result.rebalances.length) console.log(`  rebalance:  #${result.rebalances.join(", #")}`);
+  console.log(`Resume with: tradekit strategy resume ${tag}`);
+}
+
+/** `tradekit strategy resume <tag>` — bulk-resume every paused primitive
+ *  owned by the tag. Schedules + rebalance plans recompute next_run_at
+ *  from now (skip missed windows, do not backfill). Blanket by tag: it
+ *  also resumes primitives the operator paused individually. */
+export async function strategyResumeCommand(flags: Record<string, string>, positional: string[]) {
+  const tag = requireTagArg(positional[2], "resume");
+  const { resumeStrategyPrimitives } = await import("../strategyControl.js");
+  const result = resumeStrategyPrimitives(tag);
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...result });
+    return;
+  }
+  if (result.total === 0) {
+    console.log(`Nothing to resume for "${tag}"${result.skipped > 0 ? ` (${result.skipped} already active)` : " (no paused primitives match the tag)"}.`);
+    return;
+  }
+  console.log(`Resumed ${result.total} primitive(s) owned by "${tag}":`);
+  if (result.orders.length) console.log(`  orders:     #${result.orders.join(", #")}`);
+  if (result.schedules.length) console.log(`  schedules:  #${result.schedules.join(", #")}`);
+  if (result.rebalances.length) console.log(`  rebalance:  #${result.rebalances.join(", #")}`);
+}
+
+function requireTagArg(tag: string | undefined, verb: string): string {
+  if (!tag || tag.trim() === "") {
+    throw new ToolError("INVALID_PARAMS", `Usage: tradekit strategy ${verb} <tag> [--json]`);
+  }
+  return tag;
 }

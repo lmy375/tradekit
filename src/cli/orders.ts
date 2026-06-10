@@ -75,6 +75,7 @@ function shortHash(h: string | null): string {
 function statusMarker(s: OrderStatus): string {
   switch (s) {
     case "active": return "○";
+    case "paused": return "⏸";
     case "filled": return "●";
     case "cancelled": return "✕";
     case "expired": return "⌛";
@@ -267,7 +268,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
 // ── list ─────────────────────────────────────────────────────
 
 const VALID_STATUSES: ReadonlyArray<OrderStatus | "all"> = [
-  "all", "active", "filled", "cancelled", "expired", "failed",
+  "all", "active", "paused", "filled", "cancelled", "expired", "failed",
 ];
 
 export async function orderListCommand(flags: Record<string, string>) {
@@ -657,6 +658,38 @@ function describeTriggerForReplay(o: import("../db.js").OrderRow): string {
   return `${o.trigger_type} $${t}`;
 }
 
+/** `tradekit order pause <id>` — the engine stops evaluating the
+ *  trigger until resumed. Expiry still applies and OCO peers can
+ *  still cancel a paused order. */
+export async function orderPauseCommand(flags: Record<string, string>, positional: string[]) {
+  const id = parseOrderId(positional[2], "pause");
+  const { pauseOrderById } = await import("../orders.js");
+  const row = pauseOrderById(id);
+  if (flags["json"] === "true") printJson({ ok: true, order: row });
+  else console.log(`Paused order #${row.id}  (status → ${row.status})`);
+}
+
+/** `tradekit order resume <id>` — re-enters trigger evaluation on the
+ *  next tick. Trailing watermarks are preserved across the pause. */
+export async function orderResumeCommand(flags: Record<string, string>, positional: string[]) {
+  const id = parseOrderId(positional[2], "resume");
+  const { resumeOrderById } = await import("../orders.js");
+  const row = resumeOrderById(id);
+  if (flags["json"] === "true") printJson({ ok: true, order: row });
+  else console.log(`Resumed order #${row.id}  (status → ${row.status})`);
+}
+
+function parseOrderId(idArg: string | undefined, verb: string): number {
+  if (!idArg) {
+    throw new ToolError("INVALID_PARAMS", `Usage: tradekit order ${verb} <id> [--json]`);
+  }
+  const id = parseInt(idArg, 10);
+  if (!Number.isFinite(id) || id <= 0) {
+    throw new ToolError("INVALID_PARAMS", `Invalid order id "${idArg}" — expected a positive integer.`);
+  }
+  return id;
+}
+
 export async function orderCommand(
   action: string | undefined,
   flags: Record<string, string>,
@@ -675,6 +708,12 @@ export async function orderCommand(
     case "cancel":
       await orderCancelCommand(flags, positional);
       break;
+    case "pause":
+      await orderPauseCommand(flags, positional);
+      break;
+    case "resume":
+      await orderResumeCommand(flags, positional);
+      break;
     case "edit":
       await orderEditCommand(flags, positional);
       break;
@@ -685,7 +724,7 @@ export async function orderCommand(
       await orderReplayCommand(flags, positional);
       break;
     default:
-      throw subcommandError("order", action, ["create", "list", "show", "cancel", "edit", "run", "replay"]);
+      throw subcommandError("order", action, ["create", "list", "show", "cancel", "pause", "resume", "edit", "run", "replay"]);
   }
 }
 

@@ -93,6 +93,7 @@ export type EventKind =
   | "audit.error"              // audit_log row with error_code set
   | "alert.fired"              // strategy_alert_state row turned active
   | "alert.resolved"           // strategy_alert_state row last_evaluated_at after first_triggered_at fell to active=0
+  | "alert.breaker"            // circuit breaker paused a strategy's primitives (rule action: "pause")
   // Iter39: durable engine state transitions from the v26
   // engine_events table. Replaces the iter36 audit_log heuristic
   // for these events — exact data, no inference.
@@ -514,6 +515,16 @@ export function collectAlertEvents(args: {
         kind: "alert.fired",
         severity,
         summary: `ALERT FIRED ${e.tag}: ${e.rule_type}${e.message ? ` — ${e.message}` : ""}`,
+        refs: { type: "alert", id: `${e.tag}/${e.rule_type}`, strategy: e.tag },
+        details: { tag: e.tag, ruleType: e.rule_type, value: e.value_json, message: e.message },
+      });
+    } else if (e.event === "breaker_paused") {
+      if (!kindAllowed("alert.breaker", args.filter.kinds) || !severityAllowed("critical", args.filter.minSeverity)) continue;
+      out.push({
+        at: e.at,
+        kind: "alert.breaker",
+        severity: "critical",
+        summary: `CIRCUIT BREAKER ${e.tag}: ${e.rule_type}${e.message ? ` — ${e.message}` : ""}`,
         refs: { type: "alert", id: `${e.tag}/${e.rule_type}`, strategy: e.tag },
         details: { tag: e.tag, ruleType: e.rule_type, value: e.value_json, message: e.message },
       });

@@ -59,6 +59,12 @@ function strategyAlertRuleSchema() {
       .optional()
       .describe("Optional tag patterns to restrict this rule to. Supports `playbook:*` wildcard suffix. Empty/missing = all strategies."),
     note: z.string().optional().describe("Free-text rationale included in the alert notification body."),
+    action: z
+      .enum(["notify", "pause"])
+      .optional()
+      .describe(
+        "What to do when the rule FIRES (transitions ok → violated). 'notify' (default): emit the alert notification only. 'pause': CIRCUIT BREAKER — additionally bulk-pause every primitive (orders / schedules / rebalance plans) owned by the strategy tag, then emit a critical <eventPrefix>.circuit_breaker notification with the paused ids. Pausing is non-destructive (resume with `tradekit strategy resume <tag>`); the breaker acts ONLY on the fire transition — a still-violated rule does not re-pause, so an operator's deliberate resume sticks until the rule resolves and fires again.",
+      ),
   };
   return z.discriminatedUnion("type", [
     z
