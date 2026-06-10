@@ -298,6 +298,17 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+NOTES (v37 — the timeline's human layer)
+  note add "what you did and why" [--strategy TAG] [--at ISO] [--json]
+        Record context into the forensic timeline (kind note.operator):
+        "moved the stop because CPI tomorrow", "rotated RPC, base flaky".
+        Untagged notes are global; --strategy scopes to one tag's view.
+        Shows in \`tradekit timeline\` next to the machine events — "what
+        did I do around the time things broke" becomes one view. Agents
+        leave handoff reasoning via MCP note_add.
+  note list [--strategy TAG] [--limit N] [--json]
+  note rm <id> [--json]      No auto-retention — deletion is explicit.
+
 EXPORT (v36 — realized gains, tax season)
   export gains [--year N | --since ISO --until ISO] [--mode real|paper]
                [--account L] [--chain X] [--strategy TAG]

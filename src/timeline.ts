@@ -59,6 +59,8 @@ import {
   type EngineEventRow,
   listSignalEvents,
   type SignalEventRow,
+  listOperatorNotes,
+  type OperatorNoteRow,
 } from "./db.js";
 
 // ── public types ────────────────────────────────────────────
@@ -97,6 +99,7 @@ export type EventKind =
   | "alert.resolved"           // strategy_alert_state row last_evaluated_at after first_triggered_at fell to active=0
   | "alert.breaker"            // circuit breaker paused a strategy's primitives (rule action: "pause")
   | "signal.received"          // v35 external signal event arrived (webhook / cli / mcp), with consumption state
+  | "note.operator"            // v37 human/agent annotation — the forensic stream's HUMAN layer
   // Iter39: durable engine state transitions from the v26
   // engine_events table. Replaces the iter36 audit_log heuristic
   // for these events — exact data, no inference.
@@ -119,6 +122,7 @@ export const ALL_EVENT_KINDS: EventKind[] = [
   "audit.tool", "audit.error",
   "alert.fired", "alert.resolved", "alert.breaker",
   "signal.received",
+  "note.operator",
   "engine.started", "engine.stopped", "engine.lock", "engine.unlock",
   "worker.degraded", "worker.recovered", "config.reloaded", "config.reload_failed",
 ];
@@ -127,7 +131,7 @@ export interface EventRefs {
   /** Concrete primitive id when applicable (order id, schedule id,
    *  trade id, audit id, engine_event id). Used by the renderer
    *  for the "drill into this row" link. */
-  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event" | "signal";
+  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event" | "signal" | "note";
   id: number | string;
   /** Chain / account / strategy denormalized so the consumer can
    *  filter without joining. Nullable when irrelevant. */
@@ -185,6 +189,7 @@ export interface TimelineInjections {
   /** v29: schedule/rebalance decision-journal sources. */
   scheduleJournalFn?: (since: string, until: string, limit: number) => ScheduleCheckLogRow[];
   signalEventsFn?: typeof listSignalEvents;
+  notesFn?: typeof listOperatorNotes;
   rebalanceJournalFn?: (since: string, until: string, limit: number) => RebalanceCheckLogRow[];
   /** Iter39: engine_events table source. */
   engineEventsFn?: typeof listEngineEvents;
@@ -846,6 +851,34 @@ export function collectSignalEvents(args: {
   return out;
 }
 
+/** v37 operator notes → timeline. Severity info; the strategy
+ *  filter applies when the note is tagged (untagged notes are
+ *  global context and survive any strategy filter — "rotated RPC"
+ *  matters to every strategy's investigation). */
+export function collectNoteEvents(args: {
+  rows: readonly OperatorNoteRow[];
+  filter: Pick<CollectTimelineArgs, "strategy" | "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const r of args.rows) {
+    if (r.at < args.sinceIso || r.at > args.untilIso) continue;
+    if (args.filter.strategy && r.strategy != null && r.strategy !== args.filter.strategy) continue;
+    if (!kindAllowed("note.operator", args.filter.kinds)) continue;
+    if (!severityAllowed("info", args.filter.minSeverity)) continue;
+    out.push({
+      at: r.at,
+      kind: "note.operator",
+      severity: "info",
+      summary: `NOTE [${r.source}]${r.strategy ? ` (${r.strategy})` : ""}: ${r.text.slice(0, 120)}${r.text.length > 120 ? "…" : ""}`,
+      refs: { type: "note", id: r.id, strategy: r.strategy ?? undefined },
+      details: { text: r.text, strategy: r.strategy, source: r.source },
+    });
+  }
+  return out;
+}
+
 export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[] {
   const { sinceIso, untilIso } = resolveWindow({ sinceIso: args.sinceIso, untilIso: args.untilIso });
   const filter = {
@@ -942,8 +975,12 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   const signalRows = (args.injects?.signalEventsFn ?? listSignalEvents)({ limit: sourceLimit });
   const signalEvents = collectSignalEvents({ rows: signalRows, filter, sinceIso, untilIso });
 
+  // v37: operator notes — the human layer.
+  const noteRows = (args.injects?.notesFn ?? listOperatorNotes)({ limit: sourceLimit, since: sinceIso });
+  const noteEvents = collectNoteEvents({ rows: noteRows, filter, sinceIso, untilIso });
+
   // Merge.
-  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents, ...signalEvents];
+  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents, ...signalEvents, ...noteEvents];
 
   // Stable sort: newest first by `at`, then by `kind` for
   // determinism when multiple events share a millisecond.

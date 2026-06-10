@@ -1208,6 +1208,24 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_config_history_at ON config_history (saved_at);
   `,
+
+  // v37 — operator notes. The forensic timeline was all machine
+  // events; this adds the HUMAN layer: "moved the stop because…",
+  // "rotated RPC, base was flaky", an agent recording its reasoning
+  // for the next session. Notes merge into the unified timeline
+  // (kind note.operator) so "what did I do around the time things
+  // broke" is one view. No auto-retention — human context is the
+  // most precious forensic data; deletion is explicit (note rm).
+  `
+  CREATE TABLE IF NOT EXISTS operator_notes (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    at        TEXT NOT NULL,
+    text      TEXT NOT NULL,
+    strategy  TEXT,
+    source    TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_operator_notes_at ON operator_notes (at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3783,6 +3801,46 @@ export function recordScheduleError(
        retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+// ── operator notes (v37) ────────────────────────────────────
+
+export interface OperatorNoteRow {
+  id: number;
+  at: string;
+  text: string;
+  strategy: string | null;
+  source: string;
+}
+
+export function insertOperatorNote(args: { at: string; text: string; strategy?: string | null; source: string }): number {
+  const db = openDb();
+  const r = db
+    .prepare(`INSERT INTO operator_notes (at, text, strategy, source) VALUES (?, ?, ?, ?)`)
+    .run(args.at, args.text, args.strategy ?? null, args.source);
+  return Number(r.lastInsertRowid);
+}
+
+export function listOperatorNotes(filter: { strategy?: string; limit?: number; since?: string } = {}): OperatorNoteRow[] {
+  const db = openDb();
+  const args: unknown[] = [];
+  let sql = `SELECT * FROM operator_notes WHERE 1=1`;
+  if (filter.strategy) {
+    sql += " AND strategy = ?";
+    args.push(filter.strategy);
+  }
+  if (filter.since) {
+    sql += " AND at >= ?";
+    args.push(filter.since);
+  }
+  sql += " ORDER BY at DESC LIMIT ?";
+  args.push(filter.limit ?? 50);
+  return db.prepare(sql).all(...(args as never[])) as unknown as OperatorNoteRow[];
+}
+
+export function deleteOperatorNote(id: number): number {
+  const db = openDb();
+  return Number(db.prepare(`DELETE FROM operator_notes WHERE id = ?`).run(id).changes);
 }
 
 // ── config history (v36) ────────────────────────────────────

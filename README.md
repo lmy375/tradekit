@@ -1750,6 +1750,10 @@ tradekit config rollback 13 --yes      # schema-validated restore + SIGHUP hot-r
 
 Design points: recording is **best-effort and never blocks the save** (the file write is the contract); it only starts once the DB exists (a pure-config user doesn't get a database spawned by `config set`); identical content dedupes by hash so idempotent re-saves don't pile rows. Rollback **parses the stored snapshot through the current schema first** — old versions forward-fill newer fields with their defaults instead of stripping them, and hard validation errors abort before anything is written. A rollback records a *new* version: history only grows, the mistaken version stays for forensics. Prunable via `db.retention.configHistoryDays`.
 
+#### Operator notes — the timeline's human layer (v37)
+
+The forensic timeline was all machine events. Real incident reviews need the human side too: *why* did the operator move that stop, *what* was happening when the RPC got rotated. `tradekit note add "tightened the ETH trail — CPI print tomorrow" --strategy playbook:7` records an annotation that merges into the unified timeline (`note.operator`, shown beside fills/journals/alerts in the CLI, web Timeline tab, and MCP `timeline_query`) — "what did I do around the time things broke" becomes one view. Untagged notes are **global context** and deliberately survive any strategy filter (a rotated RPC matters to every strategy's investigation); tagged notes scope. Agents get `note_add`/`note_list` over MCP — an agent recording its reasoning is handoff gold for the next session and for the human reviewing it. No auto-retention: human context is the most precious forensic data; deletion is explicit (`note rm`).
+
 #### Realized-gains export (v36) — tax season, one command
 
 ```bash

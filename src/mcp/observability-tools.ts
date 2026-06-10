@@ -569,6 +569,51 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── operator notes ────────────────────────────────────────
+  server.tool(
+    "note_add",
+    "v37: record an annotation into the forensic timeline (kind note.operator) — the HUMAN/AGENT layer of the otherwise machine-only stream. Use it to leave reasoning for the next session or the operator: why you adjusted a stop, why you paused a strategy, what you observed before acting. Notes tagged with a strategy appear under that strategy's timeline filter; untagged notes are global context. Max 2000 chars. Returns { id, at }.",
+    {
+      text: z.string().min(1).max(2000).describe("What was done and WHY — the next reader's context."),
+      strategy: z.string().optional().describe("Optional strategy tag this note concerns."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("note_add", rt.opts, input, undefined, async () => {
+            const { insertOperatorNote } = await import("../db.js");
+            const at = new Date().toISOString();
+            const id = insertOperatorNote({ at, text: input.text, strategy: input.strategy ?? null, source: "mcp" });
+            return { id, at };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "note_list",
+    "v37: list operator/agent notes (newest first). The human layer of the forensic timeline — read these FIRST when investigating: they explain the why behind the machine events.",
+    {
+      strategy: z.string().optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("note_list", rt.opts, input, undefined, async () => {
+            const { listOperatorNotes } = await import("../db.js");
+            return { notes: listOperatorNotes({ strategy: input.strategy, limit: input.limit }) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── realized gains ────────────────────────────────────────
   server.tool(
     "gains_report",

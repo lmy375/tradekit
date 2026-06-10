@@ -583,6 +583,13 @@ async function main() {
         break;
       }
 
+      // v37: operator notes — the forensic timeline's human layer.
+      case "note": {
+        const { noteCommand } = await import("./cli/note.js");
+        await noteCommand(action, flags, positional);
+        break;
+      }
+
       // v36: realized-gains export (tax season).
       case "export": {
         const { exportCommand } = await import("./cli/export.js");
@@ -760,7 +767,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

@@ -978,3 +978,53 @@ describe("collectSignalEvents", () => {
     })).toHaveLength(0); // outside window
   });
 });
+
+// ── v37: operator notes ──────────────────────────────────────
+
+describe("collectNoteEvents", () => {
+  const window = { sinceIso: "2026-06-10T00:00:00Z", untilIso: "2026-06-11T00:00:00Z" };
+  const note = (over: Record<string, unknown> = {}) => ({
+    id: 1, at: "2026-06-10T12:00:00Z", text: "rotated RPC, base was flaky", strategy: null, source: "cli",
+    ...over,
+  });
+
+  it("renders the human layer with source + truncated text", async () => {
+    const { collectNoteEvents } = await import("./timeline.js");
+    const events = collectNoteEvents({ rows: [note()] as never, filter: {}, ...window });
+    expect(events).toHaveLength(1);
+    expect(events[0].kind).toBe("note.operator");
+    expect(events[0].severity).toBe("info");
+    expect(events[0].summary).toMatch(/NOTE \[cli\]: rotated RPC/);
+  });
+
+  it("untagged notes SURVIVE a strategy filter (global context); tagged notes scope", async () => {
+    const { collectNoteEvents } = await import("./timeline.js");
+    const rows = [note(), note({ id: 2, strategy: "playbook:7", text: "tightened the trail" })] as never;
+    const filtered = collectNoteEvents({ rows, filter: { strategy: "playbook:9" }, ...window });
+    // The global note survives; the playbook:7 note is filtered out.
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].details!.strategy).toBeNull();
+    const matching = collectNoteEvents({ rows, filter: { strategy: "playbook:7" }, ...window });
+    expect(matching).toHaveLength(2); // global + matching tag
+  });
+
+  it("window + kind filters apply", async () => {
+    const { collectNoteEvents } = await import("./timeline.js");
+    expect(collectNoteEvents({ rows: [note({ at: "2026-06-09T00:00:00Z" })] as never, filter: {}, ...window })).toHaveLength(0);
+    expect(collectNoteEvents({ rows: [note()] as never, filter: { kinds: ["trade.fill"] }, ...window })).toHaveLength(0);
+  });
+});
+
+describe("operator notes — end to end through collectTimeline", () => {
+  it("notes merge into the unified stream", async () => {
+    const { insertOperatorNote, openDb } = await import("./db.js");
+    const { collectTimeline } = await import("./timeline.js");
+    insertOperatorNote({ at: new Date().toISOString(), text: "e2e note", strategy: null, source: "cli" });
+    try {
+      const events = collectTimeline({ kinds: ["note.operator"], sinceIso: new Date(Date.now() - 60_000).toISOString() });
+      expect(events.some((e) => e.summary.includes("e2e note"))).toBe(true);
+    } finally {
+      openDb().exec("DELETE FROM operator_notes");
+    }
+  });
+});
