@@ -651,6 +651,21 @@ Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) 
 
 **Resetting after acknowledgment.** When the operator has investigated + addressed an alert, `tradekit strategy alerts reset --tag X --rule Y` clears the state row so the rule re-arms. The next violation emits a fresh fire notification — useful when the underlying issue gets re-triggered later.
 
+#### Emergency stop — `tradekit panic`
+
+When something is wrong — compromised-key suspicion, a runaway strategy, exchange-wide chaos — the operator should not have to remember four commands and a tag list. One command composes the safety primitives:
+
+```bash
+tradekit panic --reason "key may be leaked"
+# → engine LOCKED (every fire path gates on the lock from the next tick)
+# → every active order / schedule / rebalance plan PAUSED — tagged or untagged
+tradekit panic --cancel-orders --yes      # terminal variant: orders cancelled, not paused
+tradekit panic release                    # unlock; everything STAYS paused for selective resume
+tradekit panic release --resume-all       # false alarm — resume everything (schedules recompute next_run_at)
+```
+
+The two layers are deliberate: the engine lock acts fastest, the pause makes the stop **durable across an unlock** and explicit in every list view. Release defaults to unlock-only because panic decisions are made under stress — resuming is the calm-state decision (`strategy resume <tag>` / `order resume <id>`). `--cancel-orders` always requires the explicit `--yes` (an interactive prompt under stress invites mistakes in both directions). A critical `engine.panic` notification (which breaks through quiet hours by severity) records the counts. **Not exposed over MCP** — the same CLI-only safety boundary as backup: an agent, or a prompt-injected agent, must be unable to mass-cancel orders or release a human-engaged panic.
+
 #### Circuit breaker — alerts that act, not just notify
 
 A notification at 3am is only useful if someone is awake to read it. Any alert rule can carry `"action": "pause"` — when it fires, the watcher doesn't just notify: it **bulk-pauses every primitive the strategy owns** (orders, schedules, rebalance plans) and emits a critical `strategy.alert.circuit_breaker` notification listing exactly what was paused. The system protects itself first; the operator investigates at a humane hour.

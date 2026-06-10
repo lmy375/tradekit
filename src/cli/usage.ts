@@ -9,6 +9,15 @@ export function printUsage() {
 Usage: tradekit <command> [action] [options]
 
 OVERVIEW
+  panic [--reason "..."] [--cancel-orders] [--yes] [--json]
+        EMERGENCY STOP: locks the engine (every fire path gates on the lock
+        from the next tick) AND pauses every active order / schedule /
+        rebalance plan — tagged or not. Reversible by design; --cancel-orders
+        is TERMINAL and demands an explicit --yes. CLI-only (no MCP — same
+        safety boundary as backup: agents can neither engage nor release it).
+  panic release [--resume-all] [--yes] [--json]
+        Unlock the engine. Default leaves everything PAUSED for selective
+        resume after investigating; --resume-all is the false-alarm lever.
   health [--accounts X,Y | --accounts all] [--chains a,b,c] [--quiet] [--strict] [--summary] [--json] [--watch N]
         --quiet: filter nextActions to severity=critical (for cron tail loops)
         --strict: exit 1 when any critical nextAction or per-section error (iter755 — cron alerting gate)

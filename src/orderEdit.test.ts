@@ -349,3 +349,25 @@ describe("renderDiffForJournal", () => {
     expect(out).toBe('{"note":[null,"x"]}');
   });
 });
+
+// ── v35.5: dynamic sizing through the edit path ──────────────
+
+describe("editOrder — dynamic-amount sentinels", () => {
+  it("accepts spend-side max and normalizes case", () => {
+    const id = seedTrailing(); // sell trailing
+    const result = editOrder({ id, changes: { baseAmount: "MAX" } });
+    expect(result.diff.find((d) => d.field === "baseAmount")?.newValue).toBe("max");
+    expect(getOrderById(id)?.base_amount).toBe("max");
+  });
+
+  it("accepts spend-side percentages verbatim", () => {
+    const id = seedTrailing();
+    editOrder({ id, changes: { baseAmount: "37.5%" } });
+    expect(getOrderById(id)?.base_amount).toBe("37.5%");
+  });
+
+  it("rejects out-of-range percentages that parseFloat would mis-accept", () => {
+    const id = seedTrailing();
+    expect(() => editOrder({ id, changes: { baseAmount: "150%" } })).toThrow(/percentage/);
+  });
+});

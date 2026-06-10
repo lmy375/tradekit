@@ -583,6 +583,15 @@ async function main() {
         break;
       }
 
+      // Emergency stop: engine lock + pause everything in one command.
+      // CLI-only by design (no MCP exposure — same safety boundary as
+      // backup).
+      case "panic": {
+        const { panicCommand } = await import("./cli/panic.js");
+        await panicCommand(action, flags, positional);
+        break;
+      }
+
       // Funding-runway forecast: will live automation run out of
       // money, and when? Walks upcoming schedule fires + reserved
       // order spends against current balances.
@@ -729,7 +738,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

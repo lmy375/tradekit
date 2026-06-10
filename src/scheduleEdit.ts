@@ -30,6 +30,7 @@
 // ──────────────────────────────────────────────────────────────────
 
 import { ToolError } from "./errors.js";
+import { validateSpendAmounts } from "./orders.js";
 import { loadConfig, type Config } from "./config.js";
 import {
   getScheduleById,
@@ -166,25 +167,25 @@ export function validateScheduleEdit(args: {
           : "Specify exactly one of baseAmount / quoteAmount; cannot have both unset.",
       );
     }
-    if (hasBase) {
-      const p = parseFloat(afterBase as string);
-      if (!Number.isFinite(p) || p <= 0) {
-        throw new ToolError("INVALID_PARAMS", `baseAmount must be a positive decimal string (got "${afterBase}").`);
-      }
+    // v35.5: same validation as create — positive decimal OR a
+    // spend-side dynamic sentinel ("max" / "N%"). Pre-fix the edit
+    // path rejected valid sentinels (parseFloat("max") is NaN) AND
+    // accepted invalid ones ("150%" parsed as 150 plain tokens).
+    const normalizedAmounts = validateSpendAmounts({
+      side: schedule.side,
+      baseAmount: hasBase ? (afterBase as string) : null,
+      quoteAmount: hasQuote ? (afterQuote as string) : null,
+      context: "schedule edit",
+    });
+    const baseToStore = hasBase ? normalizedAmounts.baseAmount : null;
+    const quoteToStore = hasQuote ? normalizedAmounts.quoteAmount : null;
+    if ("baseAmount" in changes && !fieldEqual(schedule.base_amount, baseToStore)) {
+      dbChanges.base_amount = baseToStore;
+      diff.push({ field: "baseAmount", oldValue: schedule.base_amount, newValue: baseToStore });
     }
-    if (hasQuote) {
-      const p = parseFloat(afterQuote as string);
-      if (!Number.isFinite(p) || p <= 0) {
-        throw new ToolError("INVALID_PARAMS", `quoteAmount must be a positive decimal string (got "${afterQuote}").`);
-      }
-    }
-    if ("baseAmount" in changes && !fieldEqual(schedule.base_amount, afterBase)) {
-      dbChanges.base_amount = afterBase;
-      diff.push({ field: "baseAmount", oldValue: schedule.base_amount, newValue: afterBase });
-    }
-    if ("quoteAmount" in changes && !fieldEqual(schedule.quote_amount, afterQuote)) {
-      dbChanges.quote_amount = afterQuote;
-      diff.push({ field: "quoteAmount", oldValue: schedule.quote_amount, newValue: afterQuote });
+    if ("quoteAmount" in changes && !fieldEqual(schedule.quote_amount, quoteToStore)) {
+      dbChanges.quote_amount = quoteToStore;
+      diff.push({ field: "quoteAmount", oldValue: schedule.quote_amount, newValue: quoteToStore });
     }
   }
 
