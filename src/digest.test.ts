@@ -328,6 +328,8 @@ const emptyFires = () => ({
   schedulesFired: 0, rebalanceRuns: 0,
   scheduleJournalEnabled: false, scheduleFireCount: 0, scheduleFireFailures: 0, scheduleHookFailures: 0,
   rebalanceJournalEnabled: false, rebalanceExecutedCount: 0, rebalanceInBandCount: 0, rebalanceFailureCount: 0,
+    signalsReceived: 0,
+    signalsFired: 0,
   recentFills: [],
 });
 const emptyAlerts = () => ({ fired: 0, resolved: 0, currentlyActive: 0, topRules: [] });
@@ -609,5 +611,22 @@ describe("gatherDigest — equity section", () => {
     const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000 });
     expect(r.equity).toBeNull();
     expect(r.verdict).toBeDefined();
+  });
+});
+
+describe("gatherDigest — signal counts (v36.5)", () => {
+  it("counts received vs fired in the window", async () => {
+    const { insertSignalEvent, consumeSignalEvent, openDb } = await import("./db.js");
+    const now = new Date().toISOString();
+    const a = insertSignalEvent({ name: "s1", receivedAt: now, source: "cli" });
+    insertSignalEvent({ name: "s2", receivedAt: now, source: "webhook" }); // never fires
+    consumeSignalEvent(a, now, 42);
+    try {
+      const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000 });
+      expect(r.fires.signalsReceived).toBe(2);
+      expect(r.fires.signalsFired).toBe(1);
+    } finally {
+      openDb().exec("DELETE FROM signal_events");
+    }
   });
 });

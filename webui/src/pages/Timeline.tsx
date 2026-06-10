@@ -41,6 +41,7 @@ const KIND_GROUPS: Record<string, string[]> = {
   schedules: ["schedule.journal"],
   rebalance: ["rebalance.journal"],
   alerts: ["alert.fired", "alert.resolved", "alert.breaker"],
+  signals: ["signal.received"],
   audit: ["audit.tool", "audit.error"],
   engine: [
     "engine.started", "engine.stopped", "engine.lock", "engine.unlock",

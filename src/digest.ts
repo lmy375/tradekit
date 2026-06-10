@@ -38,6 +38,7 @@ import {
   type OrderRow,
   type ScheduleRow,
   type RebalanceRow,
+  listSignalEvents,
 } from "./db.js";
 import { computeBudgetConsumption } from "./strategyBudget.js";
 import { loadConfig, type Config } from "./config.js";
@@ -120,6 +121,12 @@ export interface FiresSection {
   rebalanceExecutedCount: number;
   rebalanceInBandCount: number;
   rebalanceFailureCount: number;
+  /** v36.5: external signal events received in the window, and how
+   *  many of those fired at least one order. A non-zero gap means
+   *  alerts arrived that fired NOTHING — the integration-debugging
+   *  signal. */
+  signalsReceived: number;
+  signalsFired: number;
   /** Most recently fired orders (top 5). */
   recentFills: Array<{
     orderId: number;
@@ -508,12 +515,27 @@ function gatherFiresWithUntil(args: { since: string; until?: string; config: Con
   }
 
   const jc = journalCounts({ since: args.since, until: args.until });
+
+  // v36.5: signal-inbox counts. listSignalEvents is newest-first;
+  // window-filter in JS (the table stays small via retention).
+  let signalsReceived = 0;
+  let signalsFired = 0;
+  try {
+    for (const ev of listSignalEvents({ limit: 1000 })) {
+      if (!inWindow(ev.received_at, args)) continue;
+      signalsReceived += 1;
+      if (ev.consumed_by_order != null) signalsFired += 1;
+    }
+  } catch { /* pre-v35 db — section reads 0 */ }
+
   return {
     ordersFilled, ordersCancelled, ordersExpired, ordersFailed,
     schedulesFired, rebalanceRuns,
     scheduleJournalEnabled: args.config.engine.scheduleJournal?.enabled === true,
     rebalanceJournalEnabled: args.config.engine.rebalanceJournal?.enabled === true,
     ...jc,
+    signalsReceived,
+    signalsFired,
     recentFills,
   };
 }

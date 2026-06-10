@@ -135,6 +135,10 @@ function renderFiresText(f: FiresSection, prior?: FiresSection): string {
     lines.push(`  Rebalance runs:   ${f.rebalanceRuns}${exact}`);
   }
   if (f.rebalanceFailureCount > 0) lines.push(`  Rebalance failures: ${f.rebalanceFailureCount}  ⚠`);
+  if (f.signalsReceived > 0) {
+    const unclaimed = f.signalsReceived - f.signalsFired;
+    lines.push(`  Signals received: ${f.signalsReceived} (${f.signalsFired} fired${unclaimed > 0 ? `, ${unclaimed} fired NOTHING ⚠` : ""})`);
+  }
   if (f.recentFills.length > 0) {
     lines.push(`  Recent fills:`);
     for (const fill of f.recentFills) {

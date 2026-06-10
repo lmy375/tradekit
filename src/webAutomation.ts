@@ -348,6 +348,19 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── signal inbox ──────────────────────────────────────────
+  app.get(
+    "/api/signals",
+    wrap(async (req, res) => {
+      const { listSignalEvents } = await import("./db.js");
+      const events = listSignalEvents({
+        name: qStr(req, "name"),
+        limit: qInt(req, "limit", { min: 1, max: 500, fallback: 50 }),
+      });
+      res.json({ ok: true, count: events.length, events });
+    }),
+  );
+
   // ── funding runway ────────────────────────────────────────
   // On-demand (the UI computes it behind a button, not on the
   // auto-refresh loop): real buckets read on-chain balances, which

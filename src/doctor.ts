@@ -1279,6 +1279,32 @@ export async function checkPausedForgotten(): Promise<CheckResult> {
   }
 }
 
+/** v36.5: signal-armed orders need an ingestion path. If the
+ *  webhook secret is unset, signals can only arrive via CLI/MCP —
+ *  fine for agent-driven flows, but an operator who armed orders for
+ *  TradingView alerts is silently waiting forever. */
+export async function checkSignalReadiness(): Promise<CheckResult> {
+  try {
+    const { listOrders } = await import("./db.js");
+    const armed = listOrders({ status: "active" }).filter((o) => o.trigger_type === "signal");
+    if (armed.length === 0) {
+      return { name: "signals", severity: "ok", message: "no signal-armed orders" };
+    }
+    const config = loadConfig();
+    if (!config.webhooks?.signalSecret) {
+      return {
+        name: "signals",
+        severity: "warn",
+        message: `${armed.length} signal-armed order(s) but webhooks.signalSecret is UNSET — the webhook endpoint is disabled (signals only arrive via 'tradekit signal fire' / MCP)`,
+        hint: "wire TradingView: `tradekit config set webhooks.signalSecret <16+ random chars>` then POST /api/signal/<name>?key=<secret>",
+      };
+    }
+    return { name: "signals", severity: "ok", message: `${armed.length} signal-armed order(s) · webhook ingestion enabled` };
+  } catch (e) {
+    return { name: "signals", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
 export async function checkEnv(): Promise<CheckResult> {
   const SENSITIVE = new Set(["WALLET_PASS", "TRADEKIT_WEB_TOKEN"]);
   const KNOWN = [
@@ -1394,6 +1420,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ timestamp: strin
   results.push(await checkQuietHours());
   results.push(await checkRetryParked());
   results.push(await checkPausedForgotten());
+  results.push(await checkSignalReadiness());
 
   // RPCs (parallel)
   results.push(...(await Promise.all(chains.map((c) => checkRpc(c, opts.logger)))));

@@ -513,3 +513,34 @@ describe("checkPausedForgotten", () => {
     }
   });
 });
+
+describe("checkSignalReadiness", () => {
+  it("warns when signal-armed orders exist but the webhook secret is unset", async () => {
+    const { insertOrder, openDb } = await import("./db.js");
+    insertOrder({
+      side: "buy", trigger_type: "signal", target_price_usd: null, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false, expires_at: null,
+      strategy: null, note: null, group_id: null, paper: true,
+      signal_name: "tv-breakout",
+    });
+    try {
+      const { checkSignalReadiness } = await import("./doctor.js");
+      const r = await checkSignalReadiness();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(/signalSecret is UNSET/);
+      expect(r.hint).toMatch(/webhooks.signalSecret/);
+    } finally {
+      openDb().exec("DELETE FROM orders");
+    }
+  });
+
+  it("ok with no signal orders", async () => {
+    const { checkSignalReadiness } = await import("./doctor.js");
+    const r = await checkSignalReadiness();
+    expect(r.severity).toBe("ok");
+  });
+});

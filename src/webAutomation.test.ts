@@ -516,3 +516,16 @@ describe("POST /api/signal/:name", () => {
     }
   });
 });
+
+describe("GET /api/signals", () => {
+  it("lists the inbox with consumption state", async () => {
+    const { insertSignalEvent, openDb } = await import("./db.js");
+    insertSignalEvent({ name: "web-sig", receivedAt: new Date().toISOString(), source: "cli" });
+    const r = await get("/api/signals?name=web-sig");
+    expect(r.status).toBe(200);
+    const events = r.body.events as Array<{ name: string; consumed_at: string | null }>;
+    expect(events).toHaveLength(1);
+    expect(events[0].consumed_at).toBeNull();
+    openDb().exec("DELETE FROM signal_events");
+  });
+});

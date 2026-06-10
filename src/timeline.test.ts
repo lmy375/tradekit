@@ -926,3 +926,55 @@ describe("collectTimeline — v29 journal sources end-to-end", () => {
     expect(evs[1].kind).toBe("schedule.journal");
   });
 });
+
+// ── v36.5: signal events ─────────────────────────────────────
+
+describe("collectSignalEvents", () => {
+  const mkSignal = (over: Record<string, unknown> = {}) => ({
+    id: 1, name: "tv-breakout", received_at: "2026-06-10T12:00:00Z",
+    source: "webhook", payload_json: null, consumed_at: null, consumed_by_order: null,
+    ...over,
+  });
+  const window = { sinceIso: "2026-06-10T00:00:00Z", untilIso: "2026-06-11T00:00:00Z" };
+
+  it("consumed-by-order events are info with the order id in the summary", async () => {
+    const { collectSignalEvents } = await import("./timeline.js");
+    const events = collectSignalEvents({
+      rows: [mkSignal({ consumed_at: "2026-06-10T12:01:00Z", consumed_by_order: 7 })] as never,
+      filter: {},
+      ...window,
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0].severity).toBe("info");
+    expect(events[0].summary).toMatch(/fired order #7/);
+    expect(events[0].kind).toBe("signal.received");
+  });
+
+  it("PENDING and expired-unclaimed events are warn — the integration-debugging signal", async () => {
+    const { collectSignalEvents } = await import("./timeline.js");
+    const pending = collectSignalEvents({ rows: [mkSignal()] as never, filter: {}, ...window });
+    expect(pending[0].severity).toBe("warn");
+    expect(pending[0].summary).toMatch(/PENDING/);
+
+    const unclaimed = collectSignalEvents({
+      rows: [mkSignal({ consumed_at: "2026-06-10T13:00:00Z", consumed_by_order: null })] as never,
+      filter: {},
+      ...window,
+    });
+    expect(unclaimed[0].severity).toBe("warn");
+    expect(unclaimed[0].summary).toMatch(/UNCLAIMED/);
+  });
+
+  it("respects kind + severity filters and the window", async () => {
+    const { collectSignalEvents } = await import("./timeline.js");
+    expect(collectSignalEvents({ rows: [mkSignal()] as never, filter: { kinds: ["trade.fill"] }, ...window })).toHaveLength(0);
+    expect(collectSignalEvents({
+      rows: [mkSignal({ consumed_by_order: 1, consumed_at: "x" })] as never,
+      filter: { minSeverity: "warn" }, ...window,
+    })).toHaveLength(0); // info filtered out
+    expect(collectSignalEvents({
+      rows: [mkSignal({ received_at: "2026-06-09T00:00:00Z" })] as never,
+      filter: {}, ...window,
+    })).toHaveLength(0); // outside window
+  });
+});

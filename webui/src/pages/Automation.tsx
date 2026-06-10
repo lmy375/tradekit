@@ -275,9 +275,11 @@ export function Automation({ status: _status }: PageProps) {
   if (!engine || !alerts) return <Loader size="sm" />;
 
   const describeTrigger = (o: AutoOrderRow) =>
-    o.trigger_type === "trailing"
-      ? `trail ${o.trail_pct}%${o.water_mark_usd != null ? ` (hwm $${o.water_mark_usd})` : ""}`
-      : `${o.trigger_type === "price_below" ? "≤" : "≥"} $${o.target_price_usd}`;
+    o.trigger_type === "signal"
+      ? `on signal "${(o as { signal_name?: string | null }).signal_name ?? "?"}"`
+      : o.trigger_type === "trailing"
+        ? `trail ${o.trail_pct}%${o.water_mark_usd != null ? ` (hwm $${o.water_mark_usd})` : ""}`
+        : `${o.trigger_type === "price_below" ? "≤" : "≥"} $${o.target_price_usd}`;
 
   const targets = (p: AutoRebalanceRow): string => {
     try {

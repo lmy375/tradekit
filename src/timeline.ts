@@ -57,6 +57,8 @@ import {
   type OrderCheckLogRow,
   type StrategyAlertStateRow,
   type EngineEventRow,
+  listSignalEvents,
+  type SignalEventRow,
 } from "./db.js";
 
 // ── public types ────────────────────────────────────────────
@@ -94,6 +96,7 @@ export type EventKind =
   | "alert.fired"              // strategy_alert_state row turned active
   | "alert.resolved"           // strategy_alert_state row last_evaluated_at after first_triggered_at fell to active=0
   | "alert.breaker"            // circuit breaker paused a strategy's primitives (rule action: "pause")
+  | "signal.received"          // v35 external signal event arrived (webhook / cli / mcp), with consumption state
   // Iter39: durable engine state transitions from the v26
   // engine_events table. Replaces the iter36 audit_log heuristic
   // for these events — exact data, no inference.
@@ -115,6 +118,7 @@ export const ALL_EVENT_KINDS: EventKind[] = [
   "order.journal", "order.edited", "schedule.journal", "rebalance.journal",
   "audit.tool", "audit.error",
   "alert.fired", "alert.resolved", "alert.breaker",
+  "signal.received",
   "engine.started", "engine.stopped", "engine.lock", "engine.unlock",
   "worker.degraded", "worker.recovered", "config.reloaded", "config.reload_failed",
 ];
@@ -123,7 +127,7 @@ export interface EventRefs {
   /** Concrete primitive id when applicable (order id, schedule id,
    *  trade id, audit id, engine_event id). Used by the renderer
    *  for the "drill into this row" link. */
-  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event";
+  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event" | "signal";
   id: number | string;
   /** Chain / account / strategy denormalized so the consumer can
    *  filter without joining. Nullable when irrelevant. */
@@ -180,6 +184,7 @@ export interface TimelineInjections {
   journalFn?: (since: string, until: string, limit: number) => OrderCheckLogRow[];
   /** v29: schedule/rebalance decision-journal sources. */
   scheduleJournalFn?: (since: string, until: string, limit: number) => ScheduleCheckLogRow[];
+  signalEventsFn?: typeof listSignalEvents;
   rebalanceJournalFn?: (since: string, until: string, limit: number) => RebalanceCheckLogRow[];
   /** Iter39: engine_events table source. */
   engineEventsFn?: typeof listEngineEvents;
@@ -798,6 +803,49 @@ function severityAllowed(sev: EventSeverity, floor: EventSeverity | undefined): 
 /** End-to-end timeline construction. Each source is queried with
  *  the resolved window + filters; results are merged + sorted
  *  newest-first + limited. */
+/** v35 signal events → timeline. Consumed events are info ("alert
+ *  arrived, fired order #N"); PENDING and expired-unclaimed events
+ *  are warn — an alert that arrived and fired NOTHING is exactly
+ *  what an operator debugging a TradingView integration needs to
+ *  see. Signals are global (no chain/account); strategy filter
+ *  doesn't apply. */
+export function collectSignalEvents(args: {
+  rows: readonly SignalEventRow[];
+  filter: Pick<CollectTimelineArgs, "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const r of args.rows) {
+    if (r.received_at < args.sinceIso || r.received_at > args.untilIso) continue;
+    if (!kindAllowed("signal.received", args.filter.kinds)) continue;
+    const consumedByOrder = r.consumed_by_order != null;
+    const expiredUnclaimed = r.consumed_at != null && r.consumed_by_order == null;
+    const severity: EventSeverity = consumedByOrder ? "info" : "warn";
+    if (!severityAllowed(severity, args.filter.minSeverity)) continue;
+    const state = consumedByOrder
+      ? `fired order #${r.consumed_by_order}`
+      : expiredUnclaimed
+        ? "expired UNCLAIMED — nothing was armed"
+        : "PENDING";
+    out.push({
+      at: r.received_at,
+      kind: "signal.received",
+      severity,
+      summary: `SIGNAL "${r.name}" received [${r.source}] — ${state}`,
+      refs: { type: "signal", id: r.id },
+      details: {
+        name: r.name,
+        source: r.source,
+        consumedAt: r.consumed_at,
+        consumedByOrder: r.consumed_by_order,
+        payload: r.payload_json,
+      },
+    });
+  }
+  return out;
+}
+
 export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[] {
   const { sinceIso, untilIso } = resolveWindow({ sinceIso: args.sinceIso, untilIso: args.untilIso });
   const filter = {
@@ -890,8 +938,12 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   });
   const engineEvents = collectEngineEvents({ rows: engineRows, filter, sinceIso, untilIso });
 
+  // v35: signal inbox — global like engine events.
+  const signalRows = (args.injects?.signalEventsFn ?? listSignalEvents)({ limit: sourceLimit });
+  const signalEvents = collectSignalEvents({ rows: signalRows, filter, sinceIso, untilIso });
+
   // Merge.
-  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents];
+  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents, ...signalEvents];
 
   // Stable sort: newest first by `at`, then by `kind` for
   // determinism when multiple events share a millisecond.
