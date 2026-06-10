@@ -490,6 +490,17 @@ BACKTESTING (historical strategy simulation)
         single-strategy commands. Base/quote inferred from the first non-rebalance
         strategy when --base / --quote aren't passed.
         Templates supported: --var / --vars-file work identically to 'playbook deploy'.
+  backtest rebalance --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]'
+                     [--drift-threshold 5] [--min-trade-usd 10] [--cron "..."|--every 6h]
+                     [--quote-token USDC] [--slippage-bps N] [--max-runs N]
+                     [--balance '{"ETH":1,"USDC":2000}' | --initial-usd 10000]
+                     [--since 90d] [--chain X] [--json]
+        Multi-asset rebalance backtest — one CoinGecko series per target (stablecoins
+        synthesize a flat $1 series). Walks the cron's occurrences across the window,
+        fires corrective legs with the live engine's mechanics (sells fund the quote
+        anchor, buys draw from it, per-leg min-trade skip, shortfall clamps). Default
+        starting book: --initial-usd split at target weights at window-start prices,
+        so PnL − hold-PnL is the pure REBALANCING ALPHA vs HODL of the same book.
   backtest compare <scenarios.json>
                     --balance '{"ETH":1,"USDC":3000}'
                     --since 60d [--chain X] [--json]
@@ -503,7 +514,7 @@ BACKTESTING (historical strategy simulation)
         Recent comparison runs, newest-first. Shows pair, scenario count, winner.
   backtest compare show <id> [--json]
         Re-render a stored comparison without re-running simulations.
-  backtest list [--strategy-type order|schedule] [--chain X] [--limit N] [--json]
+  backtest list [--strategy-type order|schedule|playbook|rebalance] [--chain X] [--limit N] [--json]
         Recent backtest runs sorted newest-first. Shows pair, fire count, strategy PnL, hold PnL.
   backtest show <id> [--json]
         Full detail including spec, balances, fire timeline, and Vs-hold comparison.

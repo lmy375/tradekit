@@ -30,7 +30,7 @@ import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { ToolError } from "../errors.js";
 import { loadConfig, resolveProfile } from "../config.js";
-import { resolveTradePair } from "../chains.js";
+import { resolveTradePair, resolveToken } from "../chains.js";
 import {
   simulateOrder,
   simulateSchedule,
@@ -389,8 +389,8 @@ export async function backtestScheduleCommand(flags: Record<string, string>) {
 
 export async function backtestListCommand(flags: Record<string, string>) {
   const strategyType = flags["strategy-type"];
-  if (strategyType != null && strategyType !== "order" && strategyType !== "schedule") {
-    throw new ToolError("INVALID_PARAMS", `--strategy-type must be 'order' or 'schedule' (got "${strategyType}").`);
+  if (strategyType != null && strategyType !== "order" && strategyType !== "schedule" && strategyType !== "playbook" && strategyType !== "rebalance") {
+    throw new ToolError("INVALID_PARAMS", `--strategy-type must be order | schedule | playbook | rebalance (got "${strategyType}").`);
   }
   const limit = parseIntFlag(flags["limit"], "--limit", { min: 1, max: 1000 }) ?? 50;
   const rows = listBacktestRuns({
@@ -484,6 +484,24 @@ function renderRowText(row: BacktestRunRow): string {
   lines.push(`  Vs hold:       ${verb} by ${fmtSignedUsd(diff)}`);
   if (row.notes) {
     lines.push(`  Notes:         ${row.notes}`);
+  }
+  if (row.strategy_type === "rebalance") {
+    // Rebalance fires carry per-leg detail instead of a single price.
+    const fires = JSON.parse(row.fires_json) as Array<{
+      ts: string; maxDriftPct: number;
+      legs: Array<{ side: string; symbol: string; amountUsd: number; clamped?: boolean }>;
+    }>;
+    lines.push("");
+    if (fires.length === 0) {
+      lines.push(`  No corrections fired.`);
+    } else {
+      lines.push(`  Corrections (${fires.length}):`);
+      for (const f of fires) {
+        const legs = f.legs.map((l) => `${l.side} ${l.symbol} $${fmt(l.amountUsd, 0)}${l.clamped ? "⚠" : ""}`).join(", ");
+        lines.push(`    ● ${f.ts}  drift ${fmt(f.maxDriftPct, 1)}%  ${legs}`);
+      }
+    }
+    return lines.join("\n");
   }
   const fires = JSON.parse(row.fires_json) as Array<{ ts: string; action: string; priceUsd: number; note?: string }>;
   if (fires.length === 0) {
@@ -880,6 +898,178 @@ async function backtestCompareShowCommand(flags: Record<string, string>, positio
 
 // ── dispatch ─────────────────────────────────────────────────
 
+// ── rebalance backtest ───────────────────────────────────────
+//
+// The multi-asset case. One CoinGecko series per target token (the
+// quote anchor synthesizes a flat $1 series when it's a recognized
+// stablecoin without burning a CoinGecko call). Initial book defaults
+// to $10k split at target weights at window-start prices — every
+// later fire is then attributable to market drift, and the HODL
+// counterfactual directly answers "did rebalancing add anything?".
+
+const STABLE_SYMBOLS = new Set(["USDC", "USDT", "DAI", "USDBC", "USDC.E", "LUSD", "GUSD", "FRAX"]);
+
+export async function backtestRebalanceCommand(flags: Record<string, string>) {
+  const config = loadConfig();
+  const chainName = flags["chain"] ?? config.activeChain;
+  const profile = resolveProfile(chainName, config);
+  const {
+    simulateRebalance,
+    validateRebalanceBacktestSpec,
+    constantSeries,
+    defaultInitialBalance,
+  } = await import("../backtestRebalance.js");
+
+  // --targets — same JSON shape rebalance create takes.
+  const targetsRaw = flags["targets"];
+  if (!targetsRaw) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `--targets is required, e.g. --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]'`,
+    );
+  }
+  let targetsParsed: unknown;
+  try {
+    targetsParsed = JSON.parse(targetsRaw);
+  } catch (e) {
+    throw new ToolError("INVALID_PARAMS", `--targets is not valid JSON: ${(e as Error).message}`);
+  }
+  if (!Array.isArray(targetsParsed)) {
+    throw new ToolError("INVALID_PARAMS", `--targets must be a JSON array of { token, targetPct }.`);
+  }
+  const targets = (targetsParsed as Array<{ token?: string; targetPct?: number }>).map((t) => {
+    if (!t || typeof t.token !== "string" || typeof t.targetPct !== "number") {
+      throw new ToolError("INVALID_PARAMS", `every --targets entry needs { token, targetPct }.`);
+    }
+    return { symbol: t.token.toUpperCase(), targetPct: t.targetPct };
+  });
+
+  const quoteSymbol = (flags["quote-token"] ?? "USDC").toUpperCase();
+  const spec = {
+    targets,
+    driftThresholdPct: parseFloatFlag(flags["drift-threshold"], "--drift-threshold", { min: 0, max: 100 }) ?? undefined,
+    minTradeUsd: parseFloatFlag(flags["min-trade-usd"], "--min-trade-usd", { min: 0 }) ?? undefined,
+    cron: flags["cron"] ?? (flags["every"] ? durationToCron(flags["every"]) : undefined),
+    maxRuns: parseIntFlag(flags["max-runs"], "--max-runs", { min: 1 }) ?? undefined,
+    slippageBps: parseIntFlag(flags["slippage-bps"], "--slippage-bps", { min: 0, max: 10_000 }) ?? undefined,
+    quoteSymbol,
+  };
+  // Validate upfront — catches sum/threshold errors before the
+  // (slow) CoinGecko fan-out.
+  validateRebalanceBacktestSpec(spec);
+
+  const since = flags["since"] ?? "90d";
+  const days = parseSinceDuration(since);
+  const windowStartIso = new Date(Date.now() - days * 86_400_000).toISOString();
+  const windowEndIso = new Date().toISOString();
+
+  // One series per distinct symbol (targets + anchor). Sequential
+  // fetch — CoinGecko free tier rate-limits aggressive parallelism.
+  const symbols = new Set<string>(targets.map((t) => t.symbol));
+  symbols.add(quoteSymbol);
+  const series: Record<string, PriceSeries> = {};
+  let totalPoints = 0;
+  for (const sym of symbols) {
+    const addr = resolveToken(profile, sym);
+    let s: PriceSeries | null = null;
+    if (addr) {
+      s = await fetchPriceSeries(addr, days).catch((e) => {
+        if (STABLE_SYMBOLS.has(sym)) return null; // fall through to synthetic
+        throw e;
+      });
+    }
+    if (!s && STABLE_SYMBOLS.has(sym)) {
+      s = constantSeries(sym, windowStartIso, windowEndIso);
+    }
+    if (!s) {
+      throw new ToolError(
+        "UNKNOWN_TOKEN",
+        `No price series for ${sym} on ${profile.name} — backtest targets must be CoinGecko-listed (or recognized stablecoins).`,
+      );
+    }
+    series[sym] = s;
+    totalPoints += s.points.length;
+  }
+
+  const initialBalance = flags["balance"]
+    ? parseBalance(flags["balance"])
+    : defaultInitialBalance({
+        spec,
+        series,
+        totalUsd: parseFloatFlag(flags["initial-usd"], "--initial-usd", { min: 0 }) ?? undefined,
+      });
+
+  const result = simulateRebalance({ spec, initialBalance, series });
+
+  const baseSymbol = targets.map((t) => t.symbol).join("+");
+  const rowId = insertBacktestRun({
+    strategyType: "rebalance",
+    chain: profile.name,
+    baseSymbol,
+    quoteSymbol,
+    specJson: JSON.stringify(spec),
+    initialBalanceJson: JSON.stringify(initialBalance),
+    finalBalanceJson: JSON.stringify(result.finalBalance),
+    windowStart: result.windowStart,
+    windowEnd: result.windowEnd,
+    points: totalPoints,
+    firesJson: JSON.stringify(result.fires),
+    fireCount: result.fires.length,
+    pnlUsd: result.pnlUsd,
+    holdPnlUsd: result.holdPnlUsd,
+    notes: result.notes.join("; ") || null,
+  });
+
+  if (flags["json"] != null) {
+    printJson({
+      ok: true,
+      backtest_id: rowId,
+      strategy_type: "rebalance",
+      chain: profile.name,
+      targets,
+      quote_symbol: quoteSymbol,
+      spec,
+      initial_balance: initialBalance,
+      window_start: result.windowStart,
+      window_end: result.windowEnd,
+      evaluations: result.evaluations,
+      skipped_in_band: result.skippedInBand,
+      fires: result.fires,
+      final_balance: result.finalBalance,
+      initial_usd: result.initialUsd,
+      final_usd: result.finalUsd,
+      pnl_usd: result.pnlUsd,
+      hold_final_usd: result.holdFinalUsd,
+      hold_pnl_usd: result.holdPnlUsd,
+      notes: result.notes,
+    });
+    return;
+  }
+
+  const lines: string[] = [];
+  lines.push(`Backtest #${rowId} (rebalance)`);
+  lines.push(`  Targets:       ${targets.map((t) => `${t.symbol}=${t.targetPct}%`).join(" / ")}`);
+  lines.push(`  Threshold:     ${spec.driftThresholdPct ?? 5}% drift   minTrade $${spec.minTradeUsd ?? 10}   anchor ${quoteSymbol}${spec.slippageBps ? `   slippage ${spec.slippageBps}bps` : ""}`);
+  lines.push(`  Window:        ${result.windowStart} → ${result.windowEnd}`);
+  lines.push(`  Evaluations:   ${result.evaluations}  (${result.fires.length} fired, ${result.skippedInBand} in-band)`);
+  lines.push("");
+  lines.push(`  Strategy PnL:  ${fmtSignedUsd(result.pnlUsd)}  (${fmtSignedUsd(result.initialUsd)} → ${fmtSignedUsd(result.finalUsd)})`);
+  lines.push(`  Hold PnL:      ${fmtSignedUsd(result.holdPnlUsd)}`);
+  const diff = result.pnlUsd - result.holdPnlUsd;
+  lines.push(`  Vs hold:       ${diff >= 0 ? "outperformed" : "underperformed"} by ${fmtSignedUsd(diff)} (rebalancing alpha)`);
+  if (result.notes.length > 0) lines.push(`  Notes:         ${result.notes.join("; ")}`);
+  if (result.fires.length > 0) {
+    lines.push("");
+    lines.push(`  Corrections (${result.fires.length}):`);
+    for (const f of result.fires.slice(0, 25)) {
+      const legs = f.legs.map((l) => `${l.side} ${l.symbol} $${fmt(l.amountUsd, 0)}${l.clamped ? "⚠" : ""}`).join(", ");
+      lines.push(`    ● ${f.ts}  drift ${fmt(f.maxDriftPct, 1)}%  ${legs}`);
+    }
+    if (result.fires.length > 25) lines.push(`    … ${result.fires.length - 25} more (backtest show ${rowId})`);
+  }
+  console.log(lines.join("\n"));
+}
+
 export async function backtestCommand(
   action: string | undefined,
   flags: Record<string, string>,
@@ -895,6 +1085,9 @@ export async function backtestCommand(
     case "playbook":
       await backtestPlaybookCommand(flags, positional);
       break;
+    case "rebalance":
+      await backtestRebalanceCommand(flags);
+      break;
     case "compare":
       await backtestCompareCommand(flags, positional);
       break;
@@ -905,6 +1098,6 @@ export async function backtestCommand(
       await backtestShowCommand(flags, positional);
       break;
     default:
-      throw subcommandError("backtest", action, ["order", "schedule", "playbook", "compare", "list", "show"]);
+      throw subcommandError("backtest", action, ["order", "schedule", "playbook", "rebalance", "compare", "list", "show"]);
   }
 }

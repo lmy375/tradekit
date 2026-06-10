@@ -100,7 +100,7 @@ function parseResult(result: { content: { type: "text"; text: string }[] }): unk
 // ── registration ─────────────────────────────────────────────
 
 describe("registerStrategyTools — tool registration", () => {
-  it("registers all 11 expected tools", () => {
+  it("registers all 12 expected tools", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
     const names = Array.from(registered.keys());
@@ -114,10 +114,11 @@ describe("registerStrategyTools — tool registration", () => {
     expect(names).toContain("playbook_replace");
     expect(names).toContain("backtest_order");
     expect(names).toContain("backtest_playbook");
+    expect(names).toContain("backtest_rebalance");
     expect(names).toContain("backtest_compare");
     // Iter31: unified strategy observability.
     expect(names).toContain("strategy_report");
-    expect(names.length).toBe(11);
+    expect(names.length).toBe(12);
   });
 
   it("every tool has a non-empty description", () => {

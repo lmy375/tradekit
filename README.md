@@ -1368,9 +1368,17 @@ tradekit backtest schedule \
   --balance '{"USDC":3000}' \
   --since 6m
 
+# Multi-asset: would 60/40 ETH/USDC with a 5% drift threshold have beaten
+# HODL over the past year — and how many corrections would it have fired?
+tradekit backtest rebalance \
+  --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]' \
+  --drift-threshold 5 --every 6h --since 365d
+
 tradekit backtest list                   # recent runs, newest first
 tradekit backtest show 7                 # full detail with fire timeline
 ```
+
+**Rebalance backtest (multi-asset).** The single-pair simulators can't model a target-weight plan, so `backtest rebalance` gets its own engine: one CoinGecko series per target token (recognized stablecoins synthesize a flat $1 series instead of burning an API call), evaluation at the cron's occurrences with at-or-before price lookups (robust to misaligned sample timestamps), and the live engine's leg mechanics — sells fund the quote anchor first, buys draw from it, per-leg `minTradeUsd` skip, and anchor shortfalls CLAMP rather than mint money. The default starting book is `--initial-usd` (default $10k) split at target weights at window-start prices, which makes `PnL − hold-PnL` the pure **rebalancing alpha**: typically negative in trending markets (rebalancing sells winners early), positive in mean-reverting chop (it systematically buys dips). Optional `--slippage-bps` applies the paper-trading worst-case model per leg to stress the alpha against execution costs.
 
 **What you get.** Strategy PnL + a counterfactual `hold` PnL (what your starting balance would be worth if you'd done nothing), plus the timeline of every simulated fire with timestamp, price, and balance delta. The `--json` output is the same shape the persisted row deserializes into, so `backtest show <id>` returns the same data structure as the original run.
 
@@ -1440,7 +1448,7 @@ Winner: 5pct  (PnL +$245.18, +$520.18 vs hold, run #14)
 
 **Winner semantics.** Highest PnL among scenarios that fired at least one fill. The `vs hold` column makes the comparison vs. doing-nothing visible — a "winner" that still underperforms hold is clearly marked. When every scenario halts before any fill, the runner reports "No winner" (forcing a misleading pick would be worse than admitting no data).
 
-**Same-pair invariant.** Every scenario must reference the same `base/quote` pair across its non-rebalance strategies. Comparison happens against one price series; mixed-pair scenarios surface upfront with a structured error pointing at running independent comparisons per pair. Rebalance plans inherit the existing single-strategy backtest restriction (intrinsically multi-asset, unsupported).
+**Same-pair invariant.** Every scenario must reference the same `base/quote` pair across its non-rebalance strategies. Comparison happens against one price series; mixed-pair scenarios surface upfront with a structured error pointing at running independent comparisons per pair. Rebalance plans are intrinsically multi-asset and don't fit the shared-series comparison — use the dedicated `tradekit backtest rebalance` instead.
 
 **Persistence.** Each scenario writes a regular `backtest_runs` row so `tradekit backtest show <run_id>` works on individual scenarios. The comparison summary lives in v20 `backtest_comparisons` linking those rows by id list, so `backtest compare show <id>` re-renders without re-running simulations OR re-fetching CoinGecko data.
 
@@ -1945,13 +1953,13 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 108 tools across six groups:
+Starts an MCP stdio server exposing 109 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
 - **Trade & automation** (30) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_edit`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
-- **Strategy & backtest** (11) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
+- **Strategy & backtest** (12) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_rebalance`, `backtest_compare`, `strategy_report`
 - **Observability** (11) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `alert_history`, `price_stats`
 - **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
@@ -2223,7 +2231,7 @@ Tools exposed via the `tradekit mcp` server, grouped by domain:
   - `playbook_diff` is the read-only preview: four buckets (unchanged/modified/added/removed), field-level changes, and per-entry `applyMode` (edit-in-place vs cancel+recreate) so an agent knows whether a change preserves trailing HWM / run counters BEFORE applying
   - `playbook_replace` applies a new spec atomically with the v2 state-preservation semantics (in-place edits where possible, run-counter carry on recreate, paper-ness inherited from owned rows); `preserve_state: false` opts into a full state reset; requires `yes: true`
   - `playbook_destroy` requires `yes: true` and cascades cancel to all owned primitives
-- **Backtests:** `backtest_order` `backtest_playbook` `backtest_compare` `backtest_list` `backtest_show` `backtest_compare_list` `backtest_compare_show`
+- **Backtests:** `backtest_order` `backtest_playbook` `backtest_rebalance` `backtest_compare` `backtest_list` `backtest_show` `backtest_compare_list` `backtest_compare_show`
   - Single-strategy + multi-strategy + multi-scenario comparison
   - All persist results; `backtest_show` / `backtest_compare_show` re-render without re-fetching CoinGecko
 

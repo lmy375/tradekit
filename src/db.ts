@@ -4079,7 +4079,7 @@ export function listCachedTokenVerdicts(filter: { chain?: string } = {}): TokenS
 // "order" / "schedule" are single-strategy backtests; "playbook" is the
 // iter18 multi-strategy backtest where multiple primitives share one
 // simulated balance + timeline.
-export type BacktestStrategyType = "order" | "schedule" | "playbook";
+export type BacktestStrategyType = "order" | "schedule" | "playbook" | "rebalance";
 
 export interface BacktestRunRow {
   id: number;

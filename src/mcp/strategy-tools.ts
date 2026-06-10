@@ -26,7 +26,7 @@ import {
 import { computePlaybookDiff, replacePlaybook } from "../playbookReplace.js";
 import { listPlaybooks, getPlaybookById } from "../db.js";
 import { loadConfig, resolveProfile } from "../config.js";
-import { resolveTradePair } from "../chains.js";
+import { resolveTradePair, resolveToken } from "../chains.js";
 import {
   simulateOrder,
   simulateSchedule,
@@ -385,6 +385,133 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               initial_usd: result.initialUsd, final_usd: result.finalUsd,
               pnl_usd: result.pnlUsd, hold_pnl_usd: result.holdPnlUsd,
               fires: result.fires, notes: result.notes,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── backtest_rebalance ─────────────────────────────────────
+  server.tool(
+    "backtest_rebalance",
+    "Replay a target-weight rebalance plan against historical multi-asset CoinGecko price series — the multi-asset backtest the single-pair tools can't do. Walks the cron's occurrences across the window; at each one it prices every target (at-or-before lookup, robust to misaligned series), computes per-target drift, and when maxDrift >= driftThresholdPct fires corrective legs with the live engine's mechanics (sells fund the quote anchor first, buys draw from it, per-leg minTradeUsd skip, anchor shortfall clamps — money is never minted). Optional worst-case slippageBps per leg. Returns { id, targets, evaluations, skipped_in_band, fires: [{ ts, maxDriftPct, legs[], portfolioUsdBefore/After }], pnl_usd, hold_pnl_usd, ... } — pnl_usd − hold_pnl_usd is the REBALANCING ALPHA vs plain HODL of the same starting book (usually negative in trends, positive in mean-reverting chop). Initial book defaults to initial_usd (default $10k) split at target weights at window-start prices, so every fire is attributable to market drift. Persists to backtest_runs (strategy_type='rebalance') for backtest_show. Stablecoin anchors without a CoinGecko mapping synthesize a flat $1 series. Errors: INVALID_PARAMS (targets sum, threshold range, bad cron); UNKNOWN_TOKEN (non-listed, non-stable target).",
+    {
+      targets: z
+        .array(z.object({ token: z.string(), targetPct: z.number().positive() }))
+        .min(2)
+        .describe("Target weights — same shape rebalance_create takes; must sum to exactly 100."),
+      drift_threshold_pct: z.number().optional().describe("Fire when max per-target drift >= this. Default 5."),
+      min_trade_usd: z.number().optional().describe("Per-leg USD minimum; smaller corrective legs skip. Default 10."),
+      cron: z.string().optional().describe("Evaluation cadence (cron). Default: every 6 hours."),
+      every: z.string().optional().describe("Duration shorthand alternative to cron (6h, 1d, 7d)."),
+      max_runs: z.number().int().min(1).optional().describe("Lifetime cap on executed rebalances."),
+      slippage_bps: z.number().int().min(0).max(10_000).optional().describe("Worst-case per-leg slippage. Default 0 (isolate the pure rebalancing effect)."),
+      quote_token: z.string().optional().describe("Routing anchor symbol. Default USDC."),
+      balance: z.record(z.string(), z.number().nonnegative()).optional().describe("Starting units per symbol. Omit for the default $-split-at-target-weights book."),
+      initial_usd: z.number().positive().optional().describe("Total USD for the default starting book. Default 10000."),
+      since: z.string().default("90d").describe("Window — '90d', '6m', or bare days. Max 3650."),
+      chain: z.string().optional().describe("Chain (default: active chain)."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("backtest_rebalance", rt.opts, input, input.chain, async () => {
+            const { simulateRebalance, validateRebalanceBacktestSpec, constantSeries, defaultInitialBalance } =
+              await import("../backtestRebalance.js");
+            const { fetchPriceSeries: fetchSeries, parseSinceDuration: parseSince } = await import("../backtest.js");
+            const config = rt.getConfig();
+            const chainName = input.chain ?? config.activeChain;
+            const profile = resolveProfile(chainName, config);
+
+            const targets = input.targets.map((t) => ({ symbol: t.token.toUpperCase(), targetPct: t.targetPct }));
+            const quoteSymbol = (input.quote_token ?? "USDC").toUpperCase();
+            const { durationToCron } = await import("../cron.js");
+            const spec = {
+              targets,
+              driftThresholdPct: input.drift_threshold_pct,
+              minTradeUsd: input.min_trade_usd,
+              cron: input.cron ?? (input.every ? durationToCron(input.every) : undefined),
+              maxRuns: input.max_runs,
+              slippageBps: input.slippage_bps,
+              quoteSymbol,
+            };
+            validateRebalanceBacktestSpec(spec);
+
+            const days = parseSince(input.since);
+            const windowStartIso = new Date(Date.now() - days * 86_400_000).toISOString();
+            const windowEndIso = new Date().toISOString();
+            const STABLES = new Set(["USDC", "USDT", "DAI", "USDBC", "USDC.E", "LUSD", "GUSD", "FRAX"]);
+
+            const symbols = new Set<string>(targets.map((t) => t.symbol));
+            symbols.add(quoteSymbol);
+            const series: Record<string, import("../backtest.js").PriceSeries> = {};
+            let totalPoints = 0;
+            for (const sym of symbols) {
+              const addr = resolveToken(profile, sym);
+              let s = addr
+                ? await fetchSeries(addr, days).catch((e) => {
+                    if (STABLES.has(sym)) return null;
+                    throw e;
+                  })
+                : null;
+              if (!s && STABLES.has(sym)) s = constantSeries(sym, windowStartIso, windowEndIso);
+              if (!s) {
+                throw new ToolError(
+                  "UNKNOWN_TOKEN",
+                  `No price series for ${sym} on ${profile.name} — targets must be CoinGecko-listed (or recognized stablecoins).`,
+                );
+              }
+              series[sym] = s;
+              totalPoints += s.points.length;
+            }
+
+            const initialBalance = input.balance
+              ? Object.fromEntries(Object.entries(input.balance).map(([k, v]) => [k.toUpperCase(), v]))
+              : defaultInitialBalance({ spec, series, totalUsd: input.initial_usd });
+
+            const result = simulateRebalance({ spec, initialBalance, series });
+
+            const rowId = insertBacktestRun({
+              strategyType: "rebalance",
+              chain: profile.name,
+              baseSymbol: targets.map((t) => t.symbol).join("+"),
+              quoteSymbol,
+              specJson: JSON.stringify(spec),
+              initialBalanceJson: JSON.stringify(initialBalance),
+              finalBalanceJson: JSON.stringify(result.finalBalance),
+              windowStart: result.windowStart,
+              windowEnd: result.windowEnd,
+              points: totalPoints,
+              firesJson: JSON.stringify(result.fires),
+              fireCount: result.fires.length,
+              pnlUsd: result.pnlUsd,
+              holdPnlUsd: result.holdPnlUsd,
+              notes: result.notes.join("; ") || null,
+            });
+
+            return {
+              ok: true,
+              id: rowId,
+              targets,
+              quote_symbol: quoteSymbol,
+              window_start: result.windowStart,
+              window_end: result.windowEnd,
+              points: totalPoints,
+              evaluations: result.evaluations,
+              skipped_in_band: result.skippedInBand,
+              initial_balance: initialBalance,
+              final_balance: result.finalBalance,
+              initial_usd: result.initialUsd,
+              final_usd: result.finalUsd,
+              pnl_usd: result.pnlUsd,
+              hold_final_usd: result.holdFinalUsd,
+              hold_pnl_usd: result.holdPnlUsd,
+              rebalancing_alpha_usd: result.pnlUsd - result.holdPnlUsd,
+              fires: result.fires,
+              notes: result.notes,
             };
           }),
         );
