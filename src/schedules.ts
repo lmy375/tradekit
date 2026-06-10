@@ -44,6 +44,7 @@ import {
   recordScheduleFire,
   recordScheduleError,
   recordScheduleRetry,
+  findScheduleFireEvidence,
   insertScheduleCheckEntry,
   lastScheduleCheckDecision,
   type ScheduleCheckDecision,
@@ -316,7 +317,7 @@ export interface ScheduleTickArgs {
 export interface ScheduleFireReport {
   scheduleId: number;
   name: string | null;
-  status: "fired" | "failed" | "skipped" | "completed" | "retry_pending";
+  status: "fired" | "failed" | "skipped" | "completed" | "retry_pending" | "recovered";
   txHash?: string;
   errorCode?: string;
   errorMessage?: string;
@@ -338,6 +339,11 @@ export interface ScheduleTickReport {
   /** v32: transient failures parked on a bounded-backoff retry slot
    *  this tick (occurrence NOT lost yet). */
   retried: number;
+  /** v33: occurrences recovered from the crash-window guard — a fire
+   *  whose trade landed but whose bookkeeping never did (engine crash
+   *  mid-fire, or a TX_TIMEOUT'd tx that confirmed during a retry
+   *  backoff). Booked from the evidence trade, NOT refired. */
+  recovered: number;
   fires: ScheduleFireReport[];
   recommendedActions: NextAction[];
 }
@@ -407,6 +413,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
   let fired = 0;
   let failed = 0;
   let retried = 0;
+  let recovered = 0;
   let completed = 0;
   let skipped = 0;
 
@@ -658,9 +665,88 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       continue;
     }
 
+    const isPaperSchedule = (schedule.paper ?? 0) === 1;
+
+    // v33 crash-window guard: before firing, look for evidence that
+    // THIS occurrence already produced a trade — the engine crashed
+    // between tx-send and recordScheduleFire, or a TX_TIMEOUT'd tx
+    // confirmed during the v32 retry backoff. Refiring would double-
+    // buy; instead the engine books the occurrence from the evidence
+    // trade (amounts + txHash are on the row) and advances. The
+    // window starts at the occurrence's ORIGINAL due time: when
+    // next_run_at is a retry slot (retry_count > 0), subtract the
+    // backoff already consumed so the pre-retry attempt's trade is
+    // still inside the window.
+    {
+      let windowStart = Date.parse(schedule.next_run_at);
+      const rc = schedule.retry_count ?? 0;
+      if (rc > 0) {
+        const backoffBase = config.engine?.fireRetry?.backoffMinutes ?? 5;
+        windowStart -= backoffBase * 60_000 * (2 ** rc - 1);
+      }
+      const evidence = findScheduleFireEvidence({
+        scheduleId: schedule.id,
+        sinceIso: new Date(windowStart).toISOString(),
+        paper: isPaperSchedule,
+      });
+      if (evidence) {
+        const willCompleteOnMaxRuns =
+          schedule.max_runs != null && schedule.run_count + 1 >= schedule.max_runs;
+        const willCompleteOnEndAt =
+          schedule.end_at != null && Date.parse(schedule.end_at) <= nextAt.getTime();
+        const completedNow = willCompleteOnMaxRuns || willCompleteOnEndAt;
+        recordScheduleFire(schedule.id, {
+          nextRunAt: nextAt.toISOString(),
+          txHash: evidence.txHash ?? "recovered",
+          baseAmount: evidence.baseAmount ?? "0",
+          quoteAmount: evidence.quoteAmount ?? "0",
+          completed: completedNow,
+        });
+        journal({
+          scheduleId: schedule.id,
+          decision: "recovered",
+          runNumber: schedule.run_count + 1,
+          txHash: evidence.txHash,
+          notes: `interrupted fire recovered from ${evidence.status} trade at ${evidence.at} — booked, not refired`,
+        });
+        recovered += 1;
+        if (completedNow) completed += 1;
+        fires.push({
+          scheduleId: schedule.id,
+          name: schedule.name,
+          status: "recovered",
+          txHash: evidence.txHash ?? undefined,
+          nextRunAt: nextAt.toISOString(),
+        });
+        await tryNotify(
+          {
+            event: "schedule.recovered",
+            severity: "warn",
+            title: `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} occurrence recovered — found ${evidence.status} trade, NOT refiring`,
+            body:
+              `A trade attributable to this occurrence already exists (${evidence.txHash ?? "no hash"}, status ${evidence.status}) ` +
+              `but the schedule's bookkeeping never landed — likely an engine crash mid-fire or a timed-out tx that confirmed later. ` +
+              `The occurrence was booked from the evidence trade.` +
+              (schedule.on_fill_json ? ` NOTE: the on_fill hook was NOT executed for the recovered fire — create the follow-up manually if needed.` : ""),
+            fields: {
+              id: schedule.id,
+              chain: schedule.chain,
+              account: schedule.account,
+              txHash: evidence.txHash,
+              evidenceStatus: evidence.status,
+              runCount: schedule.run_count + 1,
+            },
+            dedupKey: `schedule.recovered:${schedule.id}:${schedule.run_count + 1}`,
+          },
+          config,
+          args.logger,
+        );
+        continue;
+      }
+    }
+
     // 3) Build the wallet (lazy). Paper schedules use the read-only
     //    path — no keystore decryption needed.
-    const isPaperSchedule = (schedule.paper ?? 0) === 1;
     let walletBuilt: Built;
     try {
       walletBuilt = await ensureWallet(schedule.chain, schedule.account, {
@@ -1126,6 +1212,7 @@ Transient failure — the occurrence is NOT lost yet. Next attempt at ${retry.re
     completed,
     skipped,
     retried,
+    recovered,
     fires,
     recommendedActions,
   };

@@ -608,3 +608,58 @@ describe("runRebalanceTick — decision journal (v29)", () => {
     });
   });
 });
+
+// ── v33: crash-window pending-legs guard ─────────────────────
+
+describe("runRebalanceTick — v33 pending-legs guard", () => {
+  const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+  const WETH2 = "0x4200000000000000000000000000000000000006";
+
+  async function seedLegTrade(planId: number, status: "pending" | "success", agoMs = 0) {
+    const { insertTrade } = await import("./db.js");
+    insertTrade({
+      timestamp: new Date(Date.now() - agoMs).toISOString(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH2, base_symbol: "WETH", base_amount: "0.1",
+      quote_token: USDC2, quote_symbol: "USDC", quote_amount: "200",
+      price: "2000",
+      tx_hash: `0xleg${status}`,
+      status,
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[rebalance #${planId}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+  }
+
+  it("unconfirmed legs from an interrupted run defer the evaluation (no quota, no failure)", async () => {
+    const id = seedPlan({ paper: false } as never);
+    await seedLegTrade(id, "pending");
+    let fetcherCalls = 0;
+    const report = await tick({ fetchPortfolio: async () => { fetcherCalls += 1; throw new Error("unreachable"); } });
+    expect(report.skipped).toBe(1);
+    expect(report.failed).toBe(0);
+    expect(fetcherCalls).toBe(0); // deferred BEFORE the snapshot fetch
+    const fire = report.fires[0];
+    expect(fire.status).toBe("skipped");
+    expect(fire.errorCode).toBe("PENDING_LEGS");
+    const row = getRebalancePlanById(id)!;
+    expect(row.run_count).toBe(0); // no quota consumed
+    expect(row.last_run_status).toBe("deferred");
+    expect(Date.parse(row.next_run_at)).toBeGreaterThan(Date.now()); // advanced
+  });
+
+  it("CONFIRMED legs don't defer — drift is recomputed from the post-leg portfolio", async () => {
+    const id = seedPlan({ paper: false } as never);
+    await seedLegTrade(id, "success");
+    const err = Object.assign(new Error("fetch reached"), { code: "INVALID_PARAMS" });
+    let fetcherCalls = 0;
+    const report = await tick({ fetchPortfolio: async () => { fetcherCalls += 1; throw err; } });
+    // The guard let the evaluation proceed (it then failed at our stub fetcher).
+    expect(fetcherCalls).toBe(1);
+    expect(report.failed).toBe(1);
+    void id;
+  });
+
+});

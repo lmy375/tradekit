@@ -43,6 +43,8 @@ import {
   recordRebalanceRun,
   recordRebalanceError,
   recordRebalanceRetry,
+  countRebalancePendingLegs,
+  deferRebalancePlan,
   insertRebalanceCheckEntry,
   lastRebalanceCheckDecision,
   type RebalanceCheckDecision,
@@ -843,10 +845,44 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       continue;
     }
 
+    const isPaperPlan = (plan.paper ?? 0) === 1;
+
+    // v33 crash-window guard: unconfirmed legs from an interrupted
+    // run mean the portfolio snapshot does NOT yet reflect them —
+    // re-evaluating drift now would double-correct. Defer this
+    // evaluation (no quota consumed, no failure stamped); once the
+    // legs confirm, the next evaluation measures drift from the
+    // post-leg portfolio and is safe by construction. CONFIRMED legs
+    // need no guard for the same reason — drift self-heals. Paper
+    // legs are instant, so only real plans are checked.
+    if (!isPaperPlan && plan.id != null) {
+      let windowStart = Date.parse(plan.next_run_at);
+      const rc = plan.retry_count ?? 0;
+      if (rc > 0) {
+        const backoffBase = config.engine?.fireRetry?.backoffMinutes ?? 5;
+        windowStart -= backoffBase * 60_000 * (2 ** rc - 1);
+      }
+      const pendingLegs = countRebalancePendingLegs(plan.id, new Date(windowStart).toISOString());
+      if (pendingLegs > 0) {
+        deferRebalancePlan(plan.id, nextAt.toISOString());
+        journal({
+          planId: plan.id,
+          decision: "skipped_pending_legs",
+          thresholdPct: plan.drift_threshold_pct,
+          notes: `${pendingLegs} unconfirmed leg(s) from an interrupted run — deferred to ${nextAt.toISOString()}; run \`tradekit reconcile\` to finalize them`,
+        });
+        skipped += 1;
+        fires.push({
+          planId: plan.id, name: plan.name, status: "skipped", executed: [], skipped: [],
+          errorCode: "PENDING_LEGS", errorMessage: `${pendingLegs} unconfirmed leg(s) pending`, nextRunAt: nextAt.toISOString(),
+        });
+        continue;
+      }
+    }
+
     // Fetch portfolio. Paper plans read the VIRTUAL book — the only
     // portfolio their corrective legs can actually move (see
     // defaultFetchPaperPortfolio's convergence rationale).
-    const isPaperPlan = (plan.paper ?? 0) === 1;
     const fetcher = isPaperPlan ? paperFetcher : realFetcher;
     let snapshot: PortfolioSnapshot;
     try {

@@ -3695,6 +3695,78 @@ export function recordScheduleError(
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
 }
 
+/** v33 crash-window guard: look for evidence that THIS occurrence
+ *  already fired even though the schedule’s bookkeeping never landed
+ *  (engine crashed between tx-send and recordScheduleFire, or a
+ *  TX_TIMEOUT’d tx confirmed during a retry backoff). Real fires
+ *  stamp `[schedule #<id>]` into the trade note; paper fires carry
+ *  source_type/source_id. Only rows from the occurrence window
+ *  (timestamp >= sinceIso) count — trades from PROPERLY booked past
+ *  fires always predate the current next_run_at, so they never
+ *  false-match. Reverted/failed rows do not count: the swap did not
+ *  deliver, refiring is the correct action. */
+export interface FireEvidence {
+  txHash: string | null;
+  baseAmount: string | null;
+  quoteAmount: string | null;
+  status: string;
+  at: string;
+}
+
+export function findScheduleFireEvidence(args: {
+  scheduleId: number;
+  sinceIso: string;
+  paper: boolean;
+}): FireEvidence | null {
+  const db = openDb();
+  if (args.paper) {
+    // paper_trades carry no tx_hash column (virtual fills have no
+    // chain tx); recovery books the occurrence with a sentinel hash.
+    const row = db
+      .prepare(
+        `SELECT base_amount, quote_amount, timestamp
+           FROM paper_trades
+          WHERE source_type = 'schedule' AND source_id = ? AND timestamp >= ?
+          ORDER BY timestamp DESC LIMIT 1`,
+      )
+      .get(args.scheduleId, args.sinceIso) as
+      | { base_amount: string; quote_amount: string; timestamp: string }
+      | undefined;
+    if (!row) return null;
+    return { txHash: null, baseAmount: row.base_amount, quoteAmount: row.quote_amount, status: "success", at: row.timestamp };
+  }
+  // Exact-marker match: the "]" terminator means "[schedule #5]" can
+  // never match a "[schedule #55]" note.
+  const row = db
+    .prepare(
+      `SELECT tx_hash, base_amount, quote_amount, status, timestamp
+         FROM trades
+        WHERE notes LIKE ? AND timestamp >= ? AND status IN ('pending', 'success')
+        ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(`%[schedule #${args.scheduleId}]%`, args.sinceIso) as
+    | { tx_hash: string | null; base_amount: string; quote_amount: string; status: string; timestamp: string }
+    | undefined;
+  if (!row) return null;
+  return { txHash: row.tx_hash, baseAmount: row.base_amount, quoteAmount: row.quote_amount, status: row.status, at: row.timestamp };
+}
+
+/** v33: count UNCONFIRMED legs from an interrupted rebalance run in
+ *  the occurrence window. Pending legs mean the portfolio snapshot
+ *  does not yet reflect them — re-evaluating drift now would
+ *  double-correct. CONFIRMED legs are safe: drift is recomputed from
+ *  the post-leg portfolio, so the engine re-evaluates normally. */
+export function countRebalancePendingLegs(planId: number, sinceIso: string): number {
+  const db = openDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM trades
+        WHERE notes LIKE ? AND timestamp >= ? AND status = 'pending'`,
+    )
+    .get(`%[rebalance #${planId}]%`, sinceIso) as { n: number };
+  return row.n;
+}
+
 /** v32: record a TRANSIENT fire failure and park the schedule on a
  *  bounded-backoff retry slot instead of skipping the occurrence.
  *  next_run_at = retryAt (must be BEFORE the next natural cron slot —
@@ -4094,6 +4166,19 @@ export function recordRebalanceError(
        retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+/** v33: defer a rebalance evaluation WITHOUT consuming run quota or
+ *  stamping a failure — used by the crash-window guard when
+ *  unconfirmed legs from an interrupted run are still pending (the
+ *  snapshot would not reflect them; re-evaluating would double-
+ *  correct). */
+export function deferRebalancePlan(id: number, nextRunAt: string): void {
+  const db = openDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE rebalance_plans SET updated_at = ?, next_run_at = ?, last_run_status = 'deferred' WHERE id = ?`,
+  ).run(now, nextRunAt, id);
 }
 
 /** v32: rebalance counterpart of recordScheduleRetry. */
@@ -5134,6 +5219,7 @@ export type ScheduleCheckDecision =
   | "fired"
   | "fire_failed"
   | "retry_scheduled"
+  | "recovered"
   | "skipped_locked"
   | "skipped_pre_start"
   | "retired_end_at"
@@ -5212,6 +5298,7 @@ export type RebalanceCheckDecision =
   | "in_band"
   | "fired"
   | "retry_scheduled"
+  | "skipped_pending_legs"
   | "partial_failure"
   | "failed"
   | "dry_run"

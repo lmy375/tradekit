@@ -704,3 +704,194 @@ describe("runScheduleTick — v32 transient retry", () => {
     }
   }
 });
+
+// ── v33: crash-window recovery guard ─────────────────────────
+
+describe("runScheduleTick — v33 crash-window recovery", () => {
+  const nowIso = () => new Date().toISOString();
+
+  async function seedPaperEvidence(scheduleId: number, over: Record<string, unknown> = {}) {
+    const { recordPaperTrade } = await import("./db.js");
+    return recordPaperTrade({
+      timestamp: nowIso(),
+      source_type: "schedule",
+      source_id: scheduleId,
+      chain: "base",
+      account: "default",
+      direction: "buy",
+      base_token: WETH,
+      base_symbol: "WETH",
+      base_amount: "0.05",
+      quote_token: USDC,
+      quote_symbol: "USDC",
+      quote_amount: "100",
+      price: "2000",
+      slippage_bps: 50,
+      strategy: null,
+      notes: null,
+      ...over,
+    } as never);
+  }
+
+  it("a paper occurrence with an orphaned fill is booked, not refired", async () => {
+    seedQuoteBalance("10000");
+    const id = seedSchedule(); // due (PAST), paper
+    await seedPaperEvidence(id);     // the crashed fire's fill — bookkeeping never landed
+    const report = await tick();
+    expect(report.recovered).toBe(1);
+    expect(report.fired).toBe(0);
+    expect(report.fires[0].status).toBe("recovered");
+
+    const row = getScheduleById(id)!;
+    expect(row.run_count).toBe(1); // occurrence booked
+    expect(Date.parse(row.next_run_at)).toBeGreaterThan(Date.now()); // advanced
+    expect(row.total_quote_spent).toBe("100"); // amounts from the evidence trade
+    // NO second fill: exactly the one orphaned paper trade remains.
+    expect(listPaperTrades({})).toHaveLength(1);
+  });
+
+  it("a real schedule recovers from a pending trade row without touching the wallet", async () => {
+    const { insertTrade } = await import("./db.js");
+    const id = seedSchedule({ paper: false });
+    insertTrade({
+      timestamp: nowIso(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.05",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "100",
+      price: "2000",
+      tx_hash: "0xdeadbeef",
+      status: "pending", // TX_TIMEOUT'd — confirmed-or-not, do NOT resubmit
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[schedule #${id}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    // Wallet must never be needed: make any wallet access explode.
+    mockedReadOnlyWallet.mockImplementation(() => { throw new Error("wallet must not be touched"); });
+    const report = await tick();
+    expect(report.recovered).toBe(1);
+    const row = getScheduleById(id)!;
+    expect(row.run_count).toBe(1);
+    expect(row.last_run_tx_hash).toBe("0xdeadbeef");
+  });
+
+  it("a reverted (failed) trade is NOT evidence — the occurrence refires", async () => {
+    const { insertTrade } = await import("./db.js");
+    seedQuoteBalance("10000");
+    const id = seedSchedule(); // paper — would fire normally
+    insertTrade({
+      timestamp: nowIso(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.05",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "100",
+      price: "2000",
+      tx_hash: "0xreverted",
+      status: "failed",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[schedule #${id}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recovered).toBe(0);
+    expect(report.fired).toBe(1); // refired normally
+  });
+
+  it("evidence from a PAST occurrence (ts < due time) never false-recovers", async () => {
+    seedQuoteBalance("10000");
+    const id = seedSchedule(); // next_run_at = PAST (60s ago)
+    // A fill from 10 minutes ago — properly-booked previous occurrence.
+    await seedPaperEvidence(id, { timestamp: new Date(Date.now() - 600_000).toISOString() });
+    const report = await tick();
+    expect(report.recovered).toBe(0);
+    expect(report.fired).toBe(1);
+  });
+
+  it("retry-slot windows reach BACK past the consumed backoff (TX_TIMEOUT interplay)", async () => {
+    const { insertTrade } = await import("./db.js");
+    const id = seedSchedule({ paper: false });
+    // Simulate: fire at T sent a tx → TX_TIMEOUT → retry parked, attempt 1.
+    // The evidence trade is ~4 minutes old; next_run_at (retry slot) is due NOW.
+    openDb().prepare(`UPDATE schedules SET retry_count = 1 WHERE id = ?`).run(id);
+    insertTrade({
+      timestamp: new Date(Date.now() - 4 * 60_000).toISOString(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.05",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "100",
+      price: "2000",
+      tx_hash: "0xlanded",
+      status: "success", // the timed-out tx confirmed during the backoff
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[schedule #${id}]`,
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recovered).toBe(1); // booked, NOT refired — no double-buy
+    const row = getScheduleById(id)!;
+    expect(row.retry_count).toBe(0); // recordScheduleFire reset it
+    expect(row.last_run_tx_hash).toBe("0xlanded");
+  });
+
+  it("marker matching is exact — schedule #5's evidence never matches #55", async () => {
+    const { insertTrade } = await import("./db.js");
+    seedQuoteBalance("10000");
+    const id = seedSchedule(); // paper id (likely 1)
+    insertTrade({
+      timestamp: nowIso(),
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.05",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "100",
+      price: "2000",
+      tx_hash: "0xother",
+      status: "success",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null,
+      notes: `[schedule #${id}5]`, // a DIFFERENT schedule's marker (id*10+5)
+      strategy: null,
+      realized_slippage_bps: null,
+    });
+    const report = await tick();
+    expect(report.recovered).toBe(0);
+    expect(report.fired).toBe(1);
+  });
+
+  it("recovery completes a max_runs=1 campaign and skips the on_fill hook", async () => {
+    seedQuoteBalance("10000");
+    const hook = {
+      type: "createOrder",
+      spec: { side: "sell", trigger: "trailing", trailPct: 5, base: "WETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+    };
+    const id = seedSchedule({ max_runs: 1, on_fill_json: JSON.stringify(hook) });
+    await seedPaperEvidence(id);
+    const report = await tick();
+    expect(report.recovered).toBe(1);
+    const row = getScheduleById(id)!;
+    expect(row.status).toBe("completed"); // max_runs reached via recovery
+    // Hook deliberately NOT executed on recovery.
+    expect(listOrders({ status: "all" })).toHaveLength(0);
+  });
+
+  it("journals the recovered decision with the evidence tx", async () => {
+    const { saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, scheduleJournal: { enabled: true } } } as never);
+    try {
+      seedQuoteBalance("10000");
+      const id = seedSchedule();
+      await seedPaperEvidence(id);
+      await tick();
+      const { replayScheduleEntries } = await import("./db.js");
+      const entries = replayScheduleEntries(id);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].decision).toBe("recovered");
+      expect(entries[0].run_number).toBe(1);
+      expect(entries[0].notes).toMatch(/booked, not refired/);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+});

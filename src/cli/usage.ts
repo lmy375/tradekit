@@ -248,6 +248,11 @@ SCHEDULED / RECURRING TRADES (DCA)
         "occurrence LOST" notification. Terminal failures (safeguard, balance)
         never retry. Same mechanism guards rebalance evaluations. Disable with
         \`config set engine.fireRetry.enabled false\`.
+        v33 crash-window guard: before every fire the engine checks for a trade
+        already attributable to THIS occurrence (engine crash between tx-send and
+        bookkeeping, or a timed-out tx that confirmed during a retry backoff). If
+        found, the occurrence is BOOKED from the evidence trade — never refired,
+        never double-bought. Emits schedule.recovered; journals "recovered".
   schedule replay <id> [--limit N] [--json]
         v29: forensic decision timeline — every fired / fire_failed / retired /
         locked-skip / on_fill hook outcome with timestamps, run numbers, tx hashes.
