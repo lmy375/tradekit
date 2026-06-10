@@ -174,7 +174,10 @@ describe("schedules DB layer", () => {
     recordScheduleError(id, "2026-06-08T10:00:00.000Z", "RPC_FAILED", "RPC timeout");
     const r = getScheduleById(id)!;
     expect(r.status).toBe("active");
-    expect(r.run_count).toBe(1);
+    // run_count counts successful FIRES only — failures must not consume
+    // the max_runs quota (a max_runs=12 DCA with 3 transient failures
+    // would otherwise complete after only 9 actual buys).
+    expect(r.run_count).toBe(0);
     expect(r.last_run_status).toBe("failed");
     expect(r.last_error_code).toBe("RPC_FAILED");
     expect(r.last_error_message).toBe("RPC timeout");

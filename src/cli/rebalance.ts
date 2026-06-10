@@ -5,7 +5,7 @@
 //                             [--cron "0 */6 * * *"] [--drift-threshold 5] [--min-trade-usd 10]
 //                             [--quote-token USDC] [--slippage <bps>] [--auto-slippage]
 //                             [--start-at <ISO>] [--end-at <ISO>] [--max-runs N]
-//                             [--strategy TAG] [--note "..."] [--json]
+//                             [--strategy TAG] [--note "..."] [--paper true] [--json]
 //   tradekit rebalance list   [--status all|active|paused|completed|cancelled]
 //                             [--chain X] [--account L] [--strategy TAG] [--limit N] [--json]
 //   tradekit rebalance show   <id> [--json]
@@ -153,6 +153,7 @@ export async function rebalanceCreateCommand(flags: Record<string, string>) {
       autoSlippage: flags["auto-slippage"] === "true",
       strategy: resolveStrategy(flags["strategy"], process.env.TRADEKIT_STRATEGY),
       note: flags["note"],
+      paper: flags["paper"] === "true",
     },
     config,
   );
@@ -161,7 +162,13 @@ export async function rebalanceCreateCommand(flags: Record<string, string>) {
     printJson({ ok: true, plan: row });
     return;
   }
-  console.log(`Created rebalance plan #${row.id}${row.name ? ` (${row.name})` : ""}  ${statusMarker(row.status)} ${row.status}`);
+  const paperTag = row.paper === 1 ? "  [PAPER]" : "";
+  console.log(`Created rebalance plan #${row.id}${row.name ? ` (${row.name})` : ""}  ${statusMarker(row.status)} ${row.status}${paperTag}`);
+  if (row.paper === 1) {
+    console.log("  Paper mode: drift is evaluated against the VIRTUAL book (tradekit paper balances)");
+    console.log("  and corrective trades fire into it — no real funds move. Seed the book first:");
+    console.log("    tradekit paper deposit --token USDC --amount 10000");
+  }
   console.log(`  Targets:  ${describeTargets(row)}`);
   console.log(`  Anchor:   ${row.quote_symbol ?? row.quote_token}`);
   console.log(`  Threshold: drift ≥ ${row.drift_threshold_pct}% triggers a rebalance`);
@@ -221,7 +228,7 @@ export async function rebalanceListCommand(flags: Record<string, string>) {
   for (const r of rows) {
     const id = String(r.id ?? "?").padStart(4);
     const st = (statusMarker(r.status) + " " + r.status).padEnd(11);
-    const name = (r.name ?? "—").padEnd(15);
+    const name = ((r.paper === 1 ? "📝" : "") + (r.name ?? "—")).padEnd(15);
     const targets = describeTargets(r).padEnd(35).slice(0, 35);
     const thresh = `≥ ${r.drift_threshold_pct}%`.padEnd(10);
     const next = formatRelativeAge(r.next_run_at).padEnd(16);
@@ -242,7 +249,8 @@ export async function rebalanceShowCommand(flags: Record<string, string>, positi
     printJson({ ok: true, plan: row });
     return;
   }
-  console.log(`Plan #${row.id}${row.name ? ` (${row.name})` : ""}  ${statusMarker(row.status)} ${row.status.toUpperCase()}`);
+  const paperTag = row.paper === 1 ? "  [PAPER]" : "";
+  console.log(`Plan #${row.id}${row.name ? ` (${row.name})` : ""}  ${statusMarker(row.status)} ${row.status.toUpperCase()}${paperTag}`);
   console.log(`  Targets:  ${describeTargets(row)}`);
   console.log(`  Anchor:   ${row.quote_symbol ?? row.quote_token}`);
   console.log(`  Threshold: drift ≥ ${row.drift_threshold_pct}% triggers`);

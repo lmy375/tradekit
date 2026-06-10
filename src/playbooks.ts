@@ -523,9 +523,9 @@ export function createOnePrimitive(args: {
   spec: PlaybookSpec;
   config: Config;
   /** Iter30: when true the produced primitives are marked paper.
-   *  Rebalance is not yet paper-aware (v1 scope); we deliberately
-   *  IGNORE the flag for rebalance entries with a logged warning
-   *  rather than silently dropping a paper deploy on the floor. */
+   *  v27: applies to ALL three primitive types — orders, schedules,
+   *  AND rebalance plans (paper rebalance evaluates drift against the
+   *  virtual book and fires legs through executePaperTrade). */
   paper?: boolean;
 }): DeployedItem {
   const { entry, localId, playbookId, strategyTag, spec, config } = args;
@@ -601,19 +601,10 @@ export function createOnePrimitive(args: {
       };
     }
     case "rebalance": {
-      if (paper) {
-        // v1 scope: rebalance isn't paper-aware. Reject explicitly
-        // rather than silently producing real-trading rebalance
-        // plans inside an otherwise-paper deploy — that surprise
-        // would burn capital. Operators can split: deploy paper
-        // orders/schedules + a separate real rebalance, or wait
-        // for paper-rebalance support.
-        throw new ToolError(
-          "INVALID_PARAMS",
-          `Playbook "${spec.name}" includes a rebalance entry "${localId}"; paper mode does not yet support rebalance primitives (v1 scope). Remove rebalance entries from the playbook for paper deploys, or deploy without --paper.`,
-          { details: { playbookId, localId, type: entry.type } },
-        );
-      }
+      // v27: rebalance is paper-aware — a `--paper` deploy now cascades to
+      // rebalance entries too (drift evaluated against the virtual book,
+      // legs routed through executePaperTrade). Pre-v27 this branch
+      // rejected paper deploys containing rebalance entries outright.
       const createArgs: CreateRebalancePlanArgs = {
         name: entry.name,
         account: accountLabel,
@@ -630,6 +621,7 @@ export function createOnePrimitive(args: {
         autoSlippage: entry.autoSlippage,
         strategy: strategyTag,
         note: entry.note,
+        paper,
       };
       const row = createRebalancePlanRow(createArgs, config);
       return {

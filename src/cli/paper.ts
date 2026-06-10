@@ -29,13 +29,12 @@ import {
   listPaperTrades,
   listPaperBalances,
   resetPaperState,
-  type PaperTradeRow,
   type PaperBalanceRow,
 } from "../db.js";
 import { loadConfig, resolveProfile } from "../config.js";
 import { resolveToken, makeTransport } from "../chains.js";
 import { getToken } from "../tokens.js";
-import { setPaperBalance, adjustPaperBalance } from "../paperTrade.js";
+import { setPaperBalance, adjustPaperBalance, summarizePaperPnl } from "../paperTrade.js";
 import { printJson, prompt, subcommandError } from "./helpers.js";
 
 // ── shared helpers ──────────────────────────────────────────
@@ -86,8 +85,8 @@ export async function paperTradesCommand(flags: Record<string, string>) {
   if (flags["strategy"]) filter.strategy = flags["strategy"];
   if (flags["source"]) {
     const src = flags["source"];
-    if (src !== "order" && src !== "schedule" && src !== "manual") {
-      throw new ToolError("INVALID_PARAMS", `--source must be one of order, schedule, manual (got "${src}").`);
+    if (src !== "order" && src !== "schedule" && src !== "rebalance" && src !== "manual") {
+      throw new ToolError("INVALID_PARAMS", `--source must be one of order, schedule, rebalance, manual (got "${src}").`);
     }
     filter.sourceType = src;
   }
@@ -242,55 +241,9 @@ export async function paperPnlCommand(flags: Record<string, string>) {
   if (flags["strategy"]) filter.strategy = flags["strategy"];
   const rows = listPaperTrades(filter);
 
-  // Group by strategy (null → "unattributed").
-  const grouped = new Map<string, PaperTradeRow[]>();
-  for (const r of rows) {
-    const key = r.strategy ?? "(unattributed)";
-    const arr = grouped.get(key) ?? [];
-    arr.push(r);
-    grouped.set(key, arr);
-  }
-
-  type Summary = {
-    strategy: string;
-    fills: number;
-    buys: number;
-    sells: number;
-    quoteSpent: number;
-    quoteReceived: number;
-    netQuote: number;
-    firstFillAt: string | null;
-    lastFillAt: string | null;
-  };
-  const summaries: Summary[] = [];
-  for (const [strategy, fills] of grouped) {
-    let buys = 0, sells = 0, qSpent = 0, qRecvd = 0;
-    let first: string | null = null, last: string | null = null;
-    for (const r of fills) {
-      const q = parseFloat(r.quote_amount);
-      if (r.direction === "buy") {
-        buys += 1;
-        qSpent += q;
-      } else {
-        sells += 1;
-        qRecvd += q;
-      }
-      if (!first || r.timestamp < first) first = r.timestamp;
-      if (!last || r.timestamp > last) last = r.timestamp;
-    }
-    summaries.push({
-      strategy,
-      fills: fills.length,
-      buys,
-      sells,
-      quoteSpent: qSpent,
-      quoteReceived: qRecvd,
-      netQuote: qRecvd - qSpent,
-      firstFillAt: first,
-      lastFillAt: last,
-    });
-  }
-  summaries.sort((a, b) => b.fills - a.fills);
+  // Iter: aggregation lives in the shared summarizePaperPnl() core so
+  // the CLI and the MCP `paper_pnl` tool report identical numbers.
+  const summaries = summarizePaperPnl(rows);
 
   if (flags["json"] === "true") {
     printJson({ ok: true, count: summaries.length, summaries });

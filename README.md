@@ -221,18 +221,20 @@ Decision timeline (5 entries):
   2026-05-01 20:00:00 UTC    $3030.00  HWM $3200.00 thr $3040.00         🔥 FIRED
 ```
 
-**Seven decision states:**
+**Nine decision states:**
 - `activation_pending` ○ — trailing order waiting for activation gate
 - `tracking_started` ⚙ — first tick after activation; HWM seeded
 - `hwm_advanced` ⚙ — water mark moved
 - `near_threshold` ⚠ — price first within `proximityPct` of fire threshold
 - `triggered_fired` 🔥 — engine fired the order
-- `triggered_skipped` ⏸ — trigger satisfied but engine declined (rate-limit, balance, safety)
-- `error` ✕ — engine path error (price fetch failed, RPC error, TX revert)
+- `triggered_skipped` ⏸ — trigger satisfied but engine declined (dry-run, engine lock, rate-limit, balance, safety); notes carry the reason
+- `error` ✕ — engine path error (price fetch failed, wallet load failed, trade exception — transient AND terminal; notes carry the error code so replay answers "why did this order flip to failed?")
+- `edited_by_operator` ✎ — order edited in-place; notes carry the field diff
+- `expired` ⌛ — engine retired the order (now ≥ `expires_at`); the replay timeline ends explicitly instead of just stopping. Also written by the pre-fire expiry re-check (an order whose `expires_at` passes during the price fetch / keystore decrypt is retired instead of fired)
 
 **Sampling decisions** (`shouldLogCheck`): a tick produces a journal row when ANY of:
 1. First entry for the order
-2. Terminal decision (`triggered_fired` / `triggered_skipped` / `error`) — always logged for forensic context
+2. Terminal decision (`triggered_fired` / `triggered_skipped` / `error` / `expired`) — always logged for forensic context
 3. Decision state changed from prior entry
 4. Water mark advanced (or null↔number transition)
 5. Price first crossed within `proximityPct` of threshold
@@ -389,6 +391,14 @@ tradekit rebalance list                        # active plans
 tradekit rebalance show 1                      # detail incl. last-run telemetry
 tradekit rebalance run --once --dry-run        # evaluate without firing
 tradekit rebalance pause 1                     # engine ignores while paused
+
+# Paper variant: drift is measured against the VIRTUAL book and corrective
+# legs fill it — no chain reads, no keystore, no real trades. Seed first.
+tradekit paper deposit --chain base --token ETH  --amount 0.5
+tradekit paper deposit --chain base --token USDC --amount 1000
+tradekit rebalance create --name paper-folio --paper true \
+  --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]' \
+  --chain base --account main
 ```
 
 **How drift is computed.** For each target token: `currentPct = tokenUsd / portfolioUsd × 100`. The plan fires when `max(|currentPct - targetPct|) ≥ driftThresholdPct`. The corrective trades are computed by:
@@ -1227,7 +1237,7 @@ tradekit playbook destroy 1
 tradekit playbook deploy ./eth-strategy.json
 ```
 
-**Per-primitive flag.** `--paper` is also available on `order create` / `schedule create` for one-off paper primitives. `playbook deploy --paper` cascades the flag across every order/schedule in the spec.
+**Per-primitive flag.** `--paper` is also available on `order create` / `schedule create` / `rebalance create` for one-off paper primitives. `playbook deploy --paper` cascades the flag across every order/schedule/rebalance entry in the spec.
 
 **What's identical to real mode.** Trigger predicates, trailing watermarks, OCO cascade, schedule cron / `next_run_at` advancement, post-fill hooks, notifications, engine lock (`tradekit engine lock` halts paper too), error codes (transient vs terminal classification). A failing paper trade emits `order.failed` / `schedule.failed` notifications using the same dedupKey pattern as real failures — operator workflow is unchanged.
 
@@ -1239,12 +1249,12 @@ tradekit playbook deploy ./eth-strategy.json
 - **No gas.** Paper trades are gas-free. Strategies that are only profitable when gas is cheap should still validate against historical gas via `tradekit backtest`.
 
 **Virtual book schema.** Two new tables (v24 migration):
-- `paper_trades` — mirrors the `trades` shape; carries `source_type` (order / schedule / manual) + `source_id` for attribution. Indexed on `(strategy, timestamp)` so per-strategy queries stay fast.
+- `paper_trades` — mirrors the `trades` shape; carries `source_type` (order / schedule / rebalance / manual) + `source_id` for attribution. Indexed on `(strategy, timestamp)` so per-strategy queries stay fast.
 - `paper_balances` — per `(account, chain, token)` running virtual balance. `paper deposit` writes here; `executePaperTrade` reads + atomically updates.
 
-**Pre-existing primitives are unaffected.** The v24 migration adds a `paper INTEGER NOT NULL DEFAULT 0` column to `orders` and `schedules`. Every pre-iter30 row keeps `paper=0` and runs through the unchanged real-trading path.
+**Pre-existing primitives are unaffected.** The v24 migration adds a `paper INTEGER NOT NULL DEFAULT 0` column to `orders` and `schedules` (v27 extends it to `rebalance_plans`). Every pre-existing row keeps `paper=0` and runs through the unchanged real-trading path.
 
-**v1 limitation: rebalance.** Paper mode supports orders + schedules; `playbook deploy --paper` with a rebalance primitive in the spec fails fast with INVALID_PARAMS rather than silently mixing real rebalance trades into a paper deploy. Paper rebalance is planned for v2.
+**Rebalance plans are paper-aware too (v27).** `rebalance create --paper true` registers a plan whose drift is evaluated against the VIRTUAL book — `paper balances` IS the portfolio, not the on-chain wallet. Corrective legs fire through `executePaperTrade` and fill back into the same virtual book, which is what makes the plan converge: after a correction lands, the next tick re-reads the (now-corrected) book and sees drift back inside the threshold. `playbook deploy --paper` with a rebalance entry in the spec cascades the flag the same way it does for orders/schedules — the pre-v27 fail-fast INVALID_PARAMS is gone. Seed the book with `paper deposit` first; an empty virtual book is an empty-portfolio skip, not an error. Paper plans use the read-only wallet path (no keystore decryption) and their fills land in `paper_trades` with `source_type='rebalance'`.
 
 **Open positions are NOT marked-to-market.** `paper pnl` reports REALIZED P&L only (sum of quote received - quote spent). Adding MTM would require an oracle call per held token, which makes the command non-deterministic. To see total P&L, pair `paper balances` with `tradekit price`.
 
@@ -1531,11 +1541,11 @@ tradekit schedule run --strict --json                  # daemon: watch=30 by def
 
 **Duration shorthand** — `--every 30m`, `1h`, `6h`, `1d`, `7d`. Compiles to the equivalent cron at create time and is stored in canonical form. Cadences that don't divide an hour or day evenly are rejected (use `--cron` for those).
 
-**Bounds** — optional `--start-at <ISO>` (engine skips fires before this), `--end-at <ISO>` (schedule flips to `completed` when reached), `--max-runs N` (lifetime cap; common for bounded campaigns like "buy 12 weekly chunks").
+**Bounds** — optional `--start-at <ISO>` (engine skips fires before this), `--end-at <ISO>` (schedule flips to `completed` when reached), `--max-runs N` (lifetime cap on SUCCESSFUL fires; common for bounded campaigns like "buy 12 weekly chunks"). Failed attempts don't consume the cap — a `--max-runs 12` campaign always delivers 12 actual buys even if some occurrences hit transient RPC errors along the way.
 
 **Lifecycle** — `active → paused → active` loop while running; terminal states are `completed` (reached max_runs or end_at) and `cancelled` (operator action). Failed fires stay `active` so each cron occurrence is evaluated independently — the row carries `last_error_code / last_error_message` for diagnosis, and `schedule.failed` fires via the notification system.
 
-**Run telemetry** — `run_count`, `total_base_filled`, `total_quote_spent`, `last_run_at`, `last_run_tx_hash` accumulate on every fire. `schedule show <id>` surfaces all of them at-a-glance — quick "how much have I DCA'd into ETH so far".
+**Run telemetry** — `run_count` (successful fires only), `total_base_filled`, `total_quote_spent`, `last_run_at`, `last_run_tx_hash` accumulate on every fire. `schedule show <id>` surfaces all of them at-a-glance — quick "how much have I DCA'd into ETH so far".
 
 **Post-fill hooks (iter27).** Auto-create a follow-up order after each successful fire. The classic use case: DCA buys ETH → auto-create a trailing-stop on the amount just bought. Pre-iter27 operators had to manually create the follow-up after every fire; with hooks, the schedule self-manages.
 
@@ -1916,12 +1926,15 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 70 tools across four groups:
+Starts an MCP stdio server exposing 104 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
-- **Trade** (27) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
-- **Security** (6) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`
-- **Admin / diagnostics** (19) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`
+- **Trade & automation** (29) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
+- **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
+- **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
+- **Strategy & backtest** (9) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
+- **Observability** (10) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `price_stats`
+- **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
 Every write tool accepts `simulate: true`. Errors are structured (see *Agent integration* below). Every monitoring/diagnostic tool exposes a top-level `severity` field ('ok' | 'warn' | 'critical' / 'fail') and a `recommendedActions[]` array carrying structured `NextAction[]` dispatch hints — agents branch on `severity` for at-a-glance status and iterate `recommendedActions` to auto-remediate without parsing prose.
 
@@ -2176,6 +2189,12 @@ Tools exposed via the `tradekit mcp` server, grouped by domain:
 **Security / approvals:** `allowances` `audit_allowances` `approve` `revoke` `revoke_all` `check_token`
 
 **Notifications:** `notify_list` `notify_test`
+
+**Paper trading (virtual book):** `paper_balances` `paper_trades` `paper_pnl` `paper_deposit` `paper_reset`
+- Manage the synthetic book that `paper: true` orders / schedules / playbooks fire against — the full dry-run loop over MCP, no real funds, no CLI fallback
+- `paper_deposit` seeds/adjusts a virtual balance (mode `credit` adds, mode `set` overwrites; decimals come from the same on-chain getToken lookup the trade flow uses)
+- `paper_pnl` is realized, quote-denominated P&L per strategy via the same `summarizePaperPnl()` core the CLI uses (numbers match across surfaces); open positions are NOT marked-to-market — pair with `paper_balances` + `price` for total P&L
+- `paper_reset` is destructive (wipes balances + fill journal for a scope) and requires `confirm: true`; omitting both `account` and `chain` wipes the whole book
 
 **Iter26 — strategy lifecycle (playbooks + backtests):**
 - **Playbook management:** `playbook_validate` `playbook_deploy` `playbook_list` `playbook_show` `playbook_destroy`

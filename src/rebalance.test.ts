@@ -454,7 +454,9 @@ describe("rebalance plans DB layer", () => {
     recordRebalanceError(id, "2026-06-01T06:00:00.000Z", "RPC_FAILED", "RPC down");
     const r = getRebalancePlanById(id)!;
     expect(r.status).toBe("active");
-    expect(r.run_count).toBe(1);
+    // run_count counts EXECUTED rebalances only — failures must not
+    // consume the max_runs quota (same fires-only contract as schedules).
+    expect(r.run_count).toBe(0);
     expect(r.last_run_status).toBe("failed");
     expect(r.last_error_code).toBe("RPC_FAILED");
     expect(r.last_error_message).toBe("RPC down");

@@ -621,36 +621,68 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     return ctx;
   }
 
+  // Iter25 journal config — hoisted out of the loop so EVERY per-order
+  // path (including the expiry retirement that runs before the price
+  // fetch) can record. Cheap no-op when the feature is disabled.
+  const journalConfig = {
+    enabled: config.engine.orderJournal.enabled,
+    proximityPct: config.engine.orderJournal.proximityPct,
+  };
+  const journalFor = async (
+    order: OrderRow,
+    priceUsd: number | null,
+    overrides: { fired?: boolean; skipped?: boolean; expired?: boolean; notes?: string; errorMessage?: string } = {},
+  ) => {
+    if (!journalConfig.enabled) return;
+    const { recordCheckEntry, buildObservation } = await import("./orderJournal.js");
+    recordCheckEntry({
+      observation: buildObservation({
+        order, priceUsd, checkedAt: new Date().toISOString(), ...overrides,
+      }),
+      config: journalConfig,
+    });
+  };
+
+  // Shared expiry retirement: mark + journal + notify + OCO cascade.
+  // Called from BOTH the step-1 pre-price check and the pre-fire
+  // re-check (the window between them spans price fetch + keystore
+  // decrypt, which can take seconds — an order must not fire after
+  // its expires_at even when the trigger matched before it).
+  const retireExpired = async (order: OrderRow, priceUsd: number | null) => {
+    markOrderExpired(order.id!);
+    expired += 1;
+    await journalFor(order, priceUsd, { expired: true });
+    // Notify: order expired. info severity — expiry is expected, not an
+    // alert; operators monitoring at minSeverity=warn won't see this.
+    await tryNotify(
+      {
+        event: "order.expired",
+        severity: "info",
+        title: `Order #${order.id} expired (${summarizeIntent(order)})`,
+        fields: {
+          id: order.id,
+          chain: order.chain,
+          account: order.account,
+          trigger: summarizeTrigger(order),
+          expiresAt: order.expires_at,
+        },
+        dedupKey: `order.expired:${order.id}`,
+      },
+      config,
+      args.logger,
+    );
+    // OCO cascade: an expired peer cancels the rest of its group.
+    await cascadeOcoIfApplicable(order, config, args.logger, {
+      firedAs: "expired",
+      firedReason: `expires_at ${order.expires_at}`,
+    });
+  };
+
   for (const order of orders) {
     if (order.id == null) continue;
     // 1) Expiry check — runs even before the price fetch since it's free.
     if (isOrderExpired(order)) {
-      markOrderExpired(order.id);
-      expired += 1;
-      // Notify: order expired. info severity — expiry is expected, not an
-      // alert; operators monitoring at minSeverity=warn won't see this.
-      await tryNotify(
-        {
-          event: "order.expired",
-          severity: "info",
-          title: `Order #${order.id} expired (${summarizeIntent(order)})`,
-          fields: {
-            id: order.id,
-            chain: order.chain,
-            account: order.account,
-            trigger: summarizeTrigger(order),
-            expiresAt: order.expires_at,
-          },
-          dedupKey: `order.expired:${order.id}`,
-        },
-        config,
-        args.logger,
-      );
-      // OCO cascade: an expired peer cancels the rest of its group.
-      await cascadeOcoIfApplicable(order, config, args.logger, {
-        firedAs: "expired",
-        firedReason: `expires_at ${order.expires_at}`,
-      });
+      await retireExpired(order, null);
       continue;
     }
 
@@ -683,21 +715,8 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     // this tick's evaluation; the journal helper applies the sampling
     // predicate (only writes on state changes). Cheap no-op when the
     // feature is disabled (default).
-    const journalConfig = {
-      enabled: config.engine.orderJournal.enabled,
-      proximityPct: config.engine.orderJournal.proximityPct,
-    };
-    const journalNow = new Date().toISOString();
-    const recordJournal = async (overrides: { fired?: boolean; skipped?: boolean; errorMessage?: string } = {}) => {
-      if (!journalConfig.enabled) return;
-      const { recordCheckEntry, buildObservation } = await import("./orderJournal.js");
-      recordCheckEntry({
-        observation: buildObservation({
-          order, priceUsd: currentPrice, checkedAt: journalNow, ...overrides,
-        }),
-        config: journalConfig,
-      });
-    };
+    const recordJournal = (overrides: { fired?: boolean; skipped?: boolean; expired?: boolean; notes?: string; errorMessage?: string } = {}) =>
+      journalFor(order, currentPrice, overrides);
 
     if (currentPrice == null) {
       transientErrors += 1;
@@ -771,10 +790,13 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
         errorCode: "ENGINE_LOCKED", errorMessage: msg,
       });
       setOrderError(order.id, "ENGINE_LOCKED", msg);
-      await recordJournal({ skipped: true });
+      await recordJournal({ skipped: true, notes: msg });
       continue;
     }
 
+    // Pre-fire expiry re-check. The step-1 check ran BEFORE the price
+    // fetch; on a slow tick (HTTP price call + per-account keystore
+    // decrypt for an earlier order) seconds can pass — enough for a
     // 4) Build the wallet (lazy — only when we actually need to fire).
     //    Iter30: paper orders use a read-only client (no keystore
     //    decryption) — the same path as dry-run ticks. This means a
@@ -797,6 +819,20 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       transientErrors += 1;
       setOrderError(order.id, code, msg);
       fills.push({ orderId: order.id, status: "skipped", observedPriceUsd: currentPrice, errorCode: code, errorMessage: msg });
+      await recordJournal({ errorMessage: `${code}: ${msg}` });
+      continue;
+    }
+
+    // Pre-fire expiry re-check. The step-1 check ran BEFORE the price
+    // fetch and the wallet build; on a slow tick (HTTP price call +
+    // keystore scrypt decrypt) seconds can pass — enough for a
+    // short-dated order to cross its expires_at between evaluation and
+    // fire. Firing outside the validity window violates the operator's
+    // explicit intent, so retire instead of firing. Same cascade
+    // semantics as the step-1 path (an expired OCO peer cancels the
+    // rest of its group).
+    if (isOrderExpired(order)) {
+      await retireExpired(order, currentPrice);
       continue;
     }
 
@@ -870,10 +906,20 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
         transientErrors += 1;
         setOrderError(order.id, code, msg);
         fills.push({ orderId: order.id, status: "skipped", observedPriceUsd: currentPrice, errorCode: code, errorMessage: msg });
+        // Journal: trigger matched but the fire attempt failed transiently
+        // (RPC flake, rate limit). Order stays active; replay shows WHY
+        // this tick didn't convert the trigger into a fill.
+        await recordJournal({ errorMessage: `${code}: ${msg}` });
       } else {
         markOrderFailed(order.id, code, msg);
         failed += 1;
         fills.push({ orderId: order.id, status: "failed", observedPriceUsd: currentPrice, errorCode: code, errorMessage: msg });
+        // Journal: terminal failure (safeguard tripped, insufficient
+        // balance, blacklist…). This is the single most forensically
+        // important entry after a fill — pre-fix the timeline simply
+        // stopped here and `order replay` couldn't answer "why did this
+        // order flip to failed?".
+        await recordJournal({ errorMessage: `${code}: ${msg}` });
         // Notify: terminal failure path (safeguard tripped, balance
         // insufficient, etc.). critical severity — distinguished from the
         // TX_REVERTED warn case because these block the operator's intent
@@ -1005,6 +1051,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       transientErrors += 1;
       setOrderError(order.id, "INTERNAL_ERROR", "executeTrade returned no tx hash");
       fills.push({ orderId: order.id, status: "skipped", observedPriceUsd: currentPrice, errorCode: "INTERNAL_ERROR", errorMessage: "no tx hash" });
+      await recordJournal({ errorMessage: "INTERNAL_ERROR: executeTrade returned no tx hash" });
     }
   }
 

@@ -11,6 +11,7 @@ import { registerTradeTools } from "./mcp/trade-tools.js";
 import { registerSecurityTools } from "./mcp/security-tools.js";
 import { registerStrategyTools } from "./mcp/strategy-tools.js";
 import { registerObservabilityTools } from "./mcp/observability-tools.js";
+import { registerPaperTools } from "./mcp/paper-tools.js";
 import { tradekitVersion } from "./version.js";
 
 export type { ServerOptions };
@@ -32,6 +33,10 @@ export function createMcpServer(opts: ServerOptions): McpServer {
   // Completes the gap between iter17-25 CLI features and the MCP surface.
   registerStrategyTools(server, runtime); // playbook_validate, playbook_deploy, playbook_list, playbook_show, playbook_destroy, backtest_order, backtest_playbook, backtest_compare
   registerObservabilityTools(server, runtime); // status_dashboard, digest_summary, order_replay, backtest_list, backtest_show, backtest_compare_list, backtest_compare_show
+  // Paper-trading book management — seed/inspect/reset the virtual book +
+  // realized P&L. Closes the CLI/MCP parity gap: paper trades could fire
+  // via the order/schedule `paper` flag but had no MCP management surface.
+  registerPaperTools(server, runtime); // paper_balances, paper_trades, paper_pnl, paper_deposit, paper_reset
 
   return server;
 }

@@ -918,7 +918,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       name: z.string().optional().describe("Operator label for list views + notifications."),
       startAt: z.string().optional().describe("ISO-8601 timestamp before which the engine skips fires."),
       endAt: z.string().optional().describe("ISO-8601 timestamp at which the schedule is marked completed (must be > now and > startAt)."),
-      maxRuns: z.number().int().positive().optional().describe("Lifetime cap on fires. Schedule flips to 'completed' when reached."),
+      maxRuns: z.number().int().positive().optional().describe("Lifetime cap on SUCCESSFUL fires. Schedule flips to 'completed' when reached. Failed attempts (RPC down, safeguard, balance) do NOT consume quota — a maxRuns=12 monthly DCA always delivers 12 actual buys."),
       strategy: z.string().max(100).optional(),
       note: z.string().optional(),
     },
@@ -1186,9 +1186,13 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       autoSlippage: z.boolean().optional(),
       startAt: z.string().optional().describe("ISO-8601 timestamp before which the engine skips fires."),
       endAt: z.string().optional().describe("ISO-8601 timestamp at which the plan flips to completed."),
-      maxRuns: z.number().int().positive().optional().describe("Lifetime cap on fires."),
+      maxRuns: z.number().int().positive().optional().describe("Lifetime cap on EXECUTED rebalances. Failed attempts (portfolio fetch error, wallet failure) do not consume quota."),
       strategy: z.string().max(100).optional(),
       note: z.string().optional(),
+      paper: z
+        .boolean()
+        .optional()
+        .describe("v27: paper plan — drift is evaluated against the VIRTUAL book (paper_balances) and corrective legs route through executePaperTrade. No chain trades, no keystore. Seed the book first via paper_deposit; inspect fills via paper_trades (source='rebalance'). Default false."),
     },
     async (input) => {
       try {
@@ -1215,6 +1219,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 autoSlippage: input.autoSlippage,
                 strategy: input.strategy,
                 note: input.note,
+                paper: input.paper,
               },
               config,
             );

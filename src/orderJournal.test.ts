@@ -344,6 +344,87 @@ describe("buildObservation — price_above / price_below", () => {
     expect(obs.thresholdUsd).toBe(3500);
     expect(obs.waterMarkUsd).toBeNull();
   });
+
+  // Regression: this was a no-op ternary (`triggered ? "near_threshold"
+  // : "near_threshold"`) — BOTH branches wrote near_threshold, so replay
+  // could not distinguish "approaching the threshold" from "trigger met
+  // but the engine didn't fire".
+  it("non-triggered price order observes near_threshold", () => {
+    const obs = buildObservation({
+      order: mkOrder({ trigger_type: "price_above", target_price_usd: 3500, water_mark_usd: null, trail_pct: null }),
+      priceUsd: 3200, // 3200 < 3500 — not triggered
+      checkedAt: "x",
+    });
+    expect(obs.decision).toBe("near_threshold");
+    expect(obs.notes ?? null).toBeNull();
+  });
+
+  it("triggered-but-unflagged price order observes triggered_skipped (not near_threshold)", () => {
+    const obs = buildObservation({
+      order: mkOrder({ trigger_type: "price_above", target_price_usd: 3500, water_mark_usd: null, trail_pct: null }),
+      priceUsd: 3600, // 3600 >= 3500 — trigger satisfied, no fired/skipped flag
+      checkedAt: "x",
+    });
+    expect(obs.decision).toBe("triggered_skipped");
+    expect(obs.notes).toContain("trigger satisfied");
+  });
+
+  it("price_below symmetric: triggered observes triggered_skipped", () => {
+    const obs = buildObservation({
+      order: mkOrder({ trigger_type: "price_below", target_price_usd: 3000, water_mark_usd: null, trail_pct: null }),
+      priceUsd: 2900, // 2900 <= 3000 — triggered
+      checkedAt: "x",
+    });
+    expect(obs.decision).toBe("triggered_skipped");
+  });
+});
+
+describe("buildObservation — expired override", () => {
+  it("expired override sets decision='expired' with expires_at note", () => {
+    const obs = buildObservation({
+      order: mkOrder({ expires_at: "2026-05-02T00:00:00Z" }),
+      priceUsd: null,
+      checkedAt: "2026-05-02T00:00:05Z",
+      expired: true,
+    });
+    expect(obs.decision).toBe("expired");
+    expect(obs.notes).toContain("2026-05-02T00:00:00Z");
+  });
+
+  it("expired override carries explicit notes when provided", () => {
+    const obs = buildObservation({
+      order: mkOrder({ expires_at: "2026-05-02T00:00:00Z" }),
+      priceUsd: 3100,
+      checkedAt: "x",
+      expired: true,
+      notes: "expired between trigger evaluation and fire",
+    });
+    expect(obs.decision).toBe("expired");
+    expect(obs.notes).toBe("expired between trigger evaluation and fire");
+    expect(obs.priceUsd).toBe(3100);
+  });
+
+  it("expired is a terminal decision — shouldLogCheck always logs it", () => {
+    expect(
+      shouldLogCheck({
+        current: { orderId: 1, checkedAt: "x", priceUsd: null, waterMarkUsd: null, thresholdUsd: null, decision: "expired" },
+        prior: mkRow({ decision: "expired" }), // even a duplicate logs
+        config: { enabled: true, proximityPct: 5 },
+      }),
+    ).toBe(true);
+  });
+
+  it("skipped override carries notes (lock reason context)", () => {
+    const obs = buildObservation({
+      order: mkOrder(),
+      priceUsd: 2950,
+      checkedAt: "x",
+      skipped: true,
+      notes: "engine locked: incident response",
+    });
+    expect(obs.decision).toBe("triggered_skipped");
+    expect(obs.notes).toBe("engine locked: incident response");
+  });
 });
 
 // ── recordCheckEntry — DB writes + gating ────────────────────
@@ -499,6 +580,7 @@ describe("decisionMarker + decisionLabel", () => {
     const decisions = [
       "activation_pending", "tracking_started", "hwm_advanced",
       "near_threshold", "triggered_fired", "triggered_skipped", "error",
+      "edited_by_operator", "expired",
     ] as const;
     for (const d of decisions) {
       expect(decisionMarker(d).length).toBeGreaterThan(0);

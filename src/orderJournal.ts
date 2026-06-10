@@ -20,6 +20,7 @@
  *   - triggered_fired      engine fired the order
  *   - triggered_skipped    trigger satisfied but engine declined
  *   - error                engine path error during check
+ *   - expired              engine retired the order (now >= expires_at)
  *   - activation_pending   first observation where trailing's
  *                          activation gate isn't yet reached
  *
@@ -115,7 +116,8 @@ export function shouldLogCheck(args: {
   if (
     current.decision === "triggered_fired" ||
     current.decision === "triggered_skipped" ||
-    current.decision === "error"
+    current.decision === "error" ||
+    current.decision === "expired"
   ) {
     return true;
   }
@@ -185,6 +187,13 @@ export function buildObservation(args: {
    *  (rate-limit, balance, safety) — sets decision to
    *  `triggered_skipped`. Notes carry the reason. */
   skipped?: boolean;
+  /** Optional free-form context for skipped / expired entries (the
+   *  lock reason, the expiry boundary, …). Ignored when errorMessage
+   *  is set (errorMessage IS the note on the error path). */
+  notes?: string;
+  /** True when the engine retired the order because now >= expires_at —
+   *  decision = "expired". Terminal: the replay timeline ends here. */
+  expired?: boolean;
   /** Set on engine-path errors — decision = "error". */
   errorMessage?: string;
 }): OrderCheckObservation {
@@ -199,6 +208,18 @@ export function buildObservation(args: {
       thresholdUsd: deriveThreshold(order, order.water_mark_usd),
       decision: "error",
       notes: args.errorMessage,
+    };
+  }
+
+  if (args.expired) {
+    return {
+      orderId: order.id!,
+      checkedAt,
+      priceUsd,
+      waterMarkUsd: order.water_mark_usd,
+      thresholdUsd: deriveThreshold(order, order.water_mark_usd),
+      decision: "expired",
+      notes: args.notes ?? (order.expires_at ? `expires_at ${order.expires_at}` : null),
     };
   }
 
@@ -220,6 +241,7 @@ export function buildObservation(args: {
       waterMarkUsd: order.water_mark_usd,
       thresholdUsd: deriveThreshold(order, order.water_mark_usd),
       decision: "triggered_skipped",
+      notes: args.notes ?? null,
     };
   }
 
@@ -272,17 +294,20 @@ export function buildObservation(args: {
     { trigger_type: order.trigger_type, target_price_usd: order.target_price_usd },
     priceUsd,
   );
+  // A trigger-satisfied observation that reaches this non-terminal path
+  // means the engine evaluated "would fire" but the caller didn't flag
+  // fired/skipped. Record it honestly as triggered_skipped (trigger met,
+  // no fire happened) instead of mislabeling it near_threshold — pre-fix
+  // this was a no-op ternary that wrote near_threshold for BOTH branches,
+  // so replay couldn't distinguish "approaching" from "met but unfired".
   return {
     orderId: order.id!,
     checkedAt,
     priceUsd,
     waterMarkUsd: null,
     thresholdUsd: order.target_price_usd,
-    decision: triggered ? "near_threshold" : "near_threshold",
-    // The "triggered" path normally routes to fire; if we're here
-    // without fired=true it means the engine evaluated as triggered
-    // but the caller didn't flag fired/skipped. Should be rare —
-    // engine path always knows.
+    decision: triggered ? "triggered_skipped" : "near_threshold",
+    notes: triggered ? "trigger satisfied; engine did not flag fired/skipped" : null,
   };
 }
 
@@ -359,6 +384,7 @@ export function decisionMarker(d: OrderCheckDecision): string {
     case "triggered_skipped":  return "⏸";
     case "error":              return "✕";
     case "edited_by_operator": return "✎";
+    case "expired":            return "⌛";
   }
 }
 
@@ -373,5 +399,6 @@ export function decisionLabel(d: OrderCheckDecision): string {
     case "triggered_skipped":  return "trigger skipped";
     case "error":              return "error";
     case "edited_by_operator": return "edited by operator";
+    case "expired":            return "expired";
   }
 }

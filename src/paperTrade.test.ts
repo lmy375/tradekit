@@ -41,7 +41,9 @@ const {
   readVirtualBalance,
   adjustPaperBalance,
   setPaperBalance,
+  summarizePaperPnl,
 } = await import("./paperTrade.js");
+type PaperTradeRow = import("./db.js").PaperTradeRow;
 const {
   openDb,
   closeDb,
@@ -138,6 +140,87 @@ describe("computeOppositeAmount", () => {
         effectivePrice: 100,
       }),
     ).toThrow(/Invalid baseAmount/);
+  });
+});
+
+// ── 1b) summarizePaperPnl (pure realized-P&L roll-up) ───────
+
+describe("summarizePaperPnl", () => {
+  function row(over: Partial<PaperTradeRow>): PaperTradeRow {
+    return {
+      id: 1,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      source_type: "order",
+      source_id: 1,
+      chain: "base",
+      account: "default",
+      direction: "buy",
+      base_token: "0xeee",
+      base_symbol: "ETH",
+      base_amount: "1",
+      quote_token: "0xbbb",
+      quote_symbol: "USDC",
+      quote_amount: "2000",
+      price: "2000",
+      slippage_bps: 50,
+      strategy: null,
+      notes: null,
+      ...over,
+    };
+  }
+
+  it("returns [] for empty input", () => {
+    expect(summarizePaperPnl([])).toEqual([]);
+  });
+
+  it("nets quoteReceived - quoteSpent per strategy", () => {
+    const out = summarizePaperPnl([
+      row({ direction: "buy", quote_amount: "2000", strategy: "dca" }),
+      row({ direction: "sell", quote_amount: "2100", strategy: "dca" }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      strategy: "dca",
+      fills: 2,
+      buys: 1,
+      sells: 1,
+      quoteSpent: 2000,
+      quoteReceived: 2100,
+      netQuote: 100,
+    });
+  });
+
+  it("folds null strategy into (unattributed)", () => {
+    const out = summarizePaperPnl([row({ strategy: null })]);
+    expect(out[0].strategy).toBe("(unattributed)");
+  });
+
+  it("sorts buckets by fill count descending", () => {
+    const out = summarizePaperPnl([
+      row({ strategy: "a" }),
+      row({ strategy: "b" }),
+      row({ strategy: "b" }),
+      row({ strategy: "b" }),
+      row({ strategy: "c" }),
+      row({ strategy: "c" }),
+    ]);
+    expect(out.map((s) => s.strategy)).toEqual(["b", "c", "a"]);
+  });
+
+  it("tracks first/last fill timestamps within a bucket", () => {
+    const out = summarizePaperPnl([
+      row({ strategy: "x", timestamp: "2026-03-01T00:00:00.000Z" }),
+      row({ strategy: "x", timestamp: "2026-01-01T00:00:00.000Z" }),
+      row({ strategy: "x", timestamp: "2026-02-01T00:00:00.000Z" }),
+    ]);
+    expect(out[0].firstFillAt).toBe("2026-01-01T00:00:00.000Z");
+    expect(out[0].lastFillAt).toBe("2026-03-01T00:00:00.000Z");
+  });
+
+  it("treats a non-finite quote_amount as 0 (defensive)", () => {
+    const out = summarizePaperPnl([row({ direction: "sell", quote_amount: "not-a-number", strategy: "x" })]);
+    expect(out[0].quoteReceived).toBe(0);
+    expect(out[0].netQuote).toBe(0);
   });
 });
 

@@ -1030,6 +1030,19 @@ const MIGRATIONS: string[] = [
   CREATE INDEX IF NOT EXISTS idx_engine_events_ts ON engine_events (timestamp DESC);
   CREATE INDEX IF NOT EXISTS idx_engine_events_type ON engine_events (event_type, timestamp);
   `,
+
+  // v27 — paper-mode rebalance.
+  //
+  // Completes the paper-trading triangle: orders + schedules grew
+  // `paper` in v24; rebalance plans were the holdout (playbook
+  // `--paper` deploys with rebalance entries were rejected outright).
+  // A paper plan evaluates drift against the VIRTUAL book (not real
+  // chain holdings — otherwise drift would never converge since
+  // paper fires don't move the real portfolio) and routes corrective
+  // legs through executePaperTrade.
+  `
+  ALTER TABLE rebalance_plans ADD COLUMN paper INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3504,6 +3517,14 @@ export function recordScheduleError(
 ): void {
   const db = openDb();
   const now = new Date().toISOString();
+  // NOTE: run_count is deliberately NOT incremented. run_count counts
+  // successful FIRES — that's the documented max_runs contract ("lifetime
+  // cap on fires") and what every consumer assumes (the max_runs
+  // completion check, on_fill's fireNumber, notification dedup keys, the
+  // CLI's RUNS column). Pre-fix this bumped run_count on failure too, so
+  // a max_runs=12 monthly DCA with 3 transient RPC failures completed
+  // after only 9 actual buys — silently shorting the campaign. The
+  // failure trail lives in last_run_status / last_error_* instead.
   db.prepare(
     `UPDATE schedules SET
        updated_at = ?,
@@ -3511,8 +3532,7 @@ export function recordScheduleError(
        last_run_at = ?,
        last_run_status = 'failed',
        last_error_code = ?,
-       last_error_message = ?,
-       run_count = run_count + 1
+       last_error_message = ?
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
 }
@@ -3619,6 +3639,10 @@ export interface RebalanceRow {
   last_run_max_drift_pct: number | null;
   last_error_code: string | null;
   last_error_message: string | null;
+  /** v27: 1 = paper plan — drift evaluated against the VIRTUAL book,
+   *  corrective legs fire through executePaperTrade (no chain, no
+   *  keystore). 0 = real plan. */
+  paper: number;
 }
 
 export interface InsertRebalancePlanArgs {
@@ -3639,6 +3663,8 @@ export interface InsertRebalancePlanArgs {
   auto_slippage: boolean;
   strategy: string | null;
   note: string | null;
+  /** v27: when true the plan trades against the virtual book. Default false. */
+  paper?: boolean;
 }
 
 export function insertRebalancePlan(args: InsertRebalancePlanArgs): number {
@@ -3652,8 +3678,8 @@ export function insertRebalancePlan(args: InsertRebalancePlanArgs): number {
          drift_threshold_pct, min_trade_usd,
          cron_expr, next_run_at, start_at, end_at, max_runs,
          slippage_bps, auto_slippage, strategy, note,
-         run_count
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         run_count, paper
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       now, now, "active", args.name, args.account, args.chain.toLowerCase(),
@@ -3663,7 +3689,7 @@ export function insertRebalancePlan(args: InsertRebalancePlanArgs): number {
       args.cron_expr, args.next_run_at, args.start_at, args.end_at, args.max_runs,
       args.slippage_bps, args.auto_slippage ? 1 : 0,
       args.strategy, capTradeNotes(args.note),
-      0,
+      0, args.paper === true ? 1 : 0,
     );
   return Number(result.lastInsertRowid);
 }
@@ -3775,6 +3801,9 @@ export function recordRebalanceError(
 ): void {
   const db = openDb();
   const now = new Date().toISOString();
+  // run_count NOT incremented on failure — same fires-only contract as
+  // recordScheduleError (see the note there). A rebalance plan's
+  // max_runs counts executed rebalances, not failed attempts.
   db.prepare(
     `UPDATE rebalance_plans SET
        updated_at = ?,
@@ -3782,8 +3811,7 @@ export function recordRebalanceError(
        last_run_at = ?,
        last_run_status = 'failed',
        last_error_code = ?,
-       last_error_message = ?,
-       run_count = run_count + 1
+       last_error_message = ?
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
 }
@@ -4287,7 +4315,12 @@ export type OrderCheckDecision =
   // carries the JSON-encoded diff (old → new per field). HWM /
   // attempts / journal continuity stay intact across edits, so
   // `order replay` shows the edit alongside the trigger timeline.
-  | "edited_by_operator";
+  | "edited_by_operator"
+  // Engine observed now >= expires_at and retired the order. Terminal —
+  // the replay timeline ends here instead of just stopping silently.
+  // Additive: order_check_log.decision has no CHECK constraint, so old
+  // rows / old readers are unaffected.
+  | "expired";
 
 export interface OrderCheckLogRow {
   id: number;
@@ -4781,7 +4814,7 @@ export function getDbFileStats(): DbFileStats {
 export interface PaperTradeRow {
   id: number;
   timestamp: string;
-  /** "order" | "schedule" | "manual" — identifies the spawning primitive. */
+  /** "order" | "schedule" | "rebalance" | "manual" — identifies the spawning primitive. */
   source_type: string;
   source_id: number | null;
   chain: string;
@@ -4810,7 +4843,7 @@ export interface PaperBalanceRow {
 
 export interface InsertPaperTradeArgs {
   timestamp: string;
-  source_type: "order" | "schedule" | "manual";
+  source_type: "order" | "schedule" | "rebalance" | "manual";
   source_id: number | null;
   chain: string;
   account: string;
@@ -4892,7 +4925,7 @@ export interface ListPaperTradesFilter {
   account?: string;
   chain?: string;
   strategy?: string;
-  sourceType?: "order" | "schedule" | "manual";
+  sourceType?: "order" | "schedule" | "rebalance" | "manual";
   sinceIso?: string;
   untilIso?: string;
   limit?: number;

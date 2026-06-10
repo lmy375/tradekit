@@ -324,6 +324,10 @@ export interface CreateRebalancePlanArgs {
   autoSlippage?: boolean;
   strategy?: string;
   note?: string;
+  /** v27: when true the plan is paper — drift is evaluated against the
+   *  VIRTUAL book (paper_balances) and corrective legs route through
+   *  executePaperTrade. No chain trades, no keystore. Default false. */
+  paper?: boolean;
 }
 
 export function createRebalancePlanRow(args: CreateRebalancePlanArgs, config: Config = loadConfig()): RebalanceRow {
@@ -415,6 +419,7 @@ export function createRebalancePlanRow(args: CreateRebalancePlanArgs, config: Co
     auto_slippage: args.autoSlippage ?? false,
     strategy: args.strategy ?? null,
     note: args.note ?? null,
+    paper: args.paper === true,
   };
   const id = insertRebalancePlan(insertArgs);
   const row = getRebalancePlanById(id);
@@ -470,8 +475,12 @@ export interface RebalanceTickArgs {
   dryRun?: boolean;
   logger: Logger;
   now?: Date;
-  /** Inject a portfolio fetcher for tests. Default uses live RPC. */
+  /** Inject a portfolio fetcher for tests. Default uses live RPC.
+   *  Applies to REAL plans only — paper plans use fetchPaperPortfolio. */
   fetchPortfolio?: (chain: string, account: string, config: Config, logger: Logger) => Promise<PortfolioSnapshot>;
+  /** v27: inject the PAPER portfolio fetcher for tests. Default builds
+   *  the snapshot from the virtual book (paper_balances × spot prices). */
+  fetchPaperPortfolio?: (chain: string, account: string, config: Config, logger: Logger) => Promise<PortfolioSnapshot>;
 }
 
 export interface RebalanceFireReport {
@@ -512,6 +521,77 @@ async function defaultFetchPortfolio(chain: string, account: string, config: Con
   const wallet = loadReadOnlyWallet(profile, extraRpcs, account);
   const report = await holdingsOnChain(wallet.account.address, chain, config, logger);
   return chainHoldingsToSnapshot([report]);
+}
+
+/**
+ * v27: portfolio snapshot for PAPER plans — built from the virtual book
+ * (paper_balances) instead of on-chain holdings.
+ *
+ * Why this matters: a paper rebalance MUST evaluate drift against the
+ * book its trades actually move. Evaluating against the real chain
+ * portfolio while firing paper legs would never converge — the real
+ * holdings don't change when paper trades fire, so the engine would
+ * "correct" the same drift every tick forever. Against the virtual
+ * book, a fired correction shows up on the next tick as reduced drift,
+ * which is exactly the feedback loop the operator is trying to
+ * validate.
+ *
+ * Pricing: spot via getCurrentPrice per distinct token (the engine's
+ * batch prefetch usually makes these cache hits). The NATIVE sentinel
+ * is priced via the chain's WETH (sub-bp tracking — same convention as
+ * the orders engine) and reported with address "NATIVE" so
+ * computeDrift's native aliasing (ETH/NATIVE/BNB/POL) matches.
+ * Symbols come from the chain profile's static token map (best-effort;
+ * address-targeted plans match by address anyway).
+ */
+async function defaultFetchPaperPortfolio(
+  chain: string,
+  account: string,
+  config: Config,
+  logger: Logger,
+): Promise<PortfolioSnapshot> {
+  const { listPaperBalances } = await import("./db.js");
+  const { getCurrentPrice } = await import("./price.js");
+  const { isNativeSentinel } = await import("./paperTrade.js");
+  const profile = resolveProfile(chain, config);
+
+  // Reverse symbol lookup: address → symbol from the profile's static map
+  // (+ the canonical weth/usdc fields).
+  const symbolByAddress = new Map<string, string>();
+  for (const [sym, addr] of Object.entries(profile.tokens ?? {})) {
+    symbolByAddress.set(addr.toLowerCase(), sym);
+  }
+  symbolByAddress.set(profile.weth.toLowerCase(), symbolByAddress.get(profile.weth.toLowerCase()) ?? "WETH");
+  symbolByAddress.set(profile.usdc.toLowerCase(), symbolByAddress.get(profile.usdc.toLowerCase()) ?? "USDC");
+
+  const rows = listPaperBalances({ account, chain });
+  const tokens: PortfolioToken[] = [];
+  let totalUsd = 0;
+  let hasUnpriced = false;
+
+  for (const row of rows) {
+    const amount = parseFloat(row.balance);
+    if (!Number.isFinite(amount) || amount <= 0) continue; // zeroed rows stay in the book after spends
+    const native = isNativeSentinel(row.token as Address);
+    // Price the native sentinel via WETH (the oracle wants a real ERC20).
+    const priceTarget = native ? profile.weth : (row.token as Address);
+    let price: number | null = null;
+    try {
+      price = await getCurrentPrice(priceTarget, logger);
+    } catch (e) {
+      logger.debug(`paper portfolio: price fetch failed for ${priceTarget}: ${(e as Error).message}`);
+    }
+    const usd = price != null && price > 0 ? amount * price : null;
+    if (usd == null) hasUnpriced = true;
+    else totalUsd += usd;
+    tokens.push({
+      chain,
+      symbol: native ? profile.nativeSymbol : symbolByAddress.get(row.token.toLowerCase()) ?? null,
+      address: native ? "NATIVE" : row.token,
+      usd,
+    });
+  }
+  return { totalUsd, hasUnpriced, tokens };
 }
 
 /** Conservative classifier — same shape as the orders / schedules engines. */
@@ -563,7 +643,9 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
   let completed = 0;
 
   const config = loadConfig();
-  const fetcher = args.fetchPortfolio ?? defaultFetchPortfolio;
+  const realFetcher = args.fetchPortfolio ?? defaultFetchPortfolio;
+  // v27: paper plans evaluate drift against the virtual book.
+  const paperFetcher = args.fetchPaperPortfolio ?? defaultFetchPaperPortfolio;
 
   // Iter28: engine lock. When the kill switch is active, skip
   // rebalance evaluation entirely (the portfolio fetch is the
@@ -616,13 +698,17 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
     label: string;
   };
   const built = new Map<string, Built>();
-  async function ensureWallet(chain: string, account: string): Promise<Built> {
+  async function ensureWallet(chain: string, account: string, opts: { readOnly?: boolean } = {}): Promise<Built> {
+    // v27: opts.readOnly forces the read-only client even when a password
+    // is available — paper plans don't need (and shouldn't decrypt) the
+    // keystore. Cache namespace is shared: paper only needs the
+    // publicClient and the unused read-only walletClient is harmless.
     const key = `${chain}:${account}`;
     const cached = built.get(key);
     if (cached) return cached;
     const profile = resolveProfile(chain, config);
     const extraRpcs = config.chains[chain]?.rpcs ?? [];
-    const wallet = args.dryRun || !args.password
+    const wallet = args.dryRun || opts.readOnly || !args.password
       ? loadReadOnlyWallet(profile, extraRpcs, account)
       : await loadWallet(args.password, profile, extraRpcs, args.logger, account);
     const out: Built = {
@@ -709,7 +795,11 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       continue;
     }
 
-    // Fetch portfolio.
+    // Fetch portfolio. Paper plans read the VIRTUAL book — the only
+    // portfolio their corrective legs can actually move (see
+    // defaultFetchPaperPortfolio's convergence rationale).
+    const isPaperPlan = (plan.paper ?? 0) === 1;
+    const fetcher = isPaperPlan ? paperFetcher : realFetcher;
     let snapshot: PortfolioSnapshot;
     try {
       snapshot = await fetcher(plan.chain, plan.account, config, args.logger);
@@ -834,10 +924,11 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       continue;
     }
 
-    // Real fire. Build wallet, execute each leg.
+    // Fire. Build wallet (read-only for paper — no keystore decrypt),
+    // execute each leg.
     let walletBuilt: Built;
     try {
-      walletBuilt = await ensureWallet(plan.chain, plan.account);
+      walletBuilt = await ensureWallet(plan.chain, plan.account, { readOnly: isPaperPlan });
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const code = (e as { code?: string }).code ?? "WALLET_LOCKED";
@@ -893,7 +984,38 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         accountLabel: walletBuilt.label,
       };
       try {
-        const result = await executeTrade(req, ctx);
+        let result: TradeResult;
+        if (isPaperPlan) {
+          // v27: paper legs trade against the virtual book. Same request
+          // shape; the result is structurally compatible with the
+          // TradeResult subset consumed below (txHash "paper:…", status
+          // "success"). Sells raise the virtual quote balance that the
+          // subsequent buy legs spend — the same sells-first ordering the
+          // real path relies on.
+          const { executePaperTrade } = await import("./paperTrade.js");
+          const paperResult = await executePaperTrade(
+            {
+              direction: step.direction,
+              base: baseResolved,
+              quote: quoteAddr,
+              quoteAmount: step.amountUsd.toFixed(2),
+              slippageBps: plan.slippage_bps ?? undefined,
+              note: plan.note ? `[rebalance #${plan.id}] ${plan.note}` : `[rebalance #${plan.id}]`,
+              strategy: plan.strategy ?? undefined,
+              source: { type: "rebalance", id: plan.id ?? null },
+            },
+            {
+              publicClient: walletBuilt.publicClient,
+              profile: walletBuilt.profile,
+              config,
+              logger: args.logger,
+              accountLabel: walletBuilt.label,
+            },
+          );
+          result = paperResult as unknown as TradeResult;
+        } else {
+          result = await executeTrade(req, ctx);
+        }
         if (result.txHash && result.status !== "failed") {
           executedLegs.push({ description: step.description, ok: true, txHash: result.txHash });
         } else {

@@ -70,6 +70,7 @@ import {
   recordPaperTrade,
   getPaperBalance,
   upsertPaperBalance,
+  type PaperTradeRow,
 } from "./db.js";
 
 /** Request shape for executePaperTrade. Mirrors the meaningful
@@ -94,7 +95,7 @@ export interface PaperTradeRequest {
   /** What spawned this trade — used for paper_trades.source_type
    *  + source_id attribution. */
   source: {
-    type: "order" | "schedule" | "manual";
+    type: "order" | "schedule" | "rebalance" | "manual";
     id: number | null;
   };
 }
@@ -539,6 +540,93 @@ export function setPaperBalance(args: {
     throw new ToolError("INVALID_PARAMS", `Amount cannot be negative ("${args.amount}").`);
   }
   writeVirtualBalance(args.account, args.chain.toLowerCase(), args.token, args.decimals, big);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Realized P&L summary (shared core).
+//
+// Pulled out of cli/paper.ts's paperPnlCommand so the CLI and the
+// MCP `paper_pnl` tool compute identical numbers from one code path
+// (avoids the CLI/MCP drift that re-implementing aggregation invites).
+//
+// REALIZED only — quote-denominated. Open positions are NOT marked-
+// to-market because that needs a live oracle call per token, which
+// would make the function non-deterministic (and untestable without
+// network). Callers wanting total P&L pair this with paper balances
+// + spot prices. This is the same deliberate scope the CLI documents.
+// ──────────────────────────────────────────────────────────────────
+
+/** One strategy's realized paper-trading P&L roll-up. */
+export interface PaperPnlSummary {
+  /** Strategy tag, or "(unattributed)" for fills with no strategy. */
+  strategy: string;
+  /** Total fills in this strategy bucket. */
+  fills: number;
+  buys: number;
+  sells: number;
+  /** Sum of quote_amount across buys (quote spent acquiring base). */
+  quoteSpent: number;
+  /** Sum of quote_amount across sells (quote received disposing base). */
+  quoteReceived: number;
+  /** quoteReceived - quoteSpent. Positive = net quote inflow. */
+  netQuote: number;
+  /** ISO timestamp of the earliest fill in the bucket (null if empty). */
+  firstFillAt: string | null;
+  /** ISO timestamp of the latest fill in the bucket (null if empty). */
+  lastFillAt: string | null;
+}
+
+/**
+ * Group paper trades by strategy and roll up realized quote-denominated
+ * P&L per bucket. Pure — no DB, no network. Sorted by fill count
+ * descending so the busiest strategy leads.
+ *
+ * NULL strategy folds into the "(unattributed)" bucket so untagged
+ * paper volume is still accounted for (matches the CLI behaviour).
+ */
+export function summarizePaperPnl(rows: readonly PaperTradeRow[]): PaperPnlSummary[] {
+  const grouped = new Map<string, PaperTradeRow[]>();
+  for (const r of rows) {
+    const key = r.strategy ?? "(unattributed)";
+    const arr = grouped.get(key) ?? [];
+    arr.push(r);
+    grouped.set(key, arr);
+  }
+
+  const summaries: PaperPnlSummary[] = [];
+  for (const [strategy, fills] of grouped) {
+    let buys = 0, sells = 0, quoteSpent = 0, quoteReceived = 0;
+    let firstFillAt: string | null = null;
+    let lastFillAt: string | null = null;
+    for (const r of fills) {
+      // quote_amount is a decimal string; parseFloat is fine for a
+      // P&L summary (we're not settling on-chain amounts here).
+      const q = parseFloat(r.quote_amount);
+      const qSafe = Number.isFinite(q) ? q : 0;
+      if (r.direction === "buy") {
+        buys += 1;
+        quoteSpent += qSafe;
+      } else {
+        sells += 1;
+        quoteReceived += qSafe;
+      }
+      if (!firstFillAt || r.timestamp < firstFillAt) firstFillAt = r.timestamp;
+      if (!lastFillAt || r.timestamp > lastFillAt) lastFillAt = r.timestamp;
+    }
+    summaries.push({
+      strategy,
+      fills: fills.length,
+      buys,
+      sells,
+      quoteSpent,
+      quoteReceived,
+      netQuote: quoteReceived - quoteSpent,
+      firstFillAt,
+      lastFillAt,
+    });
+  }
+  summaries.sort((a, b) => b.fills - a.fills);
+  return summaries;
 }
 
 // Defensive: surface isNativeSentinel so callers don't have to

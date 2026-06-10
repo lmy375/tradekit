@@ -151,13 +151,16 @@ PORTFOLIO REBALANCING
                    [--cron "0 */6 * * *"] [--drift-threshold 5] [--min-trade-usd 10]
                    [--quote-token USDC] [--slippage <bps>] [--auto-slippage]
                    [--start-at <ISO>] [--end-at <ISO>] [--max-runs N]
-                   [--name X] [--strategy TAG] [--note "..."] [--json]
+                   [--name X] [--strategy TAG] [--note "..."] [--paper true|false] [--json]
         Declarative target-weight plan. On each engine tick the plan evaluates the live
         portfolio, computes per-target drift, and (if max drift >= threshold) fires the
         corrective trades through executeTrade. Trades route through the quote anchor
         (defaults to chain USDC). Each plan is scoped to ONE chain + ONE account.
         Targets must sum to exactly 100%. Sub-min-trade-usd legs skip to avoid gas
         burn on tiny corrections.
+        --paper true: drift is evaluated against the VIRTUAL book (paper balances), and
+        corrective legs fill the virtual book — no chain reads, no keystore, no real
+        trades. Seed with 'paper deposit' first or every tick is an empty-portfolio skip.
   rebalance list [--status all|active|paused|completed|cancelled] [--chain X] [--account L]
                  [--strategy TAG] [--limit N] [--json]
   rebalance show <id> [--json]                 Full detail incl. last-run telemetry
@@ -372,7 +375,7 @@ PAPER TRADING (virtual book, no on-chain submission)
         balance; --set OVERWRITES to an exact amount (used after a reset). Required before
         firing paper buys — every paper trade enforces the virtual balance, so the operator
         must explicitly fund the book.
-  paper trades [--account L] [--chain X] [--strategy TAG] [--source order|schedule|manual]
+  paper trades [--account L] [--chain X] [--strategy TAG] [--source order|schedule|rebalance|manual]
                [--since ISO] [--until ISO] [--limit N] [--json]
         Chronological journal of paper fills. Same filters as 'trades' so a strategy can
         be evaluated identically in paper + real.

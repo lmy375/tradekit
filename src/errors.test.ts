@@ -487,6 +487,10 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "engine_events",
     // Iter40: DB lifecycle observability.
     "db_stats", "db_integrity_check",
+    // paper-tools.ts: virtual-book management for dry-run strategies
+    // (closes the CLI/MCP parity gap — paper trades could fire via the
+    // order/schedule `paper` flag but had no MCP management surface).
+    "paper_balances", "paper_trades", "paper_pnl", "paper_deposit", "paper_reset",
   ]);
 
   it("ERROR_PATTERNS nextActions only reference registered MCP tools", () => {

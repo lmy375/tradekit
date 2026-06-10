@@ -315,6 +315,24 @@ describe("deployPlaybook — happy path", () => {
     expect(groups.every((g) => g!.startsWith(`pb${result.playbookId}-`))).toBe(true);
     expect(new Set(groups).size).toBe(1); // both peers share the SAME namespaced group
   });
+
+  it("v27: --paper cascades to rebalance entries too (pre-v27 this deploy was rejected)", () => {
+    const spec = parsePlaybookSpec({
+      name: "paper-with-rebalance",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }] },
+      ],
+    });
+    const result = deployPlaybook({ spec, sourcePath: null, paper: true });
+    expect(result.items.length).toBe(2);
+    const detail = getPlaybookDetail(result.playbookId);
+    expect(detail.orders[0].paper).toBe(1);
+    expect(detail.rebalances.length).toBe(1);
+    expect(detail.rebalances[0].paper).toBe(1); // the v27 cascade
+  });
 });
 
 describe("deployPlaybook — idempotency", () => {
