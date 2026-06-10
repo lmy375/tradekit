@@ -123,6 +123,12 @@ export interface PaperPnlMtmSummary extends PaperPnlSummary {
   /** Fills excluded from cost basis because their quote token is not
    *  a recognized stablecoin (volatile-quote pairs). */
   skippedNonStableQuote: number;
+  /** v31: cumulative realized P&L trajectory — one point per
+   *  realizing SELL, chronological. Deterministic (pure function of
+   *  the fill journal; no marks involved). Answers "is this strategy
+   *  improving or bleeding?" — the same +$500 total reads completely
+   *  differently as a steady climb vs a spike-and-give-back. */
+  realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }>;
 }
 
 export interface PaperPnlMtmReport {
@@ -186,10 +192,12 @@ export async function computePaperPnlMtm(
   }
 
   // Walk cost basis per strategy bucket.
-  const buckets = new Map<string, { positions: Map<string, PosAcc>; skippedNonStableQuote: number }>();
+  const buckets = new Map<string, { positions: Map<string, PosAcc>; skippedNonStableQuote: number; realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }> }>();
   for (const [strategy, fills] of grouped) {
     const positions = new Map<string, PosAcc>();
     let skipped = 0;
+    let bucketRealized = 0;
+    const realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }> = [];
     for (const r of fills) {
       if (!isStablecoin(r.quote_symbol)) {
         skipped += 1;
@@ -228,7 +236,12 @@ export async function computePaperPnlMtm(
         const sellPricePerUnit = quoteAmt / baseAmt;
         const sold = Math.min(baseAmt, Math.max(0, acc.amount));
         const untracked = baseAmt - sold;
-        acc.realized += (sellPricePerUnit - avgCost) * sold;
+        const realizedDelta = (sellPricePerUnit - avgCost) * sold;
+        acc.realized += realizedDelta;
+        if (sold > FLAT_EPSILON) {
+          bucketRealized += realizedDelta;
+          realizedTimeline.push({ at: r.timestamp, cumulativeRealizedQuote: bucketRealized });
+        }
         acc.amount -= sold;
         acc.cost = Math.max(0, acc.cost - avgCost * sold);
         if (untracked > FLAT_EPSILON) {
@@ -237,7 +250,7 @@ export async function computePaperPnlMtm(
         }
       }
     }
-    buckets.set(strategy, { positions, skippedNonStableQuote: skipped });
+    buckets.set(strategy, { positions, skippedNonStableQuote: skipped, realizedTimeline });
   }
 
   // Mark open positions. Memoize oracle calls per (chain, token) — the
@@ -320,6 +333,7 @@ export async function computePaperPnlMtm(
       positions: positionEntries,
       unpricedPositionCount: unpriced,
       skippedNonStableQuote: bucket.skippedNonStableQuote,
+      realizedTimeline: bucket.realizedTimeline,
     });
   }
 

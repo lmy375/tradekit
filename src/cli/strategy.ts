@@ -385,6 +385,34 @@ function formatPendingRow(t: PendingTriggerEntry): string {
   return `#${String(t.orderId).padEnd(5)} ${t.side.padEnd(4)} ${trig.padEnd(10)} target ${target.padStart(12)}  current ${curr.padStart(12)}  dist ${dist.padStart(8)}  ${fireFlag}`.trimEnd();
 }
 
+/** Downsample a series to `width` buckets and render a unicode
+ *  sparkline. Pure; exported for tests. Empty/constant series render
+ *  flat. */
+export function sparkline(values: number[], width = 40): string {
+  if (values.length === 0) return "";
+  const BARS = "▁▂▃▄▅▆▇█";
+  // Downsample: take the LAST value in each bucket (trajectory's
+  // closing value, not an average — this is a cumulative series).
+  const sampled: number[] = [];
+  if (values.length <= width) {
+    sampled.push(...values);
+  } else {
+    for (let i = 0; i < width; i++) {
+      const idx = Math.min(values.length - 1, Math.floor(((i + 1) * values.length) / width) - 1);
+      sampled.push(values[idx]);
+    }
+  }
+  const min = Math.min(...sampled);
+  const max = Math.max(...sampled);
+  const span = max - min;
+  return sampled
+    .map((v) => {
+      const norm = span === 0 ? 0.5 : (v - min) / span;
+      return BARS[Math.min(BARS.length - 1, Math.floor(norm * BARS.length))];
+    })
+    .join("");
+}
+
 function renderValuation(report: StrategyReport): string[] {
   const v = report.valuation;
   if (!v) return [];
@@ -395,6 +423,13 @@ function renderValuation(report: StrategyReport): string[] {
   const unreal = v.unrealizedQuote == null ? "— (unpriced)" : sign(v.unrealizedQuote);
   lines.push(`  Realized:    ${sign(v.realizedQuote)}   Unrealized: ${unreal}   Total: ${sign(v.totalQuote)}`);
   lines.push(`  Open value:  $${v.openValueQuote.toFixed(2)}   marked at ${v.markedAt}`);
+  if (v.realizedTimeline.length >= 2) {
+    const vals = v.realizedTimeline.map((t) => t.cumulativeRealizedQuote);
+    const first = v.realizedTimeline[0];
+    const last = v.realizedTimeline[v.realizedTimeline.length - 1];
+    lines.push(`  Trajectory:  ${sparkline(vals)}  (${v.realizedTimeline.length} realizing sells)`);
+    lines.push(`               ${sign(vals[0])} @ ${first.at.slice(0, 10)}  →  ${sign(last.cumulativeRealizedQuote)} @ ${last.at.slice(0, 10)}   peak ${sign(Math.max(...vals))}  trough ${sign(Math.min(...vals))}`);
+  }
   for (const p of v.positions) {
     if (p.amount <= 1e-9 && p.realizedQuote === 0 && p.untrackedSellBase === 0) continue;
     const sym = p.symbol ?? p.token.slice(0, 10);

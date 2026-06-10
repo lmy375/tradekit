@@ -267,6 +267,10 @@ export interface ValuationSection {
    *  inventory, or real trades predating the journal) — proceeds
    *  excluded from realizedQuote, reported for transparency. */
   untrackedSellQuote: number;
+  /** v31: cumulative realized trajectory (one point per realizing
+   *  sell, chronological). Deterministic — present even without a
+   *  markPriceFn. Empty when the strategy never realized. */
+  realizedTimeline: Array<{ at: string; cumulativeRealizedQuote: number }>;
 }
 
 export interface RiskSection {
@@ -1024,6 +1028,11 @@ async function buildValuation(args: {
   const unrealizedQuote = hasOpen
     ? (unrealizedVals.length > 0 ? unrealizedVals.reduce((a, v) => a + v, 0) : null)
     : 0;
+  // Trajectory: rows are tag-filtered so there is one bucket in
+  // practice; with multiple defensive buckets the per-bucket
+  // cumulatives can't be merged without re-walking — take the single
+  // bucket's timeline, else empty.
+  const realizedTimeline = buckets.length === 1 ? buckets[0].realizedTimeline : [];
   return {
     markedAt: report.timestamp,
     realizedQuote,
@@ -1034,6 +1043,7 @@ async function buildValuation(args: {
     unpricedPositionCount: buckets.reduce((acc, b) => acc + b.unpricedPositionCount, 0),
     skippedNonStableQuote: buckets.reduce((acc, b) => acc + b.skippedNonStableQuote, 0),
     untrackedSellQuote: positions.reduce((acc, p) => acc + p.untrackedSellQuote, 0),
+    realizedTimeline,
   };
 }
 

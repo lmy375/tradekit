@@ -37,6 +37,7 @@ import { resolveToken, makeTransport } from "../chains.js";
 import { getToken } from "../tokens.js";
 import { setPaperBalance, adjustPaperBalance, summarizePaperPnl } from "../paperTrade.js";
 import { computePaperPnlMtm, defaultPaperPriceFetcher, type PaperPnlMtmSummary } from "../paperPnl.js";
+import { sparkline } from "./strategy.js";
 import { printJson, prompt, subcommandError, makeCliLogger } from "./helpers.js";
 
 // ── shared helpers ──────────────────────────────────────────
@@ -300,6 +301,9 @@ function renderMtmSummary(s: PaperPnlMtmSummary): void {
   console.log(`  ${s.strategy.padEnd(24)}  fills=${s.fills}  buy=${s.buys}  sell=${s.sells}`);
   const unreal = s.unrealizedQuote == null ? "— (unpriced)" : fmtSigned(s.unrealizedQuote);
   console.log(`    realized ${fmtSigned(s.realizedQuote)}  unrealized ${unreal}  total ${fmtSigned(s.totalQuote)}  open value ${fmtUsd(s.openValueQuote)}`);
+  if (s.realizedTimeline.length >= 2) {
+    console.log(`    trajectory ${sparkline(s.realizedTimeline.map((t) => t.cumulativeRealizedQuote))}  (${s.realizedTimeline.length} realizing sells)`);
+  }
   for (const p of s.positions) {
     if (p.amount <= 0 && p.realizedQuote === 0 && p.untrackedSellBase === 0) continue;
     const sym = p.symbol ?? p.token.slice(0, 10);

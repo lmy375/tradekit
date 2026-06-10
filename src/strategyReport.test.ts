@@ -1200,3 +1200,48 @@ describe("buildForward — rebalance drift", () => {
     expect(f.rebalanceDrift[0]).toMatchObject({ planId: 2, status: "paused", paper: true });
   });
 });
+
+describe("valuation — realizedTimeline (v31)", () => {
+  const ETH3 = "0x4200000000000000000000000000000000000006";
+  const USDC3 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  it("the section carries the cumulative realized trajectory", async () => {
+    const mk = (ts: string, dir: "buy" | "sell", base: string, quote: string) =>
+      insertTrade({
+        timestamp: ts, chain: "base", account: "default", direction: dir,
+        base_token: ETH3, base_symbol: "ETH", base_amount: base,
+        quote_token: USDC3, quote_symbol: "USDC", quote_amount: quote,
+        price: "0", tx_hash: `0x${ts}`, status: "success",
+        gas_used: null, gas_price_wei: null, gas_cost_native: null,
+        aggregator: "kyberswap", fee_tier: null, notes: null,
+        strategy: "tl-test", realized_slippage_bps: null,
+      } as never);
+    mk("2026-06-01T00:00:00Z", "buy", "1", "2000");
+    mk("2026-06-02T00:00:00Z", "sell", "0.5", "1100"); // +100
+    mk("2026-06-03T00:00:00Z", "sell", "0.5", "1050"); // +50 → cum 150
+
+    const r = await buildStrategyReport({ tag: "tl-test", mode: "real", sections: ["valuation"] });
+    const tl = r.valuation!.realizedTimeline;
+    expect(tl).toHaveLength(2);
+    expect(tl[1].cumulativeRealizedQuote).toBeCloseTo(150, 6);
+  });
+});
+
+describe("sparkline (CLI helper)", () => {
+  it("renders trajectory shape, handles flat/empty/downsampling", async () => {
+    const { sparkline } = await import("./cli/strategy.js");
+    expect(sparkline([])).toBe("");
+    // Flat series → mid-band bars, length preserved.
+    const flat = sparkline([5, 5, 5]);
+    expect(flat).toHaveLength(3);
+    expect(new Set(flat.split("")).size).toBe(1);
+    // Monotonic climb → first char is the lowest bar, last the highest.
+    const climb = sparkline([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(climb[0]).toBe("▁");
+    expect(climb[climb.length - 1]).toBe("█");
+    // Downsampling caps the width.
+    const wide = sparkline(Array.from({ length: 500 }, (_, i) => i), 40);
+    expect(wide).toHaveLength(40);
+    expect(wide[39]).toBe("█");
+  });
+});

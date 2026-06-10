@@ -353,3 +353,50 @@ describe("computePaperPnlMtm — bucket semantics", () => {
     expect(report.timestamp).toBe("2026-06-10T12:00:00.000Z");
   });
 });
+
+// ── v31: realized trajectory ─────────────────────────────────
+
+describe("computePaperPnlMtm — realizedTimeline", () => {
+  it("emits one cumulative point per realizing sell, chronological", async () => {
+    const rows = [
+      row({ base_amount: "1", quote_amount: "2000", timestamp: "2026-06-01T00:00:00Z" }),
+      row({ direction: "sell", base_amount: "0.5", quote_amount: "1200", timestamp: "2026-06-02T00:00:00Z" }), // +200
+      row({ direction: "sell", base_amount: "0.5", quote_amount: "900", timestamp: "2026-06-03T00:00:00Z" }),  // -100 → cum +100
+    ];
+    const { fetch } = stubPrices({});
+    const { summaries } = await computePaperPnlMtm(rows, fetch);
+    const tl = summaries[0].realizedTimeline;
+    expect(tl).toHaveLength(2);
+    expect(tl[0]).toEqual({ at: "2026-06-02T00:00:00Z", cumulativeRealizedQuote: expect.closeTo(200, 6) });
+    expect(tl[1].cumulativeRealizedQuote).toBeCloseTo(100, 6);
+    // Final point equals the bucket's realizedQuote.
+    expect(tl[1].cumulativeRealizedQuote).toBeCloseTo(summaries[0].realizedQuote, 9);
+  });
+
+  it("buys and fully-untracked sells contribute no points", async () => {
+    const rows = [
+      row({ base_amount: "1", quote_amount: "2000", timestamp: "2026-06-01T00:00:00Z" }),
+      // Pure deposit-inventory sell on a DIFFERENT token: nothing tracked.
+      row({ direction: "sell", base_token: PEPE, base_symbol: "PEPE", base_amount: "100", quote_amount: "50", timestamp: "2026-06-02T00:00:00Z" }),
+    ];
+    const { fetch } = stubPrices({});
+    const { summaries } = await computePaperPnlMtm(rows, fetch);
+    expect(summaries[0].realizedTimeline).toEqual([]);
+  });
+
+  it("cumulative is bucket-wide across multiple positions interleaved", async () => {
+    const rows = [
+      row({ base_amount: "1", quote_amount: "2000", timestamp: "2026-06-01T00:00:00Z" }), // WETH buy
+      row({ base_token: PEPE, base_symbol: "PEPE", base_amount: "100", quote_amount: "100", timestamp: "2026-06-01T01:00:00Z" }), // PEPE buy
+      row({ direction: "sell", base_amount: "1", quote_amount: "2300", timestamp: "2026-06-02T00:00:00Z" }), // WETH +300
+      row({ direction: "sell", base_token: PEPE, base_symbol: "PEPE", base_amount: "100", quote_amount: "80", timestamp: "2026-06-03T00:00:00Z" }), // PEPE -20 → cum +280
+    ];
+    const { fetch } = stubPrices({});
+    const { summaries } = await computePaperPnlMtm(rows, fetch);
+    const tl = summaries[0].realizedTimeline;
+    expect(tl.map((t) => t.cumulativeRealizedQuote)).toEqual([
+      expect.closeTo(300, 6),
+      expect.closeTo(280, 6),
+    ]);
+  });
+});
