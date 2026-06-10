@@ -769,7 +769,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       const retry = planTransientRetry({
         code,
         retryCount: schedule.retry_count ?? 0,
-        nowMs: Date.now(),
+        nowMs: now.getTime(),
         naturalNextAt: nextAt,
         endAt: schedule.end_at,
         config,
@@ -875,7 +875,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       const retry = planTransientRetry({
         code,
         retryCount: schedule.retry_count ?? 0,
-        nowMs: Date.now(),
+        nowMs: now.getTime(),
         naturalNextAt: nextAt,
         endAt: schedule.end_at,
         config,

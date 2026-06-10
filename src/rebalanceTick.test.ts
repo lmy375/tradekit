@@ -273,8 +273,15 @@ describe("runRebalanceTick — drift evaluation", () => {
   it("a TRANSIENT portfolio fetch failure parks the plan on a v32 retry slot", async () => {
     const id = seedPlan({ max_runs: 5 });
     const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
-    const before = Date.now();
-    const report = await tick({ fetchPortfolio: async () => { throw err; } });
+    // Pin the clock ≥35min clear of a UTC 6h boundary — in the last
+    // minutes before one, the 5m backoff would cross the natural slot
+    // and production correctly abandons the retry (time-of-day flake).
+    const t = new Date();
+    const intoBlock = ((t.getUTCHours() % 6) * 60 + t.getUTCMinutes()) * 60_000 + t.getUTCSeconds() * 1000;
+    const remaining = 6 * 3_600_000 - intoBlock;
+    const now = remaining < 35 * 60_000 ? new Date(t.getTime() + remaining + 60_000) : t;
+    const before = now.getTime();
+    const report = await tick({ now, fetchPortfolio: async () => { throw err; } });
     // v32: transient → bounded retry, NOT a lost occurrence.
     expect(report.failed).toBe(0);
     expect(report.retried).toBe(1);

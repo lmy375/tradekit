@@ -575,6 +575,19 @@ describe("planTransientRetry — pure planner", () => {
 });
 
 describe("runScheduleTick — v32 transient retry", () => {
+  // The 5m/10m backoff assertions assume the backoff slot does NOT
+  // cross the natural '0 */6 * * *' slot — false in the last minutes
+  // before a UTC 6h boundary (production then correctly abandons the
+  // retry). Pin the tick clock to a boundary-safe instant: same-or-
+  // future relative to real now (so PAST-seeded rows stay due), and
+  // ≥35min clear of the next boundary.
+  function boundarySafeNow(): Date {
+    const t = new Date();
+    const intoBlock = ((t.getUTCHours() % 6) * 60 + t.getUTCMinutes()) * 60_000 + t.getUTCSeconds() * 1000;
+    const remaining = 6 * 3_600_000 - intoBlock;
+    return remaining < 35 * 60_000 ? new Date(t.getTime() + remaining + 60_000) : t;
+  }
+
   async function withFireRetry<T>(over: Record<string, unknown>, fn: () => Promise<T>): Promise<T> {
     const { saveConfig } = await import("./config.js");
     const cfg = loadConfig();
@@ -590,9 +603,10 @@ describe("runScheduleTick — v32 transient retry", () => {
     seedQuoteBalance("10000");
     const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
     mockedReadOnlyWallet.mockImplementation(() => { throw err; });
-    const id = seedSchedule(); // cron 0 */6 * * * — natural slot hours out
-    const before = Date.now();
-    const report = await tick();
+    const id = seedSchedule(); // cron 0 */6 * * * — natural slot far out (pinned clock)
+    const now = boundarySafeNow();
+    const before = now.getTime();
+    const report = await tick({ now });
     expect(report.failed).toBe(0);
     expect(report.retried).toBe(1);
     const fire = report.fires[0];
@@ -614,12 +628,14 @@ describe("runScheduleTick — v32 transient retry", () => {
     const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
     mockedReadOnlyWallet.mockImplementation(() => { throw err; });
     const id = seedSchedule();
-    await tick(); // attempt 1 → retry_count = 1, next_run_at +5m (future)
+    const t1 = boundarySafeNow();
+    await tick({ now: t1 }); // attempt 1 → retry_count = 1, next_run_at +5m (future)
     // Force the retry slot due now to simulate the retry tick.
     const { setScheduleNextRunAt } = await import("./db.js");
     setScheduleNextRunAt(id, PAST);
-    const before = Date.now();
-    const report = await tick();
+    const t2 = new Date(t1.getTime() + 6 * 60_000); // just past the first backoff
+    const before = t2.getTime();
+    const report = await tick({ now: t2 });
     expect(report.retried).toBe(1);
     const row = getScheduleById(id)!;
     expect(row.retry_count).toBe(2);
@@ -687,7 +703,7 @@ describe("runScheduleTick — v32 transient retry", () => {
       const err = Object.assign(new Error("rpc down"), { code: "RPC_FAILED" });
       mockedReadOnlyWallet.mockImplementation(() => { throw err; });
       const id = seedSchedule();
-      await tick();
+      await tick({ now: boundarySafeNow() });
       const { replayScheduleEntries } = await import("./db.js");
       const entries = replayScheduleEntries(id);
       expect(entries).toHaveLength(1);

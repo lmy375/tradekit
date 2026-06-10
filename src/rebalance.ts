@@ -895,7 +895,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       const retry = planTransientRetry({
         code,
         retryCount: plan.retry_count ?? 0,
-        nowMs: Date.now(),
+        nowMs: now.getTime(),
         naturalNextAt: nextAt,
         endAt: plan.end_at,
         config,
@@ -1076,7 +1076,7 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       const retry = planTransientRetry({
         code,
         retryCount: plan.retry_count ?? 0,
-        nowMs: Date.now(),
+        nowMs: now.getTime(),
         naturalNextAt: nextAt,
         endAt: plan.end_at,
         config,
