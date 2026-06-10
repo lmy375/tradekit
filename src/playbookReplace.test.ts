@@ -150,7 +150,7 @@ describe("computePlaybookDiff", () => {
     expect(e.fieldChanges.find((c) => c.path === "trailPct")?.newValue).toBe(10);
   });
 
-  it("modified trailing order sets willResetTrailingHwm=true", () => {
+  it("v2: trailing order with only editable changes is applyMode=edit and does NOT set willResetTrailingHwm", () => {
     const oldSpec = mkSpec([
       { type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
     ]);
@@ -158,7 +158,37 @@ describe("computePlaybookDiff", () => {
       { type: "order", side: "sell", trigger: "trailing", trailPct: 7, baseAmount: 1, base: "ETH", quote: "USDC" },
     ]);
     const d = computePlaybookDiff({ oldSpec, newSpec, playbookId: 1 });
+    const modified = d.entries.find((e) => e.status === "modified");
+    expect(modified?.applyMode).toBe("edit");
+    // Edit-in-place preserves the HWM — the warning flag must stay off.
+    expect(d.willResetTrailingHwm).toBe(false);
+  });
+
+  it("v2: trailing order with a frozen-field change (group) is applyMode=recreate and sets willResetTrailingHwm", () => {
+    const oldSpec = mkSpec([
+      { type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC", group: "bracket-a" },
+    ]);
+    const newSpec = mkSpec([
+      { type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC", group: "bracket-b" },
+    ]);
+    const d = computePlaybookDiff({ oldSpec, newSpec, playbookId: 1 });
+    const modified = d.entries.find((e) => e.status === "modified");
+    expect(modified?.applyMode).toBe("recreate");
+    expect(modified?.recreateReason).toContain("group");
     expect(d.willResetTrailingHwm).toBe(true);
+  });
+
+  it("v2: modified rebalance is always applyMode=recreate (no edit machinery)", () => {
+    const oldSpec = mkSpec([
+      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 5 },
+    ]);
+    const newSpec = mkSpec([
+      { type: "rebalance", name: "folio", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 8 },
+    ]);
+    const d = computePlaybookDiff({ oldSpec, newSpec, playbookId: 1 });
+    const modified = d.entries.find((e) => e.status === "modified");
+    expect(modified?.applyMode).toBe("recreate");
+    expect(d.willResetTrailingHwm).toBe(false); // not a trailing order
   });
 
   it("modified non-trailing order does NOT set willResetTrailingHwm", () => {
@@ -283,10 +313,14 @@ describe("replacePlaybook — happy paths", () => {
     expect(result.diff.summary.added).toBe(1);
     expect(result.diff.summary.removed).toBe(0);
 
-    // 2 new primitives created (modified-new + added).
-    expect(result.created.length).toBe(2);
-    // 1 cancelled (modified-old).
-    expect(result.cancelled.length).toBe(1);
+    // v2: the trailPct change is in-place editable — the trail order is
+    // EDITED (keeps its row id + HWM), not cancelled + recreated. Only
+    // the added TP order is created.
+    expect(result.edited.length).toBe(1);
+    expect(result.edited[0].type).toBe("order");
+    expect(result.edited[0].fields).toEqual(["trailPct"]);
+    expect(result.created.length).toBe(1);
+    expect(result.cancelled.length).toBe(0);
   });
 
   it("playbook row's spec_json + source_hash update after replace", () => {
@@ -343,11 +377,13 @@ describe("replacePlaybook — happy paths", () => {
     replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
 
     const detailAfter = getPlaybookDetail(deploy.playbookId);
-    // Two orders exist (old cancelled + new active). Only one is active.
-    expect(detailAfter.orders.length).toBe(2);
+    // v2: the trailPct change is edit-in-place — SAME row, updated value,
+    // no cancelled twin left behind.
+    expect(detailAfter.orders.length).toBe(1);
     const activeOrders = detailAfter.orders.filter((o) => o.status === "active");
     expect(activeOrders.length).toBe(1);
     expect(activeOrders[0].trail_pct).toBe(15);
+    expect(activeOrders[0].id).toBe(detailBefore.orders[0].id);
   });
 
   it("no-op when new spec is identical to old", () => {
@@ -431,5 +467,297 @@ describe("replacePlaybook — error paths", () => {
     expect(() =>
       replacePlaybook({ playbookId: deploy.playbookId, newSpec: spec, newSourcePath: null }),
     ).toThrow(/not.*deployed|destroyed/i);
+  });
+});
+
+// ── v2: state preservation + paper inference ─────────────────
+
+describe("replacePlaybook v2 — state-preserving modify", () => {
+  function deployTrailDca(opts: { paper?: boolean } = {}) {
+    const spec = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+      ],
+    });
+    return { spec, deploy: deployPlaybook({ spec, sourcePath: null, ...(opts.paper ? { paper: true } : {}) }) };
+  }
+
+  it("trailing HWM survives an in-place edit (the headline v2 win)", () => {
+    const { deploy } = deployTrailDca();
+    const db = openDb();
+    const orderId = getPlaybookDetail(deploy.playbookId).orders[0].id!;
+    // Engine has been tracking: HWM sits at 3500.
+    db.prepare(`UPDATE orders SET water_mark_usd = 3500 WHERE id = ?`).run(orderId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 8, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.edited).toEqual([{ type: "order", rowId: orderId, localId: "trail", fields: ["trailPct"] }]);
+    expect(result.cancelled).toEqual([]);
+    expect(result.created).toEqual([]);
+
+    const after = getPlaybookDetail(deploy.playbookId).orders[0];
+    expect(after.id).toBe(orderId);
+    expect(after.trail_pct).toBe(8);
+    expect(after.water_mark_usd).toBe(3500); // HWM intact
+    expect(after.status).toBe("active");
+
+    // Journal continuity: the edit landed an edited_by_operator row.
+    const journal = db
+      .prepare(`SELECT decision FROM order_check_log WHERE order_id = ? ORDER BY id DESC LIMIT 1`)
+      .get(orderId) as { decision: string } | undefined;
+    expect(journal?.decision).toBe("edited_by_operator");
+  });
+
+  it("schedule run counters survive an in-place edit", () => {
+    const { deploy } = deployTrailDca();
+    const db = openDb();
+    const schedId = getPlaybookDetail(deploy.playbookId).schedules[0].id!;
+    db.prepare(
+      `UPDATE schedules SET run_count = 3, total_quote_spent = '300', last_run_at = '2026-06-01T00:00:00.000Z' WHERE id = ?`,
+    ).run(schedId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 150, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.edited).toEqual([{ type: "schedule", rowId: schedId, localId: "dca", fields: ["quoteAmount"] }]);
+    const after = getPlaybookDetail(deploy.playbookId).schedules[0];
+    expect(after.id).toBe(schedId);
+    expect(after.quote_amount).toBe("150");
+    expect(after.run_count).toBe(3); // counters intact
+    expect(after.total_quote_spent).toBe("300");
+  });
+
+  it("schedule recreate (frozen startAt changed) still carries run counters to the new row", () => {
+    const { deploy } = deployTrailDca();
+    const db = openDb();
+    const schedId = getPlaybookDetail(deploy.playbookId).schedules[0].id!;
+    db.prepare(
+      `UPDATE schedules SET run_count = 4, total_quote_spent = '400', last_run_at = '2026-06-02T00:00:00.000Z' WHERE id = ?`,
+    ).run(schedId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        // startAt is a frozen field → recreate.
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC", startAt: "2027-01-01T00:00:00.000Z" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.edited).toEqual([]);
+    expect(result.cancelled).toEqual([schedId]);
+    expect(result.created.length).toBe(1);
+
+    const schedules = getPlaybookDetail(deploy.playbookId).schedules;
+    const active = schedules.find((s) => s.status === "active")!;
+    expect(active.id).not.toBe(schedId);
+    expect(active.run_count).toBe(4); // carried
+    expect(active.total_quote_spent).toBe("400");
+    expect(active.last_run_at).toBe("2026-06-02T00:00:00.000Z");
+  });
+
+  it("rebalance modify recreates but carries run_count + last_run_at", () => {
+    const spec = parsePlaybookSpec({
+      name: "v2-reb",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 5 },
+      ],
+    });
+    const deploy = deployPlaybook({ spec, sourcePath: null });
+    const db = openDb();
+    const planId = getPlaybookDetail(deploy.playbookId).rebalances[0].id!;
+    db.prepare(`UPDATE rebalance_plans SET run_count = 2, last_run_at = '2026-06-03T00:00:00.000Z' WHERE id = ?`).run(planId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-reb",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "folio", type: "rebalance", targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }], driftThresholdPct: 8 },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.cancelled).toEqual([planId]);
+    expect(result.created.length).toBe(1);
+    const active = getPlaybookDetail(deploy.playbookId).rebalances.find((r) => r.status === "active")!;
+    expect(active.id).not.toBe(planId);
+    expect(active.drift_threshold_pct).toBe(8);
+    expect(active.run_count).toBe(2); // carried
+    expect(active.last_run_at).toBe("2026-06-03T00:00:00.000Z");
+  });
+
+  it("preserveState:false restores v1 behavior — recreate everything, fresh state", () => {
+    const { deploy } = deployTrailDca();
+    const db = openDb();
+    const orderId = getPlaybookDetail(deploy.playbookId).orders[0].id!;
+    db.prepare(`UPDATE orders SET water_mark_usd = 3500 WHERE id = ?`).run(orderId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 8, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({
+      playbookId: deploy.playbookId,
+      newSpec: updated,
+      newSourcePath: null,
+      preserveState: false,
+    });
+
+    expect(result.edited).toEqual([]);
+    expect(result.cancelled).toEqual([orderId]);
+    expect(result.created.length).toBe(1);
+    const active = getPlaybookDetail(deploy.playbookId).orders.find((o) => o.status === "active")!;
+    expect(active.id).not.toBe(orderId);
+    expect(active.water_mark_usd).toBeNull(); // fresh tracking
+    expect(active.trail_pct).toBe(8);
+  });
+
+  it("falls back to recreate when the edit-target row was cancelled outside the playbook flow", () => {
+    const { deploy } = deployTrailDca();
+    const db = openDb();
+    const orderId = getPlaybookDetail(deploy.playbookId).orders[0].id!;
+    // Operator cancelled the order directly; replace should restore the slot.
+    db.prepare(`UPDATE orders SET status = 'cancelled' WHERE id = ?`).run(orderId);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-state",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 8, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.edited).toEqual([]);
+    expect(result.created.length).toBe(1);
+    const active = getPlaybookDetail(deploy.playbookId).orders.filter((o) => o.status === "active");
+    expect(active.length).toBe(1);
+    expect(active[0].trail_pct).toBe(8);
+  });
+});
+
+describe("replacePlaybook v2 — paper inference", () => {
+  it("replacing a --paper deployment keeps recreated + added primitives paper", () => {
+    const spec = parsePlaybookSpec({
+      name: "v2-paper",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const deploy = deployPlaybook({ spec, sourcePath: null, paper: true });
+    expect(getPlaybookDetail(deploy.playbookId).orders[0].paper).toBe(1);
+
+    const updated = parsePlaybookSpec({
+      name: "v2-paper",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "tp", type: "order", side: "sell", trigger: "price_above", price: 5000, baseAmount: 0.5, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.paper).toBe(true);
+    const detail = getPlaybookDetail(deploy.playbookId);
+    const tp = detail.orders.find((o) => o.trigger_type === "price_above")!;
+    // Pre-v2 BUG: this was created with paper=0 — a silent flip to
+    // real trading on a dry-run playbook.
+    expect(tp.paper).toBe(1);
+  });
+
+  it("explicit paper:false override wins over inference", () => {
+    const spec = parsePlaybookSpec({
+      name: "v2-paper-override",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const deploy = deployPlaybook({ spec, sourcePath: null, paper: true });
+
+    const updated = parsePlaybookSpec({
+      name: "v2-paper-override",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "tp", type: "order", side: "sell", trigger: "price_above", price: 5000, baseAmount: 0.5, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({
+      playbookId: deploy.playbookId,
+      newSpec: updated,
+      newSourcePath: null,
+      paper: false,
+    });
+
+    expect(result.paper).toBe(false);
+    const tp = getPlaybookDetail(deploy.playbookId).orders.find((o) => o.trigger_type === "price_above")!;
+    expect(tp.paper).toBe(0);
+  });
+
+  it("real (non-paper) deployment stays real on replace", () => {
+    const spec = parsePlaybookSpec({
+      name: "v2-real",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const deploy = deployPlaybook({ spec, sourcePath: null });
+
+    const updated = parsePlaybookSpec({
+      name: "v2-real",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "tp", type: "order", side: "sell", trigger: "price_above", price: 5000, baseAmount: 0.5, base: "ETH", quote: "USDC" },
+      ],
+    });
+    const result = replacePlaybook({ playbookId: deploy.playbookId, newSpec: updated, newSourcePath: null });
+
+    expect(result.paper).toBe(false);
+    const tp = getPlaybookDetail(deploy.playbookId).orders.find((o) => o.trigger_type === "price_above")!;
+    expect(tp.paper).toBe(0);
   });
 });

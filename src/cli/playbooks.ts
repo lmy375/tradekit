@@ -468,7 +468,7 @@ export async function playbookDiffCommand(flags: Record<string, string>, positio
   }
   console.log(`  Summary:  ${diff.summary.unchanged} unchanged, ${diff.summary.modified} modified, ${diff.summary.added} added, ${diff.summary.removed} removed`);
   if (diff.willResetTrailingHwm) {
-    console.log(`  ⚠ Modified trailing orders will lose their HWM state on replace.`);
+    console.log(`  ⚠ Modified trailing orders will be RECREATED and lose their HWM state on replace.`);
   }
   console.log(``);
   for (const entry of diff.entries) {
@@ -479,6 +479,11 @@ export async function playbookDiffCommand(flags: Record<string, string>, positio
     if (entry.status === "modified") {
       for (const c of entry.fieldChanges) {
         console.log(`      ${c.path}: ${JSON.stringify(c.oldValue)} → ${JSON.stringify(c.newValue)}`);
+      }
+      if (entry.applyMode === "edit") {
+        console.log(`      → applied in place (state preserved: HWM, run counters, journal)`);
+      } else if (entry.applyMode === "recreate") {
+        console.log(`      → cancel + recreate (${entry.recreateReason ?? "state resets"})`);
       }
     }
   }
@@ -529,6 +534,10 @@ export async function playbookReplaceCommand(flags: Record<string, string>, posi
     return;
   }
 
+  // v2: --fresh-state opts OUT of state preservation — every modified
+  // primitive is cancelled + recreated with fresh HWM / run counters.
+  const preserveState = flags["fresh-state"] !== "true";
+
   if (
     flags["yes"] !== "true" &&
     flags["json"] !== "true" &&
@@ -536,8 +545,16 @@ export async function playbookReplaceCommand(flags: Record<string, string>, posi
   ) {
     console.log(`Playbook replace — #${id} "${existing.name}"`);
     console.log(`  Summary:  ${previewDiff.summary.unchanged} unchanged, ${previewDiff.summary.modified} modified, ${previewDiff.summary.added} added, ${previewDiff.summary.removed} removed`);
-    if (previewDiff.willResetTrailingHwm) {
-      console.log(`  ⚠ Modified trailing orders will lose their HWM state.`);
+    const editable = previewDiff.entries.filter((e) => e.status === "modified" && e.applyMode === "edit").length;
+    if (!preserveState) {
+      console.log(`  ⚠ --fresh-state: ALL modified primitives are recreated — trailing HWM + run counters reset.`);
+    } else {
+      if (editable > 0) {
+        console.log(`  ${editable} modified primitive${editable === 1 ? "" : "s"} will be edited IN PLACE (HWM, run counters, journal preserved).`);
+      }
+      if (previewDiff.willResetTrailingHwm) {
+        console.log(`  ⚠ Some modified trailing orders must be recreated — their HWM state resets.`);
+      }
     }
     const reply = await prompt(`Apply changes? type 'replace': `);
     if (reply.trim().toLowerCase() !== "replace") {
@@ -549,14 +566,21 @@ export async function playbookReplaceCommand(flags: Record<string, string>, posi
     playbookId: id,
     newSpec,
     newSourcePath: absolutePath,
+    preserveState,
   });
 
   if (flags["json"] === "true") {
     printJson({ ok: true, ...result });
     return;
   }
-  console.log(`Replaced playbook #${id} "${existing.name}"`);
+  console.log(`Replaced playbook #${id} "${existing.name}"${result.paper ? "  [PAPER]" : ""}`);
   console.log(`  Diff:       ${result.diff.summary.unchanged} unchanged, ${result.diff.summary.modified} modified, ${result.diff.summary.added} added, ${result.diff.summary.removed} removed`);
+  if (result.edited.length > 0) {
+    console.log(`  Edited:     ${result.edited.length} primitive${result.edited.length === 1 ? "" : "s"} in place (state preserved)`);
+    for (const ed of result.edited) {
+      console.log(`    ${ed.type.padEnd(10)} #${String(ed.rowId).padEnd(4)} ${ed.localId.padEnd(16)} fields: ${ed.fields.join(", ")}`);
+    }
+  }
   console.log(`  Cancelled:  ${result.cancelled.length} old primitive${result.cancelled.length === 1 ? "" : "s"}`);
   console.log(`  Created:    ${result.created.length} new primitive${result.created.length === 1 ? "" : "s"}`);
   for (const item of result.created) {

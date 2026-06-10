@@ -4128,6 +4128,37 @@ export function updatePlaybookSpec(args: {
   ).run(args.sourcePath, args.sourceHash, args.specJson, now, args.id);
 }
 
+/** Playbook-replace state carry-over: copy a recreated schedule's
+ *  runtime counters from its predecessor so max_runs accounting +
+ *  fill totals survive a recreate. The new row keeps its OWN
+ *  next_run_at (recomputed from the new cadence) — only the
+ *  historical counters carry. */
+export function carryScheduleRunCounters(args: {
+  id: number;
+  runCount: number;
+  lastRunAt: string | null;
+  totalBaseFilled: string | null;
+  totalQuoteSpent: string | null;
+}): void {
+  const db = openDb();
+  db.prepare(
+    `UPDATE schedules SET run_count = ?, last_run_at = ?, total_base_filled = ?, total_quote_spent = ?, updated_at = ? WHERE id = ?`,
+  ).run(args.runCount, args.lastRunAt, args.totalBaseFilled, args.totalQuoteSpent, new Date().toISOString(), args.id);
+}
+
+/** Same carry-over for a recreated rebalance plan (no in-place edit
+ *  machinery exists for rebalance — recreate is the only modify path). */
+export function carryRebalanceRunCounters(args: {
+  id: number;
+  runCount: number;
+  lastRunAt: string | null;
+}): void {
+  const db = openDb();
+  db.prepare(
+    `UPDATE rebalance_plans SET run_count = ?, last_run_at = ?, updated_at = ? WHERE id = ?`,
+  ).run(args.runCount, args.lastRunAt, new Date().toISOString(), args.id);
+}
+
 export function updatePlaybookStatus(id: number, status: PlaybookStatus): void {
   const db = openDb();
   const now = new Date().toISOString();

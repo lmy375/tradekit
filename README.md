@@ -504,13 +504,15 @@ tradekit playbook replace 1 ./eth-strategy-v2.json --yes
 
 **Atomic replace** runs in 4 phases:
 1. **Parse + render new spec** via the existing pipeline (templates, validation gates)
-2. **Compute diff** against current state
-3. **Pre-validate** every `added`/`modified` primitive — if ANY would fail (unknown token, invalid trigger, missing required field), abort BEFORE touching state
-4. **Apply**: cancel removed + modified-old, then create added + modified-new in the same transaction; update playbook row's `spec_json` + `source_hash` + `deployed_at`
+2. **Compute diff** against current state — each `modified` entry is also classified by **apply mode**: `edit` (in-place) vs `recreate` (cancel + create)
+3. **Pre-validate** every primitive — edits via the same validators `order edit`/`schedule edit` use, creates via the deploy validators; if ANY would fail (unknown token, invalid trigger, missing required field), abort BEFORE touching state
+4. **Apply**: cancel removed + modified-recreate, edit modified-edit in place, create added + modified-recreate-new; update playbook row's `spec_json` + `source_hash` + `deployed_at`
 
 **Failure semantics.** Pre-validation catches the most common failures (chain resolution, token resolution, missing fields) BEFORE any cancellation, so a defective new spec can't leave the playbook in partial state. Mid-apply DB errors bubble with diagnostic context pointing operators at `tradekit playbook show <id>` for state inspection.
 
-**v1 state preservation limitation.** Modified primitives are cancel-and-recreated — trailing orders LOSE their HWM water mark, schedules LOSE their `run_count` history. The diff output explicitly flags this with a `⚠ Modified trailing orders will lose their HWM state on replace.` warning. State-preserving replace would require schema changes (matching old → new rows by stable `local_id`) and is deferred to v2.
+**State preservation (v2).** A `modified` primitive whose changes are all in-place editable (price, trailPct, amounts, slippage, expiry/endAt, maxRuns, cadence, note) routes through the SAME edit machinery as `tradekit order edit` / `schedule edit`: it keeps its row id, its trailing **HWM water mark**, its `run_count` / `max_runs` accounting, and gains an `edited_by_operator` journal row — full forensic continuity. Only changes to frozen identity fields (OCO `group`, `chain`, `account`, schedule `startAt`/`name`) force cancel+recreate — and even then, recreated schedules and rebalance plans **carry their run counters** (`run_count`, `last_run_at`, fill totals) to the new row so `max_runs` accounting survives. Rebalance plans always recreate (no in-place edit machinery) but carry counters. The diff preview shows the apply mode per entry; `willResetTrailingHwm` now fires only when a trailing order genuinely must be recreated. `--fresh-state` opts out of all preservation (v1 behavior: recreate everything, reset HWM + counters) — useful when the operator *wants* tracking to restart.
+
+**Paper preservation (v2).** `deploy --paper` isn't recorded in the spec, so replace **infers** paper-ness from the playbook's owned rows: if every owned primitive is paper, recreated + added primitives are created paper too. Pre-v2 this was a real hole — replacing a paper playbook silently created the new primitives as REAL-trading ones. An explicit `paper` arg on the API overrides the inference.
 
 **CI integration.** `playbook diff` is read-only — perfect for "diff this PR's strategy spec against deployed state" gates. `--json` output gives structured field-level changes for automated review:
 

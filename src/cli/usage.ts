@@ -429,14 +429,20 @@ PLAYBOOKS (declarative strategy bundles)
         (filled / expired / cancelled / completed) are reported but left alone.
   playbook diff <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH] [--json]
         Read-only preview of what 'playbook replace' would change. Classifies each primitive
-        as unchanged / modified / added / removed; lists field-level changes for modified.
-        Useful in CI for strategy spec PRs.
-  playbook replace <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH] [--yes] [--json]
-        Atomically apply a new playbook spec. Cancels removed + modified-old primitives,
-        creates added + modified-new ones, updates the playbook row's spec_json + source_hash.
-        Pre-validates new primitives BEFORE cancellation so a defective new spec can't leave
-        partial state. Note: HWM water marks on trailing orders are LOST on modified entries
-        (v1 cancel-and-recreate semantic) — diff output warns about this.
+        as unchanged / modified / added / removed; lists field-level changes for modified
+        plus the apply mode (edit-in-place vs cancel+recreate). Useful in CI for spec PRs.
+  playbook replace <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH]
+                   [--fresh-state] [--yes] [--json]
+        Atomically apply a new playbook spec. Modified primitives whose changes are all
+        in-place editable (price, trailPct, amounts, slippage, expiry/end, maxRuns, note,
+        cadence) are EDITED via the same machinery as 'order edit' / 'schedule edit' —
+        trailing HWM, run counters, and journal continuity survive. Changes to frozen
+        fields (OCO group, chain, account, schedule startAt/name) force cancel+recreate;
+        recreated schedules/rebalance plans still carry run_count so max_runs accounting
+        survives. --fresh-state opts out (v1 behavior: recreate everything, reset state).
+        Paper-ness is inferred from the playbook's owned rows, so replacing a --paper
+        deployment stays paper. Pre-validates BEFORE cancellation so a defective new
+        spec can't leave partial state.
 
 BACKTESTING (historical strategy simulation)
   backtest order --side buy|sell --trigger price_below|price_above|trailing

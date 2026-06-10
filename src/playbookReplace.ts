@@ -33,11 +33,22 @@
  * This catches the most common case — operator tweaks parameters on
  * an existing primitive — as "modified" rather than "removed + added".
  *
- * v1 limitation: HWM water marks + run_count history are LOST when a
- * primitive is in the "modified" bucket (cancel + recreate). The
- * diff renderer warns about this explicitly so operators see the
- * trade-off. State preservation would require schema changes
- * (matching old → new rows by `local_id`) and is deferred to v2.
+ * v2 — state-preserving modify. A "modified" primitive whose field
+ * changes are all in-place editable routes through the SAME edit
+ * machinery operators use directly (orderEdit / scheduleEdit):
+ * trailing HWM water marks, run_count / max_runs accounting, and
+ * journal continuity (an `edited_by_operator` order_check_log row)
+ * all survive. Only changes to frozen identity fields (OCO group,
+ * chain, account, schedule start_at / name) force the v1
+ * cancel+recreate path — and even then, recreated schedules and
+ * rebalance plans carry their run counters to the new row so
+ * max_runs accounting survives. `preserveState: false` (CLI
+ * `--fresh-state`) opts back into a full reset.
+ *
+ * v2 also fixes a paper-mode hole: replace now infers paper-ness
+ * from the playbook's owned rows (deploy --paper isn't recorded in
+ * the spec), so replacing a paper playbook can no longer silently
+ * recreate primitives as REAL-trading ones.
  */
 
 import { ToolError } from "./errors.js";
@@ -59,11 +70,15 @@ import {
   listOrders,
   listSchedules,
   listRebalancePlans,
+  carryScheduleRunCounters,
+  carryRebalanceRunCounters,
   type OrderRow,
   type ScheduleRow,
   type RebalanceRow,
   type PlaybookRow,
 } from "./db.js";
+import { editOrder, validateOrderEdit, type OrderEditChanges } from "./orderEdit.js";
+import { editSchedule, validateScheduleEdit, type ScheduleEditChanges } from "./scheduleEdit.js";
 import { loadConfig, resolveProfile, type Config } from "./config.js";
 import { resolveTradePair } from "./chains.js";
 import {
@@ -103,6 +118,16 @@ export interface DiffEntry {
    *  otherwise. Each entry names the field path + old value + new
    *  value. */
   fieldChanges: Array<{ path: string; oldValue: unknown; newValue: unknown }>;
+  /** v2 — how a `modified` entry will be applied. "edit": in-place
+   *  via orderEdit/scheduleEdit (HWM, run_count, journal continuity
+   *  preserved). "recreate": cancel + create (frozen field changed,
+   *  or rebalance — which has no edit machinery; run counters still
+   *  carry). Undefined for non-modified entries. NOTE: replace with
+   *  preserveState:false recreates regardless of this value. */
+  applyMode?: "edit" | "recreate";
+  /** Why applyMode is "recreate" — names the frozen field(s) that
+   *  forced it. Undefined when applyMode is "edit" or absent. */
+  recreateReason?: string;
   /** Operator-readable summary of the old (or new, when added)
    *  primitive's intent. */
   summary: string;
@@ -124,8 +149,12 @@ export interface PlaybookDiff {
     added: number;
     removed: number;
   };
-  /** True if any `modified` entry is a trailing order — HWM state
-   *  will be reset, which operators should know. */
+  /** True if any `modified` trailing order will be RECREATED (frozen
+   *  field changed) — its HWM state resets, which operators should
+   *  know. v2: trailing orders whose changes are in-place editable
+   *  keep their HWM and do NOT set this flag. A replace with
+   *  preserveState:false resets every modified trailing order's HWM
+   *  regardless. */
   willResetTrailingHwm: boolean;
 }
 
@@ -201,6 +230,60 @@ function detectFieldChanges(
   return changes;
 }
 
+// ── apply-mode classification (v2) ───────────────────────────
+
+/** Spec fields whose changes the in-place edit machinery can apply.
+ *  Everything else is a frozen identity field → recreate. The sets
+ *  mirror OrderEditChanges / ScheduleEditChanges exactly — if a
+ *  field is editable via `tradekit order edit`, it's editable via
+ *  replace. (side/trigger/base/quote never appear in fieldChanges:
+ *  they're part of the structural key, so changing them lands the
+ *  entry in added+removed, not modified.) */
+const ORDER_EDITABLE_SPEC_FIELDS = new Set([
+  "price", // → targetPriceUsd (activation price for trailing)
+  "trailPct",
+  "baseAmount",
+  "quoteAmount",
+  "slippageBps",
+  "autoSlippage",
+  "expiresAt",
+  "note",
+]);
+
+const SCHEDULE_EDITABLE_SPEC_FIELDS = new Set([
+  "cron",
+  "every",
+  "baseAmount",
+  "quoteAmount",
+  "slippageBps",
+  "autoSlippage",
+  "endAt",
+  "maxRuns",
+  "note",
+]);
+
+/** Classify a modified entry: can its field changes be applied
+ *  in-place, or must it be recreated? Returns the frozen fields that
+ *  forced a recreate so the diff can explain itself. */
+function classifyModifiedEntry(
+  type: StrategySpec["type"],
+  fieldChanges: Array<{ path: string }>,
+): { applyMode: "edit" | "recreate"; recreateReason?: string } {
+  if (type === "rebalance") {
+    return {
+      applyMode: "recreate",
+      recreateReason: "rebalance plans have no in-place edit; run counters carry to the new row",
+    };
+  }
+  const editable = type === "order" ? ORDER_EDITABLE_SPEC_FIELDS : SCHEDULE_EDITABLE_SPEC_FIELDS;
+  const frozen = fieldChanges.map((c) => c.path).filter((p) => !editable.has(p));
+  if (frozen.length === 0) return { applyMode: "edit" };
+  return {
+    applyMode: "recreate",
+    recreateReason: `frozen field(s) changed: ${frozen.join(", ")}`,
+  };
+}
+
 // ── diff algorithm ───────────────────────────────────────────
 
 /**
@@ -258,12 +341,15 @@ export function computePlaybookDiff(args: {
         summary: describeEntry(newEntry),
       });
     } else {
+      const cls = classifyModifiedEntry(newEntry.type, fieldChanges);
       entries.push({
         status: "modified",
         type: newEntry.type,
         structuralKey: key,
         oldEntry, newEntry,
         fieldChanges,
+        applyMode: cls.applyMode,
+        ...(cls.recreateReason ? { recreateReason: cls.recreateReason } : {}),
         summary: describeEntry(newEntry),
       });
     }
@@ -289,8 +375,11 @@ export function computePlaybookDiff(args: {
   let willResetTrailingHwm = false;
   for (const e of entries) {
     summary[e.status]++;
+    // v2: an in-place-editable trailing order KEEPS its HWM — only a
+    // recreate resets it.
     if (
       e.status === "modified" &&
+      e.applyMode === "recreate" &&
       e.type === "order" &&
       (e.oldEntry as OrderSpec).trigger === "trailing"
     ) {
@@ -338,10 +427,25 @@ function describeEntry(entry: StrategySpec): string {
 export interface ReplaceResult {
   playbookId: number;
   diff: PlaybookDiff;
-  /** Newly-created primitives (added + modified-new). */
+  /** Newly-created primitives (added + modified-recreate). */
   created: DeployedItem[];
-  /** Old primitive ids cancelled (removed + modified-old). */
+  /** Old primitive ids cancelled (removed + modified-recreate). */
   cancelled: number[];
+  /** v2 — primitives modified IN PLACE via the edit machinery. These
+   *  keep their row id, trailing HWM, run_count, and journal
+   *  continuity; they appear in neither `created` nor `cancelled`.
+   *  Empty when preserveState:false or nothing was edit-routable. */
+  edited: Array<{
+    type: "order" | "schedule";
+    rowId: number;
+    localId: string;
+    /** Spec field names that changed. */
+    fields: string[];
+  }>;
+  /** v2 — whether recreated primitives were created as paper.
+   *  Inferred from the playbook's owned rows (deploy --paper isn't
+   *  recorded in the spec) unless the caller overrode it. */
+  paper: boolean;
   /** Old spec hash + new spec hash for forensic record. */
   oldHash: string;
   newHash: string;
@@ -377,8 +481,23 @@ export function replacePlaybook(args: {
   newSpec: PlaybookSpec;
   newSourcePath: string | null;
   config?: Config;
+  /** v2 — when true (DEFAULT), modified primitives whose changes are
+   *  in-place editable route through orderEdit/scheduleEdit (HWM +
+   *  run_count + journal continuity preserved) and recreated
+   *  schedules/rebalance plans carry their run counters. false
+   *  restores the v1 behavior: every modified primitive is
+   *  cancelled + recreated with fresh state. */
+  preserveState?: boolean;
+  /** v2 — explicit paper override for recreated primitives. When
+   *  omitted, paper-ness is INFERRED from the playbook's owned rows
+   *  (all owned orders/schedules/rebalances paper → paper replace).
+   *  Deploy's --paper flag isn't recorded in the spec, so without
+   *  this inference a replace would silently flip a paper playbook
+   *  to real trading. */
+  paper?: boolean;
 }): ReplaceResult {
   const { playbookId, newSpec, newSourcePath } = args;
+  const preserveState = args.preserveState !== false;
   const config = args.config ?? loadConfig();
 
   // Phase 0: look up the playbook row + reject if it's not deployed.
@@ -406,51 +525,120 @@ export function replacePlaybook(args: {
   }
   const diff = computePlaybookDiff({ oldSpec, newSpec, playbookId });
 
-  // Phase 2: pre-validate every added + modified primitive. This
-  // catches schema / chain-resolution / token-resolution failures
-  // BEFORE we cancel anything. Validation runs createOrderRow et al
-  // with `dryRun: true` — they throw on bad input but don't insert.
-  //
-  // The existing create-row helpers don't have a dry-run flag yet;
-  // we implement validation by attempting to BUILD the CreateArgs
-  // shape (which the helpers expect) and trapping ToolErrors. The
-  // actual validators inside createOrderRow et al run when we insert
-  // for real in phase 3, so a defective new spec WILL be caught
-  // there too — but late-failing after cancellations would leave
-  // partial state. The atomic-transaction wrap in phase 3 covers
-  // this; the dry-run here is an early-fail optimization.
+  // Phase 2: load the owned rows up front — they drive edit routing,
+  // paper inference, AND cancel matching.
   const strategyTag = `playbook:${playbookId}`;
-  const toCreate: { entry: StrategySpec; localId: string }[] = [];
-  for (const e of diff.entries) {
-    if (e.status === "added" || e.status === "modified") {
-      const localId = e.newEntry?.id ?? `strategy:${e.structuralKey}`;
-      toCreate.push({ entry: e.newEntry!, localId });
-    }
-  }
-  preValidate({ entries: toCreate, spec: newSpec, config, strategyTag });
-
-  // Phase 3: find the old primitive row ids for each removed +
-  // modified-old entry. We match the OLD spec entries against the
-  // currently-active rows in the DB owned by this playbook
-  // (strategy = playbook:N). Same structural-key matching applies.
   const ownedOrders = listOrders({ status: "all", strategy: strategyTag });
   const ownedSchedules = listSchedules({ status: "all", strategy: strategyTag });
   const ownedRebalances = listRebalancePlans({ status: "all", strategy: strategyTag });
 
+  // v2 paper inference: deploy's --paper flag isn't recorded in the
+  // spec, but every primitive it created carries paper=1. If ALL
+  // owned rows are paper, recreated primitives must be paper too —
+  // otherwise a replace silently flips a dry-run strategy to real
+  // trading. An explicit args.paper always wins (operator intent).
+  const ownedPaperFlags = [
+    ...ownedOrders.map((r) => r.paper),
+    ...ownedSchedules.map((r) => r.paper),
+    ...ownedRebalances.map((r) => r.paper),
+  ];
+  const paper = args.paper ?? (ownedPaperFlags.length > 0 && ownedPaperFlags.every((p) => p === 1));
+
+  // Phase 3: partition the diff into the three apply plans.
+  //   toEdit    — modified entries applied in place (preserveState
+  //               && applyMode=edit && the live row still exists).
+  //               Pre-validated HERE, before anything is cancelled.
+  //   toCancel  — removed + modified-recreate old rows.
+  //   toCreate  — added + modified-recreate new entries; recreates
+  //               capture the old row's run counters for carry-over.
+  const toEdit: Array<{
+    type: "order" | "schedule";
+    rowId: number;
+    localId: string;
+    changes: OrderEditChanges | ScheduleEditChanges;
+    fields: string[];
+  }> = [];
   const toCancel: Array<{ type: StrategySpec["type"]; rowId: number }> = [];
+  const toCreate: Array<{
+    entry: StrategySpec;
+    localId: string;
+    carry?:
+      | { kind: "schedule"; runCount: number; lastRunAt: string | null; totalBaseFilled: string | null; totalQuoteSpent: string | null }
+      | { kind: "rebalance"; runCount: number; lastRunAt: string | null };
+  }> = [];
+  const now = new Date();
+
   for (const e of diff.entries) {
-    if (e.status === "removed" || e.status === "modified") {
-      const oldEntry = e.oldEntry!;
-      const rowId = findOwnedRowId({
-        entry: oldEntry,
-        playbookId,
-        orders: ownedOrders,
-        schedules: ownedSchedules,
-        rebalances: ownedRebalances,
-      });
-      if (rowId != null) toCancel.push({ type: oldEntry.type, rowId });
+    if (e.status === "unchanged") continue;
+    if (e.status === "added") {
+      toCreate.push({ entry: e.newEntry!, localId: e.newEntry?.id ?? `strategy:${e.structuralKey}` });
+      continue;
     }
+    const rowId = findOwnedRowId({
+      entry: e.oldEntry!,
+      playbookId,
+      orders: ownedOrders,
+      schedules: ownedSchedules,
+      rebalances: ownedRebalances,
+    });
+    if (e.status === "removed") {
+      if (rowId != null) toCancel.push({ type: e.oldEntry!.type, rowId });
+      continue;
+    }
+
+    // status === "modified"
+    const localId = e.newEntry?.id ?? `strategy:${e.structuralKey}`;
+    const fields = e.fieldChanges.map((c) => c.path);
+
+    if (preserveState && e.applyMode === "edit" && rowId != null && e.type === "order") {
+      const row = ownedOrders.find((r) => r.id === rowId)!;
+      const changes = orderEditChangesFromSpec(e.newEntry as OrderSpec, fields);
+      // Throws INVALID_PARAMS on bad input — BEFORE any mutation, so
+      // a defective edit aborts the whole replace with state intact.
+      validateOrderEdit({ order: row, changes, config, now });
+      toEdit.push({ type: "order", rowId, localId, changes, fields });
+      continue;
+    }
+    if (preserveState && e.applyMode === "edit" && rowId != null && e.type === "schedule") {
+      const row = ownedSchedules.find((r) => r.id === rowId)!;
+      const changes = scheduleEditChangesFromSpec(e.newEntry as ScheduleSpec, fields);
+      validateScheduleEdit({ schedule: row, changes, config, now });
+      toEdit.push({ type: "schedule", rowId, localId, changes, fields });
+      continue;
+    }
+
+    // Recreate path (frozen field changed, rebalance, edit-target row
+    // missing, or preserveState:false). Capture run counters for
+    // carry-over while the old row is still readable.
+    if (rowId != null) toCancel.push({ type: e.oldEntry!.type, rowId });
+    let carry: (typeof toCreate)[number]["carry"];
+    if (preserveState && rowId != null && e.type === "schedule") {
+      const row = ownedSchedules.find((r) => r.id === rowId)!;
+      carry = {
+        kind: "schedule",
+        runCount: row.run_count,
+        lastRunAt: row.last_run_at,
+        totalBaseFilled: row.total_base_filled,
+        totalQuoteSpent: row.total_quote_spent,
+      };
+    } else if (preserveState && rowId != null && e.type === "rebalance") {
+      const row = ownedRebalances.find((r) => r.id === rowId)!;
+      carry = { kind: "rebalance", runCount: row.run_count, lastRunAt: row.last_run_at };
+    }
+    toCreate.push({ entry: e.newEntry!, localId, ...(carry ? { carry } : {}) });
   }
+
+  // Pre-validate every to-be-created primitive — catches schema /
+  // token-resolution failures BEFORE we cancel anything. The actual
+  // createXxxRow validators run again at insert time; this early
+  // pass exists so a defective new spec can't leave the playbook
+  // half-replaced.
+  preValidate({
+    entries: toCreate.map((c) => ({ entry: c.entry, localId: c.localId })),
+    spec: newSpec,
+    config,
+    strategyTag,
+  });
 
   // Phase 4: apply. The helpers (cancelByType, createOnePrimitive,
   // updatePlaybookSpec) each call openDb() internally — we don't
@@ -477,8 +665,31 @@ export function replacePlaybook(args: {
     }
   }
 
+  // v2: apply in-place edits via the shared edit machinery. Same
+  // semantics as `tradekit order edit` / `schedule edit`: trailing
+  // HWM untouched, run_count untouched, edited_by_operator journal
+  // row appended (orders). Pre-validated above, so failures here are
+  // races (row left 'active' since the validation read).
+  const edited: ReplaceResult["edited"] = [];
+  for (const ed of toEdit) {
+    try {
+      if (ed.type === "order") {
+        editOrder({ id: ed.rowId, changes: ed.changes as OrderEditChanges, config });
+      } else {
+        editSchedule({ id: ed.rowId, changes: ed.changes as ScheduleEditChanges, config });
+      }
+      edited.push({ type: ed.type, rowId: ed.rowId, localId: ed.localId, fields: ed.fields });
+    } catch (e) {
+      throw new ToolError(
+        "INTERNAL_ERROR",
+        `Replace failed mid-edit of ${ed.type} #${ed.rowId}: ${(e as Error).message}. Playbook may be in a partial state; inspect with \`tradekit playbook show ${playbookId}\`.`,
+      );
+    }
+  }
+
   // Create new primitives via the shared deploy create-path. Same
-  // semantics: strategy tag stamped, group namespaced, etc.
+  // semantics: strategy tag stamped, group namespaced, paper flag
+  // applied — then carry run counters onto recreated rows.
   const created: DeployedItem[] = [];
   for (const item of toCreate) {
     const itemResult = createOnePrimitive({
@@ -488,8 +699,24 @@ export function replacePlaybook(args: {
       strategyTag,
       spec: newSpec,
       config,
+      paper,
     });
     created.push(itemResult);
+    if (item.carry?.kind === "schedule") {
+      carryScheduleRunCounters({
+        id: itemResult.rowId,
+        runCount: item.carry.runCount,
+        lastRunAt: item.carry.lastRunAt,
+        totalBaseFilled: item.carry.totalBaseFilled,
+        totalQuoteSpent: item.carry.totalQuoteSpent,
+      });
+    } else if (item.carry?.kind === "rebalance") {
+      carryRebalanceRunCounters({
+        id: itemResult.rowId,
+        runCount: item.carry.runCount,
+        lastRunAt: item.carry.lastRunAt,
+      });
+    }
   }
 
   // Update the playbook row's persisted spec + hash + timestamp.
@@ -505,9 +732,89 @@ export function replacePlaybook(args: {
     diff,
     created,
     cancelled,
+    edited,
+    paper,
     oldHash: diff.oldHash,
     newHash: diff.newHash,
   };
+}
+
+// ── spec → edit-changes mapping (v2) ─────────────────────────
+
+/** Build OrderEditChanges from the spec fields that changed. Only
+ *  changed fields are included, so the edit is minimal — untouched
+ *  columns keep their engine-managed values. */
+function orderEditChangesFromSpec(entry: OrderSpec, changedFields: string[]): OrderEditChanges {
+  const ch: OrderEditChanges = {};
+  for (const f of changedFields) {
+    switch (f) {
+      case "price":
+        ch.targetPriceUsd = entry.price ?? null;
+        break;
+      case "trailPct":
+        ch.trailPct = entry.trailPct ?? null;
+        break;
+      case "baseAmount":
+        ch.baseAmount = entry.baseAmount != null ? String(entry.baseAmount) : null;
+        break;
+      case "quoteAmount":
+        ch.quoteAmount = entry.quoteAmount != null ? String(entry.quoteAmount) : null;
+        break;
+      case "slippageBps":
+        ch.slippageBps = entry.slippageBps ?? null;
+        break;
+      case "autoSlippage":
+        ch.autoSlippage = entry.autoSlippage === true;
+        break;
+      case "expiresAt":
+        ch.expiresAt = entry.expiresAt ?? null;
+        break;
+      case "note":
+        ch.note = entry.note ?? null;
+        break;
+    }
+  }
+  return ch;
+}
+
+/** Same mapping for schedules. cron/every are mutually exclusive in
+ *  the spec; when the operator switches representation, BOTH appear
+ *  in changedFields — we pass only the one that's set in the new
+ *  entry (the edit validator enforces exclusivity). */
+function scheduleEditChangesFromSpec(entry: ScheduleSpec, changedFields: string[]): ScheduleEditChanges {
+  const ch: ScheduleEditChanges = {};
+  for (const f of changedFields) {
+    switch (f) {
+      case "cron":
+        if (entry.cron) ch.cron = entry.cron;
+        break;
+      case "every":
+        if (entry.every) ch.every = entry.every;
+        break;
+      case "baseAmount":
+        ch.baseAmount = entry.baseAmount != null ? String(entry.baseAmount) : null;
+        break;
+      case "quoteAmount":
+        ch.quoteAmount = entry.quoteAmount != null ? String(entry.quoteAmount) : null;
+        break;
+      case "slippageBps":
+        ch.slippageBps = entry.slippageBps ?? null;
+        break;
+      case "autoSlippage":
+        ch.autoSlippage = entry.autoSlippage === true;
+        break;
+      case "endAt":
+        ch.endAt = entry.endAt ?? null;
+        break;
+      case "maxRuns":
+        ch.maxRuns = entry.maxRuns ?? null;
+        break;
+      case "note":
+        ch.note = entry.note ?? null;
+        break;
+    }
+  }
+  return ch;
 }
 
 // ── pre-validation ───────────────────────────────────────────

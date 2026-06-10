@@ -1630,7 +1630,7 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
   // ── bulk_resume (iter37) ────────────────────────────────────
   server.tool(
     "bulk_resume",
-    "Bulk resume: re-enable paused schedules + rebalances. Cancelled orders are terminal — recreate via order_create or playbook_replace; the types[] filter refuses 'orders'. Same scope requirement as bulk_halt. Returns the executed plan + per-row results. Errors: INVALID_PARAMS (no scope + no `all`, 'orders' in types).",
+    "Bulk resume: re-enable paused schedules + rebalances. Cancelled orders are terminal — recreate via order_create or the CLI `playbook replace`; the types[] filter refuses 'orders'. Same scope requirement as bulk_halt. Returns the executed plan + per-row results. Errors: INVALID_PARAMS (no scope + no `all`, 'orders' in types).",
     {
       strategy: z.string().optional(),
       chain: z.string().optional(),
