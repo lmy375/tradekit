@@ -18,6 +18,7 @@ import {
   redactConfigForDisplay,
 } from "./config.js";
 import { listChains, resolveToken, resolveTradePair, unknownTokenError } from "./chains.js";
+import { registerAutomationRoutes } from "./webAutomation.js";
 import { tradekitVersion } from "./version.js";
 import { activeWalletAddress, activeWalletLabel, loadWallet, type WalletContext } from "./wallet.js";
 import { listAccounts, setActiveAccount } from "./accounts.js";
@@ -932,6 +933,13 @@ export async function startWebServer(opts: WebServerOptions): Promise<void> {
       res.json({ ok: true, query: q ?? null, chain, pairs, timestamp: new Date().toISOString() });
     }),
   );
+
+  // ── automation API (read-only) ──────────────────────────────
+  // Orders / schedules / rebalance (+ decision-journal tails),
+  // playbooks, paper book, unified timeline, alerts, strategy
+  // reports. Registered AFTER authMiddleware so the routes inherit
+  // the same token gate; zero RPC, zero writes — see webAutomation.ts.
+  registerAutomationRoutes(app);
 
   // ── static React bundle (SPA fallback to index.html for client routes) ──
   const bundleDir = resolveBundledWebui();

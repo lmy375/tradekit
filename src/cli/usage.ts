@@ -682,6 +682,10 @@ MAINTENANCE
 SERVERS
   mcp [--pass <pw>]                   Start MCP stdio server for AI agents
   web [--port 3030] [--host 127.0.0.1] [--pass <pw>]  Single-page UI + REST API
+        Read-only automation routes (token-authed, zero RPC/writes): /api/engine,
+        /api/orders[/:id], /api/schedules[/:id], /api/rebalance[/:id] (each :id with
+        its decision-journal tail), /api/playbooks[/:id], /api/paper, /api/timeline,
+        /api/alerts, /api/strategy-report/:tag — dashboard/monitor consumption.
 
 GLOBAL FLAGS
   --pass <pw>          Wallet password (or set WALLET_PASS env). Only required for real

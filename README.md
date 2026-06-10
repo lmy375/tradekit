@@ -2015,6 +2015,22 @@ The server prints a one-time URL with an embedded per-session auth token; open i
 - **Approvals** — per-row revoke and bulk **Revoke ALL**
 - **Config** — JSON config editing with server-side Zod validation
 
+#### Read-only automation API
+
+The web server also exposes the automation engine's observability core as token-authed, **read-only** JSON routes — built for wall-mounted dashboards and external monitors, and consumed by the same core helpers the CLI/MCP use (numbers match across surfaces by construction). No wallet, no keystore, no RPC, no writes — a leaked dashboard token can't fire trades through these:
+
+| Route | Returns |
+|---|---|
+| `GET /api/engine` | engine status file + lock state (`running`, per-worker ticks, lock reason) |
+| `GET /api/orders[?status&chain&account&strategy&limit]` | conditional orders; `/api/orders/:id` adds the decision-journal tail |
+| `GET /api/schedules[…]`, `/api/schedules/:id` | DCA schedules + v29 journal tail (fires, failures, retirements, hooks) |
+| `GET /api/rebalance[…]`, `/api/rebalance/:id` | rebalance plans + the drift history journal — the dashboard's "how close to firing?" series |
+| `GET /api/playbooks`, `/api/playbooks/:id` | deployments + spec + every owned primitive |
+| `GET /api/paper[?account&chain]` | virtual balances + realized P&L (same `summarizePaperPnl` core) |
+| `GET /api/timeline[?since&until&kinds&strategy&minSeverity&limit]` | the unified forensic event stream (all 20 kinds, incl. `schedule.journal` / `rebalance.journal`) |
+| `GET /api/alerts[?tag&limit]` | active alert states + the v28 transition history |
+| `GET /api/strategy-report/:tag[?window&mode]` | the full multi-section strategy report (offline build — no live prices; MTM stays on CLI/MCP where it's explicitly opted into) |
+
 #### Architecture
 
 The server is **Express 5**; the frontend is **React 18 + Mantine 7**, bundled with **Vite**. Auth is a per-session random token accepted via `Authorization: Bearer`, `tk_token` cookie, or `?token=` query (the cookie is set on the bootstrap `GET /?token=…`). All endpoints under `/api/*` use a structured error middleware that emits `{ok:false, error:{code,message}}`. BigInt values are serialized via an Express-level `json replacer`. SPA routes fall back to `index.html`. Graceful shutdown on SIGINT/SIGTERM closes the SQLite WAL cleanly.
