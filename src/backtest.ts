@@ -34,6 +34,7 @@ import { getCoinGeckoId } from "./price.js";
 import { isOrderTriggered } from "./orders.js";
 import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.js";
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
+import { parseOnFillSpec, renderOnFillSpec, type OnFillSpec } from "./scheduleHooks.js";
 import type { OrderSide, OrderTrigger } from "./db.js";
 
 // ── price series ─────────────────────────────────────────────
@@ -705,14 +706,6 @@ export function simulatePlaybook(args: {
   const fires: PlaybookBacktestFire[] = [];
   const notes: string[] = [];
 
-  // Post-fill hooks fire follow-up orders in the LIVE engine, but the
-  // simulator doesn't model them (the hook's child order depends on
-  // fill data the sim doesn't fabricate). Surface that explicitly so
-  // operators don't read the backtest as covering the bracket legs.
-  const hookCount = spec.strategies.filter((st) => st.type === "schedule" && st.onFill != null).length;
-  if (hookCount > 0) {
-    notes.push(`${hookCount} schedule(s) declare on_fill hooks — hook-created follow-up orders are NOT simulated`);
-  }
 
   for (const pt of series.points) {
     // Order matters: orders evaluate first, then schedules — matches
@@ -728,9 +721,15 @@ export function simulatePlaybook(args: {
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
       if (st.type === "schedule") {
-        evaluateScheduleTick({ state: st, pt, balance, baseSymbol, quoteSymbol, fires });
+        evaluateScheduleTick({ state: st, pt, balance, baseSymbol, quoteSymbol, fires, states, notes });
       }
     }
+  }
+
+  // v31: hook-spawn summary. Dynamic states carry spawnedBy.
+  const spawned = states.filter((st) => st.type === "order" && st.spawnedBy != null).length;
+  if (spawned > 0) {
+    notes.push(`${spawned} follow-up order(s) spawned by on_fill hooks (simulated with the production renderer)`);
   }
 
   // Anything still "active" at the end of the timeline stays "active"
@@ -780,6 +779,9 @@ interface OrderState {
   fireCount: number;
   baseDelta: number;
   quoteDelta: number;
+  /** v31: the schedule state id whose on_fill hook spawned this
+   *  order (null for spec-declared orders). */
+  spawnedBy: string | null;
 }
 
 interface ScheduleState {
@@ -810,6 +812,7 @@ function buildStrategyState(entry: StrategySpec, idx: number): StrategyState {
       fireCount: 0,
       baseDelta: 0,
       quoteDelta: 0,
+      spawnedBy: null,
     };
   }
   if (entry.type === "schedule") {
@@ -898,8 +901,14 @@ function evaluateScheduleTick(args: {
   baseSymbol: string;
   quoteSymbol: string;
   fires: PlaybookBacktestFire[];
+  /** v31: dynamic hook orders are appended here. The orders loop runs
+   *  BEFORE the schedules loop each tick, so a spawned order starts
+   *  evaluating on the NEXT datapoint — same ordering as the live
+   *  engine (the hook creates the order after the fill lands). */
+  states: StrategyState[];
+  notes: string[];
 }): void {
-  const { state, pt, balance, baseSymbol, quoteSymbol, fires } = args;
+  const { state, pt, balance, baseSymbol, quoteSymbol, fires, states, notes } = args;
   if (state.fireCount >= state.maxRuns) {
     state.finalStatus = "completed";
     return;
@@ -917,6 +926,51 @@ function evaluateScheduleTick(args: {
     state.quoteDelta += fill.quoteDelta;
     state.lastFireMinute = minuteBucket;
     if (state.fireCount >= state.maxRuns) state.finalStatus = "completed";
+    // v31: on_fill hook — spawn the follow-up order with the SAME
+    // production renderer the live engine uses, fed the simulated
+    // fill context. A render failure mirrors the live semantics:
+    // the fill stays, the hook is noted, the sim continues.
+    if (state.spec.onFill != null) {
+      try {
+        const hook = parseOnFillSpec(state.spec.onFill);
+        const rendered = renderOnFillSpec({
+          spec: hook,
+          fill: {
+            baseAmount: String(Math.abs(fill.baseDelta)),
+            quoteAmount: String(Math.abs(fill.quoteDelta)),
+            fillPriceUsd: pt.priceUsd,
+            txHash: `sim:${state.id}:${state.fireCount}`,
+            fireNumber: state.fireCount,
+          },
+        }) as OnFillSpec;
+        const hs = rendered.spec;
+        states.push({
+          id: `${state.id}:hook#${state.fireCount}`,
+          type: "order",
+          spec: {
+            type: "order",
+            side: hs.side,
+            trigger: hs.trigger,
+            price: hs.price != null ? Number(hs.price) : undefined,
+            trailPct: hs.trailPct != null ? Number(hs.trailPct) : undefined,
+            base: hs.base,
+            quote: hs.quote,
+            baseAmount: hs.baseAmount != null ? String(hs.baseAmount) : undefined,
+            quoteAmount: hs.quoteAmount != null ? String(hs.quoteAmount) : undefined,
+            expiresAt: hs.expiresAt,
+            group: hs.group,
+          },
+          finalStatus: "active",
+          trailWaterMark: null,
+          fireCount: 0,
+          baseDelta: 0,
+          quoteDelta: 0,
+          spawnedBy: state.id,
+        });
+      } catch (e) {
+        notes.push(`${pt.ts}: on_fill hook for ${state.id} failed to render (${(e as Error).message.split("\n")[0]}) — fill kept, hook skipped`);
+      }
+    }
   } else {
     // halt — park the schedule. Some operators might want to keep
     // retrying on the next tick (a schedule with insufficient balance
@@ -1022,6 +1076,21 @@ function validatePlaybookForBacktest(
     }
     if (s.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
       errors.push(`${prefix}: quote "${s.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
+    }
+    // v31: hook orders are simulated — the same-pair invariant
+    // extends INSIDE the hook spec (one price series).
+    if (s.type === "schedule" && s.onFill != null) {
+      try {
+        const hook = parseOnFillSpec(s.onFill);
+        if (hook.spec.base.toUpperCase() !== baseSymbol.toUpperCase()) {
+          errors.push(`${prefix}.onFill: hook base "${hook.spec.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
+        }
+        if (hook.spec.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
+          errors.push(`${prefix}.onFill: hook quote "${hook.spec.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
+        }
+      } catch (e) {
+        errors.push(`${prefix}.onFill: ${(e as Error).message.split("\n")[0]}`);
+      }
     }
   }
   if (errors.length === 0) return;

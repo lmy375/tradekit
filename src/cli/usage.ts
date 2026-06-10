@@ -516,7 +516,10 @@ BACKTESTING (historical strategy simulation)
                     [--var NAME=VALUE ...] [--vars-file FILE]
         Replay a FULL playbook spec (multiple orders + schedules) against one shared price
         series with a shared simulated balance. OCO cascade fires during simulation —
-        when a peer fills, the rest of the group transitions to cancelled. Per-strategy
+        when a peer fills, the rest of the group transitions to cancelled. Schedule
+        on_fill hooks are SIMULATED: each fire spawns the follow-up order (production
+        renderer, {{filled.X}} substitution, sized to the simulated fill) which then
+        trades like any other order — DCA+bracket composites backtest end-to-end. Per-strategy
         stats (fire count, base/quote delta, final status) surface alongside total PnL.
         Rebalance plans + multi-base playbooks are rejected with a pointer to the
         single-strategy commands. Base/quote inferred from the first non-rebalance

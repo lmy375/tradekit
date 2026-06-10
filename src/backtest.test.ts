@@ -1010,3 +1010,106 @@ describe("simulatePlaybook — full smoke", () => {
     expect(result.fires.filter((f) => f.multiAction === "fill").length).toBeGreaterThan(0);
   });
 });
+
+// ── v31: on_fill hook simulation ─────────────────────────────
+
+describe("simulatePlaybook — on_fill hooks", () => {
+  const HOOK = {
+    type: "createOrder",
+    spec: {
+      side: "sell",
+      trigger: "trailing",
+      trailPct: 10,
+      base: "ETH",
+      quote: "USDC",
+      baseAmount: "{{filled.baseAmount}}",
+    },
+  };
+
+  function dcaSpec(over: Record<string, unknown> = {}) {
+    return parsePlaybookSpec({
+      name: "dca-hooked",
+      strategies: [
+        {
+          id: "dca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 1000,
+          base: "ETH", quote: "USDC", onFill: HOOK, ...over,
+        },
+      ],
+    });
+  }
+
+  it("each schedule fire spawns one hook order sized to the FILLED amount", () => {
+    // Daily series at midnight — the cron matches every point.
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2000, 2000]);
+    const r = simulatePlaybook({
+      spec: dcaSpec({ maxRuns: 2 }),
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 10_000 },
+      series,
+    });
+    const hookStats = r.perStrategy.filter((s) => s.strategyId.startsWith("dca:hook#"));
+    expect(hookStats).toHaveLength(2); // maxRuns caps spawns too
+    expect(r.notes.some((n) => n.includes("2 follow-up order(s) spawned"))).toBe(true);
+    // Each fill bought 0.5 ETH (1000/2000) → hook trail sized 0.5.
+    const dca = r.perStrategy.find((s) => s.strategyId === "dca")!;
+    expect(dca.fireCount).toBe(2);
+    expect(dca.baseDelta).toBeCloseTo(1.0, 9);
+  });
+
+  it("a spawned trailing hook actually fires on retracement — full DCA+bracket round trip", () => {
+    // Day 0: DCA buys 0.5 ETH @2000 → spawns trail (10%).
+    // Day 1+: price runs to 3000 (HWM), then crashes to 2400 (-20%)
+    // → the hook trail fires, selling the 0.5 ETH @2400.
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 3000, 2400, 2400]);
+    const r = simulatePlaybook({
+      spec: dcaSpec({ maxRuns: 1 }),
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series,
+    });
+    const hook = r.perStrategy.find((s) => s.strategyId === "dca:hook#1")!;
+    expect(hook.finalStatus).toBe("filled");
+    expect(hook.baseDelta).toBeCloseTo(-0.5, 9); // sold exactly the slice
+    // Balance round trip: 1000 → bought 0.5@2000 → sold 0.5@2400 = 1200 USDC.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(1200, 6);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+  });
+
+  it("hook orders start evaluating on the NEXT datapoint (live-engine ordering)", () => {
+    // The fill happens at 2000; a price_below 2100 hook would already
+    // be "triggered" at the same point — but live engines create the
+    // order AFTER the fill, so it must not fire until the next tick.
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 5000]);
+    const r = simulatePlaybook({
+      spec: dcaSpec({
+        maxRuns: 1,
+        onFill: { type: "createOrder", spec: { ...HOOK.spec, trigger: "price_below", price: 2100, trailPct: undefined } },
+      }),
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series,
+    });
+    const hook = r.perStrategy.find((s) => s.strategyId === "dca:hook#1")!;
+    // Next datapoint is 5000 — above the 2100 trigger → never fires.
+    expect(hook.finalStatus).toBe("active");
+    expect(hook.fireCount).toBe(0);
+  });
+
+  it("rejects a hook whose pair doesn't match the playbook series", () => {
+    const spec = dcaSpec({
+      onFill: { type: "createOrder", spec: { ...HOOK.spec, base: "WBTC" } },
+    });
+    expect(() =>
+      simulatePlaybook({
+        spec,
+        baseSymbol: "ETH",
+        quoteSymbol: "USDC",
+        initialBalance: { ETH: 0, USDC: 1000 },
+        series: dailySeries("2026-04-01T00:00:00Z", [2000, 2000]),
+      }),
+    ).toThrow(/hook base "WBTC" doesn't match/);
+  });
+});
