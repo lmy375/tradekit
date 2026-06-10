@@ -22,6 +22,11 @@ SETUP
         [--per-tx-limit N] [--max-slippage-bps N] [--allow-infinite-approvals true|false]
   doctor [--chains a,b,c | --chains all] [--pass P] [--strict] [--quiet] [--summary] [--json] [--verbose]
         Health check; --pass verifies keystore decrypts; --strict treats warnings as failures (CI-friendly); --quiet hides ok rows (iter752); --summary prints a one-line cron/Slack-friendly digest (iter847).
+        Ops-hygiene pack (offline): retention (journal tables growing unbounded vs
+        db.retention knobs), paper book (live paper primitives with an EMPTY virtual
+        book), alerts (automation running unwatched; CURRENTLY-FIRING alerts go warn —
+        --strict in cron pages on them), engine liveness (live primitives but the
+        engine never ran / status file stale).
   verify [all | backup <file> | wallet | config | db] [--pass <pw>] [--quiet] [--summary] [--json]
         Integrity check suite: backup (non-destructive decrypt+parse), wallet (re-derive address), config (orphan token refs, unknown-chain safety entries), db (schema, stale pending, audit size). Exit 1 on any failure.
         --quiet hides ok rows (iter760 — parallel to doctor/health --quiet); --summary prints a one-line cron/Slack-friendly digest (iter847).

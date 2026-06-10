@@ -185,3 +185,140 @@ describe("checkSyncBookmarks (iter740)", () => {
     expect(r.hint).toMatch(/sync cron stopped|reset-bookmark/);
   });
 });
+
+// ── v30 ops-hygiene pack ─────────────────────────────────────
+
+describe("checkRetentionHygiene", () => {
+  it("ok on a small install with retention off", async () => {
+    const { checkRetentionHygiene } = await import("./doctor.js");
+    const r = await checkRetentionHygiene();
+    expect(r.severity).toBe("ok");
+    expect(r.name).toBe("retention");
+    expect(r.details!.length).toBe(7);
+  });
+
+  it("warns when a journal table grows past 50k rows with no retention knob", async () => {
+    const { openDb } = await import("./db.js");
+    const db = openDb();
+    // Bulk-insert 50k alert_events cheaply inside one transaction.
+    db.exec("BEGIN");
+    const ins = db.prepare(
+      `INSERT INTO alert_events (at, tag, rule_type, event, severity) VALUES (?, 'bulk', 'staleness', 'fired', 'warn')`,
+    );
+    for (let i = 0; i < 50_000; i++) ins.run("2026-06-01T00:00:00Z");
+    db.exec("COMMIT");
+    try {
+      const { checkRetentionHygiene } = await import("./doctor.js");
+      const r = await checkRetentionHygiene();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toContain("alert_events");
+      expect(r.hint).toContain("db.retention");
+      const row = r.details!.find((d) => d.label === "alert_events")!;
+      expect(row.ok).toBe(false);
+    } finally {
+      db.exec("DELETE FROM alert_events");
+    }
+  });
+});
+
+describe("checkPaperReadiness", () => {
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  beforeEach(async () => {
+    const { openDb } = await import("./db.js");
+    const db = openDb();
+    db.exec("DELETE FROM orders");
+    db.exec("DELETE FROM schedules");
+    db.exec("DELETE FROM rebalance_plans");
+    db.exec("DELETE FROM paper_balances");
+  });
+
+  it("ok when no live paper primitives exist", async () => {
+    const { checkPaperReadiness } = await import("./doctor.js");
+    const r = await checkPaperReadiness();
+    expect(r.severity).toBe("ok");
+    expect(r.message).toMatch(/no live paper/);
+  });
+
+  it("warns when a live paper order has an EMPTY book; ok once funded", async () => {
+    const { insertOrder } = await import("./db.js");
+    insertOrder({
+      side: "sell", trigger_type: "trailing", target_price_usd: null, trail_pct: 5,
+      chain: "base", account: "default",
+      base_token: WETH, base_symbol: "ETH", quote_token: USDC, quote_symbol: "USDC",
+      base_amount: "1", quote_amount: null, slippage_bps: 50, auto_slippage: false,
+      expires_at: null, strategy: "doc-test", note: null, group_id: null, paper: true,
+    } as never);
+    const { checkPaperReadiness } = await import("./doctor.js");
+    const starved = await checkPaperReadiness();
+    expect(starved.severity).toBe("warn");
+    expect(starved.message).toContain("default:base");
+    expect(starved.hint).toContain("paper deposit");
+
+    const { setPaperBalance } = await import("./paperTrade.js");
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "1000" });
+    const funded = await checkPaperReadiness();
+    expect(funded.severity).toBe("ok");
+  });
+});
+
+describe("checkAlertsCoverage + checkEngineLiveness", () => {
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  beforeEach(async () => {
+    const { openDb } = await import("./db.js");
+    const db = openDb();
+    db.exec("DELETE FROM orders");
+    db.exec("DELETE FROM schedules");
+    db.exec("DELETE FROM rebalance_plans");
+    db.exec("DELETE FROM strategy_alert_state");
+  });
+
+  function seedActiveOrder() {
+    return import("./db.js").then(({ insertOrder }) =>
+      insertOrder({
+        side: "sell", trigger_type: "price_below", target_price_usd: 1900, trail_pct: null,
+        chain: "base", account: "default",
+        base_token: WETH, base_symbol: "ETH", quote_token: USDC, quote_symbol: "USDC",
+        base_amount: "1", quote_amount: null, slippage_bps: 50, auto_slippage: false,
+        expires_at: null, strategy: "doc-test", note: null, group_id: null,
+      } as never),
+    );
+  }
+
+  it("alerts: ok with no primitives; warns when automation runs unwatched", async () => {
+    const { checkAlertsCoverage } = await import("./doctor.js");
+    expect((await checkAlertsCoverage()).severity).toBe("ok");
+
+    await seedActiveOrder();
+    const r = await checkAlertsCoverage();
+    // Default config has strategyAlerts disabled.
+    expect(r.severity).toBe("warn");
+    expect(r.message).toMatch(/unwatched|disabled/);
+  });
+
+  it("alerts: CURRENTLY FIRING alerts surface as warn with the tags", async () => {
+    const { upsertStrategyAlertState } = await import("./db.js");
+    upsertStrategyAlertState({
+      tag: "doc-test", ruleType: "failure_streak", active: true,
+      firstTriggeredAt: new Date().toISOString(), lastEvaluatedAt: new Date().toISOString(), lastValueJson: null,
+    });
+    const { checkAlertsCoverage } = await import("./doctor.js");
+    const r = await checkAlertsCoverage();
+    expect(r.severity).toBe("warn");
+    expect(r.message).toContain("doc-test/failure_streak");
+  });
+
+  it("engine liveness: ok with no primitives; warns when primitives exist but the engine never ran", async () => {
+    const { checkEngineLiveness } = await import("./doctor.js");
+    expect((await checkEngineLiveness()).severity).toBe("ok");
+
+    await seedActiveOrder();
+    const r = await checkEngineLiveness();
+    expect(r.severity).toBe("warn");
+    expect(r.message).toMatch(/NEVER run/);
+    expect(r.hint).toContain("engine run");
+  });
+});

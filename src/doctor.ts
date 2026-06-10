@@ -902,6 +902,205 @@ async function checkAggregator(name: string, probe: () => Promise<boolean>): Pro
  * since it materially changes wallet UX (skips the prompt — operators forgetting
  * they set it can be surprised by trades that don't ask for a password).
  */
+// ── ops-hygiene pack (v30) ───────────────────────────────────
+//
+// The automation arc added journals (order/schedule/rebalance check
+// logs, alert_events), the paper book, the alert watcher, and the
+// engine supervisor — each with config knobs an operator can leave
+// half-wired. These checks catch the four production footguns:
+// unbounded journal growth, paper primitives with an empty book,
+// automation running unwatched, and primitives configured while the
+// engine never runs. All offline (DB + config + status file).
+
+/** Growing tables vs their retention knobs. Unbounded growth is only
+ *  a problem once the table is actually large — warn at 50k rows
+ *  with the knob unset; report counts otherwise. */
+export async function checkRetentionHygiene(): Promise<CheckResult> {
+  const WARN_ROWS = 50_000;
+  try {
+    const config = loadConfig();
+    const db = openDb();
+    const tables: Array<{ table: string; knob: string; days: number | null }> = [
+      { table: "audit_log", knob: "auditLogDays", days: config.db.retention.auditLogDays },
+      { table: "order_check_log", knob: "orderCheckLogDays", days: config.db.retention.orderCheckLogDays },
+      { table: "schedule_check_log", knob: "scheduleCheckLogDays", days: config.db.retention.scheduleCheckLogDays },
+      { table: "rebalance_check_log", knob: "rebalanceCheckLogDays", days: config.db.retention.rebalanceCheckLogDays },
+      { table: "alert_events", knob: "alertEventsDays", days: config.db.retention.alertEventsDays },
+      { table: "engine_events", knob: "engineEventsDays", days: config.db.retention.engineEventsDays },
+      { table: "paper_trades", knob: "paperTradesDays", days: config.db.retention.paperTradesDays },
+    ];
+    const details: CheckResult["details"] = [];
+    const offenders: string[] = [];
+    let total = 0;
+    for (const t of tables) {
+      const n = (db.prepare(`SELECT COUNT(*) AS n FROM ${t.table}`).get() as { n: number }).n;
+      total += n;
+      const retained = config.db.retention.enabled && t.days != null;
+      const unbounded = !retained && n >= WARN_ROWS;
+      if (unbounded) offenders.push(`${t.table} (${n.toLocaleString()} rows)`);
+      details.push({
+        label: t.table,
+        ok: !unbounded,
+        note: `${n.toLocaleString()} rows · ${retained ? `${t.days}d retention` : "no retention"}`,
+      });
+    }
+    if (offenders.length > 0) {
+      return {
+        name: "retention",
+        severity: "warn",
+        message: `${offenders.length} journal table(s) growing unbounded: ${offenders.join(", ")}`,
+        hint: `set db.retention.enabled=true + the per-table *Days knobs (e.g. \`tradekit config set db.retention.auditLogDays 90\`), then \`tradekit db prune\``,
+        details,
+      };
+    }
+    return {
+      name: "retention",
+      severity: "ok",
+      message: config.db.retention.enabled
+        ? `${total.toLocaleString()} journal rows across ${tables.length} tables (retention on)`
+        : `${total.toLocaleString()} journal rows (retention off — fine at this size)`,
+      details,
+    };
+  } catch (e) {
+    return { name: "retention", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** Active paper primitives whose (account, chain) book is EMPTY —
+ *  every fire will fail with PAPER_INSUFFICIENT_BALANCE. */
+export async function checkPaperReadiness(): Promise<CheckResult> {
+  try {
+    const { listOrders, listSchedules, listPaperBalances } = await import("./db.js");
+    const { listRebalancePlans } = await import("./rebalance.js");
+    const scopes = new Map<string, { orders: number; schedules: number; rebalances: number }>();
+    const bump = (account: string, chain: string, kind: "orders" | "schedules" | "rebalances") => {
+      const key = `${account}:${chain}`;
+      const cur = scopes.get(key) ?? { orders: 0, schedules: 0, rebalances: 0 };
+      cur[kind] += 1;
+      scopes.set(key, cur);
+    };
+    for (const o of listOrders({ status: "active" })) if ((o.paper ?? 0) === 1) bump(o.account, o.chain, "orders");
+    for (const sc of listSchedules({ status: "active" })) if ((sc.paper ?? 0) === 1) bump(sc.account, sc.chain, "schedules");
+    for (const r of listRebalancePlans({ status: "active" })) if ((r.paper ?? 0) === 1) bump(r.account, r.chain, "rebalances");
+
+    if (scopes.size === 0) {
+      return { name: "paper book", severity: "ok", message: "no live paper primitives" };
+    }
+    const funded = new Set(
+      listPaperBalances({})
+        .filter((b) => parseFloat(b.balance) > 0)
+        .map((b) => `${b.account}:${b.chain}`),
+    );
+    const details: CheckResult["details"] = [];
+    const starved: string[] = [];
+    for (const [key, counts] of scopes) {
+      const has = funded.has(key);
+      const live = counts.orders + counts.schedules + counts.rebalances;
+      if (!has) starved.push(key);
+      details.push({ label: key, ok: has, note: `${live} live paper primitive(s) · book ${has ? "funded" : "EMPTY"}` });
+    }
+    if (starved.length > 0) {
+      return {
+        name: "paper book",
+        severity: "warn",
+        message: `${starved.length} scope(s) with live paper primitives but an EMPTY virtual book: ${starved.join(", ")}`,
+        hint: `every paper fire will fail with PAPER_INSUFFICIENT_BALANCE — seed with \`tradekit paper deposit --token USDC --amount 10000\``,
+        details,
+      };
+    }
+    return { name: "paper book", severity: "ok", message: `${scopes.size} scope(s) with live paper primitives, all funded`, details };
+  } catch (e) {
+    return { name: "paper book", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** Automation running unwatched: active primitives + alert watcher
+ *  disabled. Also surfaces CURRENTLY-FIRING alerts — doctor --strict
+ *  in CI/cron goes red while something is alerting. */
+export async function checkAlertsCoverage(): Promise<CheckResult> {
+  try {
+    const config = loadConfig();
+    const { listOrders, listSchedules, listStrategyAlertStates } = await import("./db.js");
+    const { listRebalancePlans } = await import("./rebalance.js");
+    const liveCount =
+      listOrders({ status: "active" }).length +
+      listSchedules({ status: "active" }).length +
+      listRebalancePlans({ status: "active" }).length;
+    const alertsCfg = (config.safety as { strategyAlerts?: { enabled?: boolean; rules?: unknown[] } }).strategyAlerts;
+    const enabled = alertsCfg?.enabled === true && (alertsCfg.rules?.length ?? 0) > 0;
+
+    const active = listStrategyAlertStates({ active: true });
+    if (active.length > 0) {
+      return {
+        name: "alerts",
+        severity: "warn",
+        message: `${active.length} strategy alert(s) CURRENTLY FIRING: ${active.slice(0, 5).map((a) => `${a.tag}/${a.rule_type}`).join(", ")}${active.length > 5 ? ", …" : ""}`,
+        hint: `inspect with \`tradekit strategy alerts list --active-only\`; history via \`tradekit strategy alerts history\``,
+      };
+    }
+    if (liveCount > 0 && !enabled) {
+      return {
+        name: "alerts",
+        severity: "warn",
+        message: `${liveCount} live automation primitive(s) but the alert watcher is ${alertsCfg?.enabled === true ? "enabled with ZERO rules" : "disabled"}`,
+        hint: `automation is running unwatched — enable safety.strategyAlerts with at least failure_streak + staleness rules (see README "Strategy alerts")`,
+      };
+    }
+    return {
+      name: "alerts",
+      severity: "ok",
+      message: enabled
+        ? `watcher on (${alertsCfg!.rules!.length} rule${alertsCfg!.rules!.length === 1 ? "" : "s"}), nothing firing`
+        : "no live primitives — watcher optional",
+    };
+  } catch (e) {
+    return { name: "alerts", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** Primitives configured while the engine never runs — the classic
+ *  silent footgun: orders created, engine down, nothing fires. */
+export async function checkEngineLiveness(): Promise<CheckResult> {
+  const STALE_SECONDS = 6 * 3600;
+  try {
+    const { listOrders, listSchedules } = await import("./db.js");
+    const { listRebalancePlans } = await import("./rebalance.js");
+    const { readEngineStatus } = await import("./engine.js");
+    const liveCount =
+      listOrders({ status: "active" }).length +
+      listSchedules({ status: "active" }).length +
+      listRebalancePlans({ status: "active" }).length;
+    if (liveCount === 0) {
+      return { name: "engine liveness", severity: "ok", message: "no live primitives — engine optional" };
+    }
+    const status = readEngineStatus();
+    if (!status) {
+      return {
+        name: "engine liveness",
+        severity: "warn",
+        message: `${liveCount} live primitive(s) but the engine has NEVER run on this install`,
+        hint: `nothing will fire until the engine ticks — start it with \`tradekit engine run\` (or a systemd/pm2 unit)`,
+      };
+    }
+    const ageSec = Math.floor((Date.now() - Date.parse(status.updatedAt)) / 1000);
+    if (status.stopping || ageSec > STALE_SECONDS) {
+      return {
+        name: "engine liveness",
+        severity: "warn",
+        message: `${liveCount} live primitive(s) but the engine status file is ${Math.floor(ageSec / 3600)}h stale (last update ${status.updatedAt})`,
+        hint: `the engine looks down — check \`tradekit engine status\` and restart it`,
+      };
+    }
+    return {
+      name: "engine liveness",
+      severity: "ok",
+      message: `engine alive (pid ${status.pid}, last tick ${ageSec}s ago) · ${liveCount} live primitive(s)`,
+    };
+  } catch (e) {
+    return { name: "engine liveness", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
 export async function checkEnv(): Promise<CheckResult> {
   const SENSITIVE = new Set(["WALLET_PASS", "TRADEKIT_WEB_TOKEN"]);
   const KNOWN = [
@@ -1006,6 +1205,11 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ timestamp: strin
   results.push(await checkServerLog());
   results.push(await checkPendingTrades());
   results.push(await checkSyncBookmarks());
+  // v30 ops-hygiene pack (offline: DB + config + status file).
+  results.push(await checkRetentionHygiene());
+  results.push(await checkPaperReadiness());
+  results.push(await checkAlertsCoverage());
+  results.push(await checkEngineLiveness());
 
   // RPCs (parallel)
   results.push(...(await Promise.all(chains.map((c) => checkRpc(c, opts.logger)))));

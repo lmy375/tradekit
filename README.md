@@ -73,7 +73,7 @@ tradekit trade buy --chain base --quoteAmount 10 --simulate
 tradekit trade buy --chain base --quoteAmount 10
 
 # Cron-friendly monitoring (single-line output, exit 1 on issues)
-tradekit doctor --summary --strict        # config + RPC + wallet integrity
+tradekit doctor --summary --strict        # config + RPC + wallet integrity + ops hygiene (retention, paper book, alert coverage, engine liveness)
 tradekit health --summary --strict        # portfolio + PnL + alerts
 tradekit pending --summary --strict       # stuck-tx triage
 tradekit reconcile --summary              # confirm pending tx receipts
