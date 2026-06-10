@@ -1010,3 +1010,84 @@ describe("runOrderTick — position caps", () => {
     }
   });
 });
+
+// ── v38: order start_at (activation boundary) ────────────────
+
+describe("runOrderTick — start_at", () => {
+  it("a pre-start order is not evaluated: no fire, no trailing watermark", async () => {
+    seedQuoteBalance("10000");
+    const { getOrderById } = await import("./db.js");
+    // Trigger WOULD match (mock 2000 ≤ 2100) and a trailing twin
+    // WOULD start tracking — but both wait for start_at.
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    const a = seedOrder({ paper: true, start_at: future });
+    const b = seedOrder({
+      paper: true, start_at: future,
+      side: "sell", trigger_type: "trailing", trail_pct: 5,
+      target_price_usd: null, base_amount: "0.1", quote_amount: null,
+    });
+    const report = await tick();
+    expect(report.filled).toBe(0);
+    expect(getOrderById(a)?.status).toBe("active");
+    // The watermark stayed null — pre-start chop can't set the HWM.
+    expect(getOrderById(b)?.water_mark_usd).toBeNull();
+  });
+
+  it("a past start_at is active immediately", async () => {
+    seedQuoteBalance("10000");
+    seedOrder({ paper: true, start_at: new Date(Date.now() - 60_000).toISOString() });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+  });
+
+  it("expiry still applies during pre-start (validity ≠ activity)", async () => {
+    const { getOrderById } = await import("./db.js");
+    const id = seedOrder({
+      paper: true,
+      start_at: new Date(Date.now() + 3_600_000).toISOString(),
+      expires_at: new Date(Date.now() - 1_000).toISOString(),
+    });
+    const report = await tick();
+    expect(report.expiredCount).toBe(1);
+    expect(getOrderById(id)?.status).toBe("expired");
+  });
+
+  it("signals received during pre-start never fire the order, even after activation", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent, getOrderById, openDb } = await import("./db.js");
+    const { createOrderRow } = await import("./orders.js");
+    // Order armed with a start boundary 1 minute in the past… but
+    // created 5 minutes ago with start_at 2 minutes ago, and the
+    // signal arrived BETWEEN creation and start → ineligible forever.
+    const row = createOrderRow({
+      side: "buy", trigger: "signal", signalName: "prestart-sig",
+      chain: "base", account: "default",
+      base: WETH as `0x${string}`, quote: USDC as `0x${string}`,
+      quoteAmount: "100", paper: true,
+      startAt: new Date(Date.now() - 2 * 60_000).toISOString(),
+    } as never);
+    openDb().prepare(`UPDATE orders SET created_at = ? WHERE id = ?`).run(new Date(Date.now() - 5 * 60_000).toISOString(), row.id!);
+    insertSignalEvent({ name: "prestart-sig", receivedAt: new Date(Date.now() - 3 * 60_000).toISOString(), source: "cli" });
+    const r1 = await tick();
+    expect(r1.filled).toBe(0); // pre-start-received signal is dead to this order
+    expect(getOrderById(row.id!)?.status).toBe("active");
+    // A FRESH signal after activation fires.
+    insertSignalEvent({ name: "prestart-sig", receivedAt: new Date().toISOString(), source: "cli" });
+    const r2 = await tick();
+    expect(r2.filled).toBe(1);
+  });
+
+  it("createOrderRow rejects expiry before start", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    expect(() =>
+      createOrderRow({
+        side: "buy", trigger: "price_below", targetPriceUsd: 1800,
+        chain: "base", account: "default",
+        base: WETH as `0x${string}`, quote: USDC as `0x${string}`,
+        quoteAmount: "100", paper: true,
+        startAt: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      } as never),
+    ).toThrow(/expire before ever activating/);
+  });
+});

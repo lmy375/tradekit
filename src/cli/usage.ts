@@ -355,6 +355,11 @@ CONDITIONAL ORDERS
                side only; works for real (on-chain), paper (virtual book),
                and backtests (sim balance); manual trades accept both too.
                [--expires-in 30s|15m|2h|7d|4w | --expires-at <ISO>]
+               [--start-in 30m|2h|1d | --start-at <ISO>]  ← v38: activation
+               boundary — the engine ignores the order until then: no trigger
+               eval, no trailing watermark (pre-announcement chop can't set
+               the HWM), signals received before it never fire the order.
+               Expiry still applies during pre-start (validity ≠ activity).
                [--on-fill '<json>' | --on-fill-file <path>]  ← v31: chain follow-up
                order(s) after THIS order fills (same {{filled.X}} dialect as schedule
                hooks; e.g. limit buy → auto-trailing the position, or limit buy →

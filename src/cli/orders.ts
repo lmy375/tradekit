@@ -242,6 +242,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
       paper: flags["paper"] === "true",
       onFill,
       signalName: flags["signal-name"],
+      startAt: resolveStartAt(flags),
     },
     config,
   );
@@ -254,6 +255,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
   console.log(`  Trigger: ${describeTrigger(row)}  (${row.trigger_type})`);
   console.log(`  Intent:  ${describeIntent(row)} on ${row.chain} (account: ${row.account})`);
   if (row.slippage_bps) console.log(`  Slippage: ${row.slippage_bps} bps`);
+  if ((row as { start_at?: string | null }).start_at) console.log(`  Starts:  ${(row as { start_at?: string | null }).start_at}  (engine ignores until then)`);
   if (row.expires_at) console.log(`  Expires: ${row.expires_at}  (${formatRelativeAge(row.expires_at)})`);
   if (row.strategy) console.log(`  Strategy: ${row.strategy}`);
   if (row.group_id) {
@@ -392,6 +394,7 @@ export async function orderShowCommand(flags: Record<string, string>, positional
   console.log("");
   console.log(`  Created:  ${row.created_at}`);
   console.log(`  Updated:  ${row.updated_at}`);
+  if ((row as { start_at?: string | null }).start_at) console.log(`  Starts:   ${(row as { start_at?: string | null }).start_at}  (engine ignores until then)`);
   if (row.expires_at) console.log(`  Expires:  ${row.expires_at}  (${formatRelativeAge(row.expires_at)})`);
   console.log(`  Attempts: ${row.attempts}`);
   if (row.last_checked_at) {
@@ -681,6 +684,22 @@ export async function orderResumeCommand(flags: Record<string, string>, position
   const row = resumeOrderById(id);
   if (flags["json"] === "true") printJson({ ok: true, order: row });
   else console.log(`Resumed order #${row.id}  (status → ${row.status})`);
+}
+
+/** v38: --start-at <ISO> | --start-in <dur> (30m, 2h, 1d). */
+function resolveStartAt(flags: Record<string, string>): string | undefined {
+  if (flags["start-at"] && flags["start-in"]) {
+    throw new ToolError("INVALID_PARAMS", "Pass --start-at OR --start-in, not both.");
+  }
+  if (flags["start-at"]) return flags["start-at"];
+  if (flags["start-in"]) {
+    const m = /^(\d+)([smhdw])$/.exec(flags["start-in"]);
+    if (!m) throw new ToolError("INVALID_PARAMS", `--start-in must be a duration like 30m, 2h, 1d (got "${flags["start-in"]}").`);
+    const n = parseInt(m[1], 10);
+    const ms = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 7 * 86_400_000 }[m[2] as "s"]!;
+    return new Date(Date.now() + n * ms).toISOString();
+  }
+  return undefined;
 }
 
 function parseOrderId(idArg: string | undefined, verb: string): number {

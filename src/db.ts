@@ -1226,6 +1226,17 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_operator_notes_at ON operator_notes (at);
   `,
+
+  // v38 — order start_at: the activation boundary schedules always
+  // had. Before start_at the engine does not evaluate the trigger AT
+  // ALL: trailing orders don't track a watermark (pre-announcement
+  // chop must not set the HWM), signal orders aren't eligible for
+  // events received before activation. Expiry still applies
+  // (validity window ≠ activity window) and OCO peers can still
+  // cancel a pre-start arm.
+  `
+  ALTER TABLE orders ADD COLUMN start_at TEXT;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3035,6 +3046,9 @@ export interface OrderRow {
   paper?: number;
   /** v35: signal name for trigger_type='signal' (NULL otherwise). */
   signal_name?: string | null;
+  /** v38: activation boundary — the engine ignores the order until
+   *  this instant (NULL = active immediately). */
+  start_at?: string | null;
   /** v31: post-fill hook spec (JSON). NULL = no hook. */
   on_fill_json: string | null;
 }
@@ -3070,6 +3084,8 @@ export interface InsertOrderArgs {
   on_fill_json?: string | null;
   /** v35: signal name (trigger_type='signal' only). */
   signal_name?: string | null;
+  /** v38: activation boundary (NULL = immediate). */
+  start_at?: string | null;
 }
 
 export function insertOrder(args: InsertOrderArgs): number {
@@ -3083,8 +3099,8 @@ export function insertOrder(args: InsertOrderArgs): number {
          base_token, base_symbol, quote_token, quote_symbol,
          base_amount, quote_amount, slippage_bps, auto_slippage,
          expires_at, strategy, note,
-         attempts, group_id, paper, on_fill_json, signal_name
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         attempts, group_id, paper, on_fill_json, signal_name, start_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       now, now, "active", args.side, args.trigger_type, args.target_price_usd, args.trail_pct,
@@ -3095,7 +3111,7 @@ export function insertOrder(args: InsertOrderArgs): number {
       args.slippage_bps, args.auto_slippage ? 1 : 0,
       args.expires_at, args.strategy, capTradeNotes(args.note),
       0, args.group_id, args.paper ? 1 : 0, args.on_fill_json ?? null,
-      args.signal_name ?? null,
+      args.signal_name ?? null, args.start_at ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -5048,6 +5064,8 @@ export type OrderCheckDecision =
   | "triggered_fired"
   | "triggered_skipped"
   | "error"
+  // v38: order not yet active (now < start_at) — nothing evaluated.
+  | "pre_start"
   // v33: crash-window guard booked the fill from an evidence trade
   // (engine crash between tx-send and markOrderFilled, or a
   // TX_TIMEOUT'd tx that confirmed before the next tick).

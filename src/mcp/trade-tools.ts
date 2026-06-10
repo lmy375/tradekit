@@ -641,6 +641,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
         .describe("Relative duration shorthand (30s, 15m, 2h, 7d, 4w). Converted to an absolute expiresAt at create time. Mutually exclusive with expiresAt."),
       strategy: z.string().max(100).optional().describe("Strategy tag stamped on the trade when the order fills (indexed; same column as trade strategy)."),
       note: z.string().optional().describe("Free-form note saved on the order row + on the eventual trade row."),
+      startAt: z.string().optional().describe("v38: ISO activation boundary — the engine ignores the order entirely until then (no trigger eval, no trailing watermark, no signal eligibility for events received before it). Expiry still applies during pre-start. Must precede expiresAt."),
       signalName: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional().describe("v35: REQUIRED for trigger='signal' — the external signal name this order arms on. The order fires when a signal with this name arrives AFTER the order was created (late-armed orders never fire on stale signals). Signals are point events: at-most-once delivery per listener."),
       onFill: z.unknown().optional().describe("Post-fill hook: { type: 'createOrder', spec: {...} } for one follow-up, or { type: 'createOrders', specs: [{...}, {...}] } for a multi-leg bracket (2–4 legs; legs without explicit `group` are auto-OCO-paired, e.g. take-profit + stop-loss that cancel each other). {{filled.X}} placeholders interpolate the fill. Auto-creates the follow-up order(s) after THIS order fills (e.g. limit buy → auto-trailing, or limit buy → TP+SL bracket). Validated with fake fill data at create time; hook failure at fire time keeps the fill; multi-leg creation is all-or-nothing (partial legs roll back). Hook orders inherit this order's paper flag."),
       group: z
@@ -707,6 +708,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 group: input.group,
                 onFill: input.onFill,
                 signalName: input.signalName,
+                startAt: input.startAt,
               },
               config,
             );

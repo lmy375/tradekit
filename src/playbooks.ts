@@ -81,6 +81,8 @@ export type OrderSpec = {
   slippageBps?: number;
   autoSlippage?: boolean;
   expiresAt?: string;
+  /** v38: activation boundary (ISO) — engine ignores the order until then. */
+  startAt?: string;
   /** Local group id within the playbook. Will be namespaced to
    *  `pb<playbookId>-<localname>` at deploy time. */
   group?: string;
@@ -314,6 +316,9 @@ function validateOrderSpec(s: Record<string, unknown>, prefix: string, errors: s
   }
   if (s.expiresAt != null && typeof s.expiresAt !== "string") {
     errors.push(`${prefix}.expiresAt: must be ISO-8601 string`);
+  }
+  if (s.startAt != null && typeof s.startAt !== "string") {
+    errors.push(`${prefix}.startAt: must be ISO-8601 string`);
   }
   if (s.slippageBps != null && (typeof s.slippageBps !== "number" || !Number.isInteger(s.slippageBps) || s.slippageBps <= 0 || s.slippageBps > 10_000)) {
     errors.push(`${prefix}.slippageBps: must be integer in (0, 10000]`);
@@ -633,6 +638,7 @@ export function createOnePrimitive(args: {
         slippageBps: entry.slippageBps,
         autoSlippage: entry.autoSlippage,
         expiresAt: entry.expiresAt,
+        startAt: entry.startAt,
         strategy: strategyTag,
         note: entry.note,
         group: entry.group ? `pb${playbookId}-${entry.group}` : undefined,

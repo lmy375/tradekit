@@ -292,6 +292,10 @@ export interface CreateOrderArgs {
   /** v35: required for trigger="signal" — the external signal name
    *  this order arms on ([A-Za-z0-9_-]{1,64}). */
   signalName?: string;
+  /** v38: activation boundary (ISO). The engine ignores the order
+   *  entirely until then: no trigger eval, no trailing watermark, no
+   *  signal eligibility. Expiry still applies. NULL = immediate. */
+  startAt?: string;
 }
 
 /** Resolve display symbols for the base/quote pair so list views can show
@@ -470,6 +474,20 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
       throw new ToolError("INVALID_PARAMS", `expiresAt must be in the future (got "${args.expiresAt}").`);
     }
   }
+  // v38: activation boundary. A past startAt is permitted (= active
+  // immediately — idempotent playbook redeploys shouldn't fail on a
+  // boundary that already passed); ordering vs expiry is enforced.
+  let start_at: string | null = null;
+  if (args.startAt) {
+    const t = Date.parse(args.startAt);
+    if (!Number.isFinite(t)) {
+      throw new ToolError("INVALID_PARAMS", `startAt must be a valid ISO-8601 timestamp (got "${args.startAt}").`);
+    }
+    start_at = new Date(t).toISOString();
+    if (args.expiresAt && Date.parse(args.expiresAt) <= t) {
+      throw new ToolError("INVALID_PARAMS", `expiresAt must be after startAt (the order would expire before ever activating).`);
+    }
+  }
   // OCO group id validation — operator-supplied string used to link orders
   // into one-cancels-other groups. Tight character class (alphanumeric +
   // dash + underscore) keeps groups grep-friendly + path-safe and avoids
@@ -536,6 +554,7 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
     paper: args.paper === true,
     on_fill_json: onFillJson,
     signal_name,
+    start_at,
   };
   const id = insertOrder(insertArgs);
   const row = getOrderById(id);
@@ -794,7 +813,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
   const journalFor = async (
     order: OrderRow,
     priceUsd: number | null,
-    overrides: { fired?: boolean; skipped?: boolean; expired?: boolean; notes?: string; errorMessage?: string } = {},
+    overrides: { fired?: boolean; skipped?: boolean; expired?: boolean; notes?: string; errorMessage?: string; preStart?: boolean } = {},
   ) => {
     if (!journalConfig.enabled) return;
     const { recordCheckEntry, buildObservation } = await import("./orderJournal.js");
@@ -877,6 +896,16 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       continue;
     }
 
+    // v38: activation boundary. Before start_at the engine does not
+    // evaluate the order AT ALL — no price fetch, no trailing
+    // watermark (pre-announcement chop must not set the HWM), no
+    // signal eligibility. Expiry above still applies: validity
+    // window ≠ activity window.
+    if (order.start_at != null && Date.now() < Date.parse(order.start_at)) {
+      await journalFor(order, null, { preStart: true, notes: `inactive until ${order.start_at}` });
+      continue;
+    }
+
     // 2) Price fetch. We price the BASE token in USD — same convention used by
     //    holdings/portfolio. Failures here are transient (CoinGecko rate-limit,
     //    DexScreener flaky) — record + continue. The engine doesn't escalate
@@ -929,12 +958,16 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       // v35: fire when a pending signal matching this order's name
       // exists AND the order was armed before the signal arrived —
       // a late-armed order must not fire on a stale event.
+      // v38: eligibility starts at max(created_at, start_at) — a
+      // signal received during the pre-start window must not fire
+      // the order once it activates (it predates the arming).
+      const armedFrom = order.start_at != null && order.start_at > order.created_at ? order.start_at : order.created_at;
       const ev = signalInbox.find(
-        (e) => e.name === order.signal_name && order.created_at <= e.received_at && !signalConsumptions.has(e.id),
+        (e) => e.name === order.signal_name && armedFrom <= e.received_at && !signalConsumptions.has(e.id),
       ) ?? signalInbox.find(
         // Already-consumed-this-tick events still fire OTHER eligible
         // listeners in the same tick (one alert, many armed intents).
-        (e) => e.name === order.signal_name && order.created_at <= e.received_at,
+        (e) => e.name === order.signal_name && armedFrom <= e.received_at,
       );
       if (!ev) {
         await recordJournal();
@@ -1449,9 +1482,11 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     for (const ev of signalInbox) {
       if (signalConsumptions.has(ev.id)) continue;
       if (Date.now() - Date.parse(ev.received_at) < ORPHAN_MS) continue;
-      const hasListener = stillActive.some(
-        (o) => o.trigger_type === "signal" && o.signal_name === ev.name && o.created_at <= ev.received_at,
-      );
+      const hasListener = stillActive.some((o) => {
+        if (o.trigger_type !== "signal" || o.signal_name !== ev.name) return false;
+        const armedFrom = o.start_at != null && o.start_at > o.created_at ? o.start_at : o.created_at;
+        return armedFrom <= ev.received_at;
+      });
       if (!hasListener) {
         try { consumeSignalEvent(ev.id, nowIsoForSignals, null); } catch { /* best-effort */ }
         args.logger.debug(`signal "${ev.name}" #${ev.id} expired unclaimed (no eligible listener after 1h)`);

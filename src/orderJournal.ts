@@ -196,8 +196,24 @@ export function buildObservation(args: {
   expired?: boolean;
   /** Set on engine-path errors — decision = "error". */
   errorMessage?: string;
+  /** v38: order not yet active (now < start_at) — decision
+   *  "pre_start". The sampling predicate dedupes consecutive
+   *  identical decisions, so a long pre-start writes ONE row. */
+  preStart?: boolean;
 }): OrderCheckObservation {
   const { order, priceUsd, checkedAt } = args;
+
+  if (args.preStart) {
+    return {
+      orderId: order.id!,
+      checkedAt,
+      priceUsd,
+      waterMarkUsd: order.water_mark_usd,
+      thresholdUsd: null,
+      decision: "pre_start",
+      notes: args.notes ?? null,
+    };
+  }
 
   if (args.errorMessage) {
     return {
@@ -388,6 +404,7 @@ export function decisionMarker(d: OrderCheckDecision): string {
     case "hook_created":       return "↳";
     case "hook_failed":        return "↯";
     case "recovered":          return "♻";
+    case "pre_start":          return "◌";
   }
 }
 
@@ -406,5 +423,6 @@ export function decisionLabel(d: OrderCheckDecision): string {
     case "edited_by_operator": return "edited by operator";
     case "expired":            return "expired";
     case "recovered":          return "RECOVERED — booked from evidence trade, not refired";
+    case "pre_start":          return "waiting for start_at (not yet active)";
   }
 }
