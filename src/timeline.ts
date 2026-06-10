@@ -106,6 +106,19 @@ export type EventKind =
   | "config.reloaded"
   | "config.reload_failed";
 
+/** Single source of truth for the kind registry. The CLI --kinds
+ *  validator and the web /api/timeline whitelist both consume this —
+ *  pre-this they each kept their own copy, and alert.breaker (added
+ *  later) silently went missing from the web list. */
+export const ALL_EVENT_KINDS: EventKind[] = [
+  "trade.fill", "trade.failure", "trade.pending", "paper.fill",
+  "order.journal", "order.edited", "schedule.journal", "rebalance.journal",
+  "audit.tool", "audit.error",
+  "alert.fired", "alert.resolved", "alert.breaker",
+  "engine.started", "engine.stopped", "engine.lock", "engine.unlock",
+  "worker.degraded", "worker.recovered", "config.reloaded", "config.reload_failed",
+];
+
 export interface EventRefs {
   /** Concrete primitive id when applicable (order id, schedule id,
    *  trade id, audit id, engine_event id). Used by the renderer

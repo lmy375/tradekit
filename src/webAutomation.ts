@@ -54,7 +54,7 @@ import {
 import { listRebalancePlans, getRebalancePlanById, type RebalanceStatus } from "./rebalance.js";
 import { getPlaybookDetail } from "./playbooks.js";
 import { summarizePaperPnl } from "./paperTrade.js";
-import { collectTimeline, parseSinceDuration, type EventKind } from "./timeline.js";
+import { collectTimeline, parseSinceDuration, ALL_EVENT_KINDS, type EventKind } from "./timeline.js";
 import { buildStrategyReport, type ReportMode, type ReportWindow } from "./strategyReport.js";
 import { readEngineStatus } from "./engine.js";
 import { getEngineLockState } from "./engineLock.js";
@@ -96,13 +96,7 @@ function pathId(req: Request): number {
   return n;
 }
 
-const TIMELINE_KINDS: EventKind[] = [
-  "trade.fill", "trade.failure", "trade.pending", "paper.fill",
-  "order.journal", "order.edited", "schedule.journal", "rebalance.journal",
-  "audit.tool", "audit.error", "alert.fired", "alert.resolved",
-  "engine.started", "engine.stopped", "engine.lock", "engine.unlock",
-  "worker.degraded", "worker.recovered", "config.reloaded", "config.reload_failed",
-];
+const TIMELINE_KINDS: EventKind[] = ALL_EVENT_KINDS;
 
 // ── registration ────────────────────────────────────────────
 
@@ -293,6 +287,27 @@ export function registerAutomationRoutes(app: Express): void {
         limit: qInt(req, "limit", { min: 1, max: 1000, fallback: 100 }),
       });
       res.json({ ok: true, count: events.length, events });
+    }),
+  );
+
+  // ── funding runway ────────────────────────────────────────
+  // On-demand (the UI computes it behind a button, not on the
+  // auto-refresh loop): real buckets read on-chain balances, which
+  // costs an RPC round-trip per distinct spend token.
+  app.get(
+    "/api/runway",
+    wrap(async (req, res) => {
+      const days = qInt(req, "days", { min: 1, max: 366, fallback: 90 });
+      const { computeFundingRunway, defaultRunwayBalanceFetcher } = await import("./runway.js");
+      const { loadConfig } = await import("./config.js");
+      const report = await computeFundingRunway({
+        chain: qStr(req, "chain"),
+        account: qStr(req, "account"),
+        strategy: qStr(req, "strategy"),
+        horizonDays: days,
+        balanceFetcher: defaultRunwayBalanceFetcher(loadConfig()),
+      });
+      res.json({ ok: true, ...report });
     }),
   );
 

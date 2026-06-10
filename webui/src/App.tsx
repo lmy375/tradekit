@@ -20,6 +20,7 @@ import { Overview } from "./pages/Overview";
 import { Holdings } from "./pages/Holdings";
 import { Trade } from "./pages/Trade";
 import { Automation } from "./pages/Automation";
+import { Timeline } from "./pages/Timeline";
 import { Trades } from "./pages/Trades";
 import { PnL } from "./pages/PnL";
 import { Approvals } from "./pages/Approvals";
@@ -36,6 +37,7 @@ const TABS = [
   { value: "holdings", label: "Holdings", el: Holdings },
   { value: "trade", label: "Trade", el: Trade },
   { value: "automation", label: "Automation", el: Automation },
+  { value: "timeline", label: "Timeline", el: Timeline },
   { value: "chart", label: "Chart", el: Chart },
   { value: "trades", label: "Trades", el: Trades },
   { value: "pnl", label: "PnL", el: PnL },

@@ -349,3 +349,46 @@ describe("/api/dashboard", () => {
     expect(bad.status).toBe(400);
   });
 });
+
+// ── kind-registry sync (v33 drift regression) ────────────────
+
+describe("/api/timeline — kind registry", () => {
+  it("accepts every kind in ALL_EVENT_KINDS (incl. alert.breaker, which the old hand-copied list missed)", async () => {
+    const { ALL_EVENT_KINDS } = await import("./timeline.js");
+    expect(ALL_EVENT_KINDS).toContain("alert.breaker");
+    const r = await get(`/api/timeline?kinds=${ALL_EVENT_KINDS.join(",")}&since=1h`);
+    expect(r.status).toBe(200);
+  });
+});
+
+// ── /api/runway ──────────────────────────────────────────────
+
+describe("/api/runway", () => {
+  it("forecasts paper buckets offline (paper book is the balance source)", async () => {
+    seedSchedule(); // paper buy, 100 USDC per fire, 6h cron
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "250" });
+    const r = await get("/api/runway?days=30");
+    expect(r.status).toBe(200);
+    const buckets = r.body.buckets as Array<{ token: string; paper: boolean; balance: number; firesCovered: number; exhaustsAt: string | null }>;
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0].paper).toBe(true);
+    expect(buckets[0].token).toBe(USDC);
+    expect(buckets[0].balance).toBe(250);
+    // 250 covers 2 × 100 fires; the 3rd exhausts.
+    expect(buckets[0].firesCovered).toBe(2);
+    expect(buckets[0].exhaustsAt).not.toBeNull();
+  });
+
+  it("rejects an out-of-range days param", async () => {
+    const r = await get("/api/runway?days=9999");
+    expect(r.status).toBe(400);
+  });
+
+  it("strategy filter scopes the forecast", async () => {
+    seedSchedule(); // strategy web-test
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "1000" });
+    const r = await get("/api/runway?strategy=other-tag");
+    expect(r.status).toBe(200);
+    expect((r.body.buckets as unknown[])).toHaveLength(0);
+  });
+});

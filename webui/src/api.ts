@@ -336,3 +336,61 @@ export interface PaperResp {
   pnl: { strategy: string; fills: number; netQuote: number }[];
 }
 export const getPaper = () => api.get<PaperResp>("/api/paper");
+
+// ── timeline (forensic event stream) ─────────────────────────
+
+export type TimelineSeverity = "info" | "warn" | "critical";
+
+export interface TimelineEventRow {
+  at: string;
+  kind: string;
+  severity: TimelineSeverity;
+  summary: string;
+  refs: { type: string; id: number | string; txHash?: string; strategy?: string };
+  details?: Record<string, string | number | boolean | null>;
+}
+
+export interface TimelineQuery {
+  since?: string;       // duration shorthand ("6h", "2d") or ISO
+  kinds?: string[];     // omit for all
+  minSeverity?: TimelineSeverity;
+  strategy?: string;
+  limit?: number;
+}
+
+export const getTimeline = (q: TimelineQuery) => {
+  const qs = new URLSearchParams();
+  if (q.since) qs.set("since", q.since);
+  if (q.kinds && q.kinds.length > 0) qs.set("kinds", q.kinds.join(","));
+  if (q.minSeverity) qs.set("minSeverity", q.minSeverity);
+  if (q.strategy) qs.set("strategy", q.strategy);
+  if (q.limit) qs.set("limit", String(q.limit));
+  return api.get<{ ok: true; count: number; events: TimelineEventRow[] }>(`/api/timeline?${qs}`);
+};
+
+// ── funding runway ───────────────────────────────────────────
+
+export interface RunwayBucket {
+  account: string;
+  chain: string;
+  paper: boolean;
+  token: string;
+  symbol: string | null;
+  balance: number | null;
+  oneShotReserved: number;
+  burn30d: number;
+  totalFiresInHorizon: number;
+  firesCovered: number;
+  exhaustsAt: string | null;
+  runwayDays: number | null;
+}
+
+export interface RunwayResp {
+  ok: true;
+  generatedAt: string;
+  horizonDays: number;
+  buckets: RunwayBucket[];
+  skipped: { kind: string; id: number; reason: string }[];
+}
+
+export const getRunway = (days = 90) => api.get<RunwayResp>(`/api/runway?days=${days}`);

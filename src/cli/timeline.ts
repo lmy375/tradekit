@@ -15,27 +15,14 @@ import { ToolError } from "../errors.js";
 import {
   collectTimeline,
   parseSinceDuration,
+  ALL_EVENT_KINDS,
   type EventKind,
   type EventSeverity,
   type TimelineEvent,
 } from "../timeline.js";
 import { printJson } from "./helpers.js";
 
-const VALID_KINDS: EventKind[] = [
-  "trade.fill",
-  "trade.failure",
-  "trade.pending",
-  "paper.fill",
-  "order.journal",
-  "order.edited",
-  "schedule.journal",
-  "rebalance.journal",
-  "audit.tool",
-  "audit.error",
-  "alert.fired",
-  "alert.resolved",
-  "alert.breaker",
-];
+const VALID_KINDS: EventKind[] = ALL_EVENT_KINDS;
 
 function parseKinds(raw: string | undefined): EventKind[] | undefined {
   if (!raw) return undefined;

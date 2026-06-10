@@ -10,6 +10,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Accordion,
   Badge,
+  Button,
   Card,
   Code,
   Group,
@@ -33,6 +34,7 @@ import {
   getAutoSchedules,
   getEngine,
   getPaper,
+  getRunway,
   type AlertsResp,
   type AutoOrderRow,
   type AutoPlaybookRow,
@@ -42,6 +44,7 @@ import {
   type OrderJournalRow,
   type PageProps,
   type PaperResp,
+  type RunwayResp,
   type RebalanceJournalRow,
   type ScheduleJournalRow,
 } from "../api";
@@ -209,6 +212,9 @@ export function Automation({ status: _status }: PageProps) {
   const [plans, setPlans] = useState<AutoRebalanceRow[] | null>(null);
   const [playbooks, setPlaybooks] = useState<AutoPlaybookRow[] | null>(null);
   const [paper, setPaper] = useState<PaperResp | null>(null);
+  const [runway, setRunway] = useState<RunwayResp | null>(null);
+  const [runwayLoading, setRunwayLoading] = useState(false);
+  const [runwayError, setRunwayError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>("active");
   const [error, setError] = useState<string | null>(null);
   // Journal drill-in caches, keyed by "<kind>:<id>".
@@ -252,6 +258,18 @@ export function Automation({ status: _status }: PageProps) {
       setJournals((j) => ({ ...j, [key]: [] }));
     }
   }, [journals]);
+
+  const computeRunway = useCallback(async () => {
+    setRunwayLoading(true);
+    setRunwayError(null);
+    try {
+      setRunway(await getRunway(90));
+    } catch (e) {
+      setRunwayError((e as Error).message);
+    } finally {
+      setRunwayLoading(false);
+    }
+  }, []);
 
   if (error) return <Text c="red">Failed to load automation state: {error}</Text>;
   if (!engine || !alerts) return <Loader size="sm" />;
@@ -423,6 +441,51 @@ export function Automation({ status: _status }: PageProps) {
                   <Code fz={10}>{p.strategy}</Code> {p.fills} fills · net {p.netQuote >= 0 ? "+" : ""}{p.netQuote.toFixed(2)}
                 </Text>
               ))}
+            </Stack>
+          )}
+        </Card>
+
+        <Card withBorder padding="sm">
+          <Group justify="space-between" mb="xs">
+            <Title order={6}>Funding runway</Title>
+            <Button size="compact-xs" variant="default" onClick={computeRunway} loading={runwayLoading}>
+              {runway ? "Recompute" : "Compute"}
+            </Button>
+          </Group>
+          {runwayError && <Text size="xs" c="red">{runwayError}</Text>}
+          {!runway && !runwayError && (
+            <Text size="xs" c="dimmed">
+              On-demand: walks upcoming schedule fires + reserved order spends against
+              current balances (real buckets read on-chain).
+            </Text>
+          )}
+          {runway && runway.buckets.length === 0 && (
+            <Text size="xs" c="dimmed">no computable spend — nothing to forecast</Text>
+          )}
+          {runway && runway.buckets.length > 0 && (
+            <Stack gap={4}>
+              {runway.buckets.slice(0, 8).map((b, i) => {
+                const sym = b.symbol ?? (b.token === "native" ? "native" : `${b.token.slice(0, 8)}…`);
+                const verdict =
+                  b.balance == null ? { color: "gray", text: "balance unknown" } :
+                  b.exhaustsAt != null && (b.runwayDays ?? 0) <= 7 ? { color: "red", text: `runs out ${b.exhaustsAt.slice(0, 10)} (${b.runwayDays!.toFixed(1)}d)` } :
+                  b.exhaustsAt != null ? { color: "yellow", text: `runs out ${b.exhaustsAt.slice(0, 10)} (${b.runwayDays!.toFixed(1)}d)` } :
+                  { color: "teal", text: `survives ${runway.horizonDays}d` };
+                return (
+                  <Group key={i} gap={6} wrap="nowrap">
+                    <Badge size="xs" color={verdict.color} variant="filled" style={{ flexShrink: 0 }}>
+                      {sym}
+                    </Badge>
+                    <Text size="xs" ff="monospace" style={{ flex: 1 }}>
+                      {b.account}/{b.chain}{b.paper ? " [paper]" : ""} · bal {b.balance == null ? "?" : b.balance.toFixed(2)} · {verdict.text}
+                      {b.exhaustsAt != null ? ` · ${b.firesCovered}/${b.totalFiresInHorizon} fires` : ""}
+                    </Text>
+                  </Group>
+                );
+              })}
+              {runway.skipped.length > 0 && (
+                <Text size="xs" c="dimmed">({runway.skipped.length} primitive(s) skipped — spend needs a price)</Text>
+              )}
             </Stack>
           )}
         </Card>

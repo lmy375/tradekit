@@ -7,6 +7,7 @@
 // an agent-callable interface. Zero RPC, sub-100ms responses.
 
 import { z } from "zod";
+import { ALL_EVENT_KINDS, type EventKind } from "../timeline.js";
 import { toToolError, ToolError } from "../errors.js";
 import { ok, fail, runTool, type RegisterFn } from "./runtime.js";
 import {
@@ -342,18 +343,9 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
       account: z.string().optional().describe("Restrict to one account label."),
       strategy: z.string().optional().describe("Restrict to one strategy tag."),
       kinds: z
-        .array(
-          z.enum([
-            "trade.fill", "trade.failure", "trade.pending",
-            "paper.fill",
-            "order.journal", "order.edited",
-            "schedule.journal", "rebalance.journal",
-            "audit.tool", "audit.error",
-            "alert.fired", "alert.resolved", "alert.breaker",
-          ]),
-        )
+        .array(z.enum(ALL_EVENT_KINDS as [EventKind, ...EventKind[]]))
         .optional()
-        .describe("Subset of event kinds. Omit for all kinds."),
+        .describe(`Subset of event kinds. Omit for all kinds. Valid: ${ALL_EVENT_KINDS.join(", ")}.`),
       minSeverity: z
         .enum(["info", "warn", "critical"])
         .optional()
