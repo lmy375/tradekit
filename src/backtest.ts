@@ -1110,6 +1110,11 @@ function validatePlaybookForBacktest(
       errors.push(`${prefix}: rebalance plans aren't supported in playbook backtest (intrinsically multi-asset)`);
       continue;
     }
+    // v37: signal triggers have no history to replay against.
+    if (s.type === "order" && s.trigger === "signal") {
+      errors.push(`${prefix}: signal-triggered orders aren't backtestable (no signal history) — replace with a price trigger for simulation, or backtest the rest of the bundle without it`);
+      continue;
+    }
     if (s.base.toUpperCase() !== baseSymbol.toUpperCase() && !(baseSymbol.toUpperCase() === "ETH" && s.base.toUpperCase() === "ETH")) {
       errors.push(`${prefix}: base "${s.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
     }

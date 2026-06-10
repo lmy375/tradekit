@@ -607,6 +607,11 @@ PLAYBOOKS (declarative strategy bundles)
         order/schedule/rebalance list --strategy playbook:N.
         OCO group names are namespaced to pb<id>-<localname> so two playbooks with the
         same local group don't cross-cancel.
+        v37: order entries accept trigger "signal" + "signalName" — a playbook
+        can bundle a signal-armed entry with its brackets/schedules. signalName
+        is NOT pb-namespaced (the external alert name is global; several
+        playbooks listening to one signal is a feature). Signal entries are
+        rejected by playbook BACKTESTS (no signal history) with a clear message.
         Schedule entries can declare post-fill hooks inline ("onFill": {"type":"createOrder",
         "spec": {...}} or multi-leg {"type":"createOrders","specs":[...]} — same shape as
         schedule create --on-fill, {{filled.X}} placeholders supported); validated

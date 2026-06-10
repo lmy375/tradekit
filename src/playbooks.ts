@@ -66,9 +66,14 @@ export type OrderSpec = {
   id?: string;
   type: "order";
   side: "buy" | "sell";
-  trigger: "price_below" | "price_above" | "trailing";
+  trigger: "price_below" | "price_above" | "trailing" | "signal";
   price?: number;
   trailPct?: number;
+  /** v37: required for trigger="signal". NOT playbook-namespaced —
+   *  the external alert name is global by nature (TradingView posts
+   *  to /api/signal/<name> regardless of which playbook listens);
+   *  multiple playbooks listening to one signal is a feature. */
+  signalName?: string;
   base: string;
   quote: string;
   baseAmount?: string | number;
@@ -264,9 +269,10 @@ function validateOrderSpec(s: Record<string, unknown>, prefix: string, errors: s
   if (
     s.trigger !== "price_below" &&
     s.trigger !== "price_above" &&
-    s.trigger !== "trailing"
+    s.trigger !== "trailing" &&
+    s.trigger !== "signal"
   ) {
-    errors.push(`${prefix}.trigger: must be "price_below" | "price_above" | "trailing"`);
+    errors.push(`${prefix}.trigger: must be "price_below" | "price_above" | "trailing" | "signal"`);
   }
   if (s.trigger === "trailing") {
     if (s.trailPct == null || typeof s.trailPct !== "number" || !(s.trailPct > 0 && s.trailPct <= 100)) {
@@ -276,6 +282,19 @@ function validateOrderSpec(s: Record<string, unknown>, prefix: string, errors: s
     if (s.price == null || typeof s.price !== "number" || !(s.price > 0)) {
       errors.push(`${prefix}.price: required positive number for ${s.trigger}`);
     }
+  } else if (s.trigger === "signal") {
+    if (typeof s.signalName !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(s.signalName)) {
+      errors.push(`${prefix}.signalName: required for signal triggers, matching /^[A-Za-z0-9_-]{1,64}$/`);
+    }
+    if (s.price != null) {
+      errors.push(`${prefix}.price: meaningless for signal triggers — the SIGNAL is the trigger; omit it`);
+    }
+    if (s.trailPct != null) {
+      errors.push(`${prefix}.trailPct: only meaningful for trailing; omit it for signal triggers`);
+    }
+  }
+  if (s.signalName != null && s.trigger !== "signal") {
+    errors.push(`${prefix}.signalName: only meaningful with trigger="signal"`);
   }
   if (typeof s.base !== "string" || s.base === "") {
     errors.push(`${prefix}.base: required non-empty string`);
@@ -619,6 +638,7 @@ export function createOnePrimitive(args: {
         group: entry.group ? `pb${playbookId}-${entry.group}` : undefined,
         paper,
         onFill: entry.onFill,
+        signalName: entry.signalName,
       };
       const row = createOrderRow(createArgs, config);
       return {

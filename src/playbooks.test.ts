@@ -947,3 +947,73 @@ describe("promotePreflight", () => {
     expect(preflightBlocker(pf)).toBeNull();
   });
 });
+
+// ── v37: signal orders in playbooks ──────────────────────────
+
+describe("playbooks — signal-triggered orders", () => {
+  const signalEntry = {
+    id: "breakout", type: "order", side: "buy", trigger: "signal", signalName: "tv-breakout",
+    base: "ETH", quote: "USDC", quoteAmount: 500,
+  };
+
+  it("parses + deploys a signal order with the signal_name persisted", async () => {
+    const spec = parsePlaybookSpec({
+      name: "signal-bundle",
+      chain: "base",
+      account: "default",
+      strategies: [signalEntry],
+    });
+    const result = deployPlaybook({ spec, sourcePath: null, paper: true });
+    const detail = getPlaybookDetail(result.playbookId);
+    expect(detail.orders).toHaveLength(1);
+    const row = detail.orders[0] as typeof detail.orders[0] & { signal_name?: string | null };
+    expect(row.trigger_type).toBe("signal");
+    expect(row.signal_name).toBe("tv-breakout");
+    expect(row.target_price_usd).toBeNull();
+    expect(row.paper).toBe(1);
+  });
+
+  it("validation: signalName required + pattern; price/trailPct rejected; cross-trigger rejected", () => {
+    const bad = (entry: Record<string, unknown>) => () =>
+      parsePlaybookSpec({ name: "x", chain: "base", strategies: [entry] });
+    expect(bad({ ...signalEntry, signalName: undefined })).toThrow(/signalName: required/);
+    expect(bad({ ...signalEntry, signalName: "bad name!" })).toThrow(/signalName/);
+    expect(bad({ ...signalEntry, price: 100 })).toThrow(/meaningless for signal/);
+    expect(bad({ ...signalEntry, trailPct: 5 })).toThrow(/only meaningful for trailing/);
+    expect(bad({ id: "x", type: "order", side: "buy", trigger: "price_below", price: 100, signalName: "y", base: "ETH", quote: "USDC", quoteAmount: 1 })).toThrow(/only meaningful with trigger="signal"/);
+  });
+
+  it("backtest rejects signal entries with a teaching message", async () => {
+    const { simulatePlaybook, fetchPriceSeries } = await import("./backtest.js");
+    void fetchPriceSeries;
+    const spec = parsePlaybookSpec({
+      name: "sig-bt",
+      strategies: [signalEntry],
+    });
+    expect(() =>
+      simulatePlaybook({
+        spec,
+        baseSymbol: "ETH",
+        quoteSymbol: "USDC",
+        initialBalance: { ETH: 0, USDC: 1000 },
+        series: { coinId: "ethereum", daysRequested: 1, points: [
+          { ts: "2026-04-01T00:00:00Z", priceUsd: 2000 },
+          { ts: "2026-04-02T00:00:00Z", priceUsd: 2000 },
+        ] },
+      }),
+    ).toThrow(/signal-triggered orders aren't backtestable/);
+  });
+
+  it("replace classifies a signalName change as RECREATE (trigger identity)", async () => {
+    const { computePlaybookDiff } = await import("./playbookReplace.js");
+    const spec1 = parsePlaybookSpec({ name: "sig-rep", chain: "base", account: "default", strategies: [signalEntry] });
+    const spec2 = parsePlaybookSpec({
+      name: "sig-rep", chain: "base", account: "default",
+      strategies: [{ ...signalEntry, signalName: "tv-breakdown" }],
+    });
+    const diff = computePlaybookDiff({ oldSpec: spec1, newSpec: spec2, playbookId: 1 });
+    expect(diff.summary.modified).toBe(1);
+    const entry = diff.entries.find((e) => e.status === "modified")!;
+    expect(entry.applyMode).toBe("recreate");
+  });
+});
