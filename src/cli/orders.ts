@@ -97,6 +97,9 @@ function describeTrigger(o: Pick<OrderRow, "trigger_type" | "target_price_usd" |
     }
     return `${sym} trailing ${pct}%`;
   }
+  if (o.trigger_type === "signal") {
+    return `${sym} on signal "${(o as { signal_name?: string | null }).signal_name ?? "?"}"`;
+  }
   const cmp = o.trigger_type === "price_below" ? "≤" : "≥";
   return `${sym} ${cmp} $${o.target_price_usd}`;
 }
@@ -115,14 +118,14 @@ function parseSide(raw: string | undefined): OrderSide {
 }
 
 function parseTrigger(raw: string | undefined): OrderTrigger {
-  if (raw === "price_below" || raw === "price_above" || raw === "trailing") return raw;
+  if (raw === "price_below" || raw === "price_above" || raw === "trailing" || raw === "signal") return raw;
   // Friendly aliases for common operator vocabulary.
   if (raw === "below" || raw === "lt" || raw === "<=") return "price_below";
   if (raw === "above" || raw === "gt" || raw === ">=") return "price_above";
   if (raw === "trail" || raw === "trailing_stop" || raw === "trailing-stop") return "trailing";
   throw new ToolError(
     "INVALID_PARAMS",
-    `--trigger must be "price_below", "price_above", or "trailing" (aliases: below/above/lt/gt/trail). Got "${raw ?? "(missing)"}").`,
+    `--trigger must be "price_below", "price_above", "trailing", or "signal" (aliases: below/above/lt/gt/trail). Got "${raw ?? "(missing)"}").`,
   );
 }
 
@@ -139,7 +142,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
   // CLI just provides a clear error when --price is missing for the
   // legacy triggers.
   const targetPriceUsd = parseFloatFlag(flags["price"], "--price", { min: 0 });
-  if (trigger !== "trailing" && (targetPriceUsd == null || targetPriceUsd <= 0)) {
+  if (trigger !== "trailing" && trigger !== "signal" && (targetPriceUsd == null || targetPriceUsd <= 0)) {
     throw new ToolError(
       "INVALID_PARAMS",
       `--price <USD> is required for trigger=${trigger} (it's the trigger threshold).`,
@@ -238,6 +241,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
       group: flags["group"],
       paper: flags["paper"] === "true",
       onFill,
+      signalName: flags["signal-name"],
     },
     config,
   );

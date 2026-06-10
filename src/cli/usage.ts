@@ -283,9 +283,27 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+SIGNALS (v35 — event-driven orders)
+  signal fire <name> [--payload '<json>'] [--json]
+        Drop a signal event in the inbox — the manual/test twin of the
+        TradingView webhook. The next engine tick fires EVERY active order
+        armed on this name that was created BEFORE the event arrived
+        (late-armed orders never fire on stale signals). At-most-once per
+        listener; unclaimed events expire after 1h.
+  signal list [--name X] [--limit N] [--json]
+        Event inbox with consumption state (PENDING / consumed by order #N /
+        expired unclaimed) — "did my TradingView alert arrive?"
+        Webhook ingestion: POST /api/signal/<name>?key=<secret> on the web
+        server (config set webhooks.signalSecret <16+ chars> to enable; a
+        SEPARATE secret from the dashboard token — webhook URLs leak).
+        A forged signal can only fire orders YOU pre-armed with your own
+        amounts + safety rails.
+
 CONDITIONAL ORDERS
-  order create --side buy|sell --trigger price_below|price_above|trailing
+  order create --side buy|sell --trigger price_below|price_above|trailing|signal
                (price triggers: --price <USD>) (trailing: --trail-pct <N> [--price <activation>])
+               (signal: --signal-name <name> — fires when the named external
+               signal arrives; no price, no polling; expiry/OCO/hooks normal)
                --base ETH|<addr> --quote USDC|<addr>
                (--baseAmount A|max|N% | --quoteAmount A|max|N%) [--slippage <bps>] [--auto-slippage]
                v35 dynamic sizing: "max" resolves to the LIVE balance at fire

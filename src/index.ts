@@ -583,6 +583,14 @@ async function main() {
         break;
       }
 
+      // v35: external signal events — fire / inspect the inbox that
+      // drives signal-armed orders.
+      case "signal": {
+        const { signalCommand } = await import("./cli/signal.js");
+        await signalCommand(action, flags, positional);
+        break;
+      }
+
       // Equity curve from portfolio snapshots (pure DB read).
       case "equity": {
         const { equityCommand } = await import("./cli/equity.js");
@@ -745,7 +753,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

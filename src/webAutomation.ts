@@ -100,6 +100,64 @@ const TIMELINE_KINDS: EventKind[] = ALL_EVENT_KINDS;
 
 // ── registration ────────────────────────────────────────────
 
+/**
+ * v35: inbound signal webhook — POST /api/signal/:name?key=SECRET.
+ *
+ * Registered BEFORE the dashboard-token middleware (TradingView and
+ * most alert sources can only POST a fixed URL + JSON body — no
+ * bearer headers). Auth is the SEPARATE config webhooks.signalSecret
+ * (webhook URLs get pasted into third-party UIs and leak; the
+ * dashboard token must not travel with them). Risk profile is
+ * bounded by design: a forged signal can only fire orders the
+ * operator PRE-ARMED with their own amounts and safety rails — it
+ * cannot move funds on its own. Unset secret = 404 (endpoint
+ * indistinguishable from absent).
+ */
+export function registerSignalWebhook(
+  app: Express,
+  logger: { info: (msg: string) => void },
+): void {
+  app.post("/api/signal/:name", async (req, res) => {
+    try {
+      const { loadConfig } = await import("./config.js");
+      const secret = loadConfig().webhooks?.signalSecret;
+      if (!secret) {
+        res.status(404).json({ ok: false, error: { code: "INVALID_PARAMS", message: "Not found." } });
+        return;
+      }
+      const key = typeof req.query.key === "string" ? req.query.key : "";
+      if (!key || !timingSafeEqualStr(key, secret)) {
+        res.status(401).json({ ok: false, error: { code: "WALLET_LOCKED", message: "Unauthorized." } });
+        return;
+      }
+      const name = String(req.params.name ?? "");
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+        res.status(400).json({ ok: false, error: { code: "INVALID_PARAMS", message: "signal name must match /^[A-Za-z0-9_-]{1,64}$/." } });
+        return;
+      }
+      const { insertSignalEvent } = await import("./db.js");
+      const payload =
+        req.body != null && typeof req.body === "object" && Object.keys(req.body as object).length > 0
+          ? JSON.stringify(req.body).slice(0, 4096)
+          : null;
+      const id = insertSignalEvent({ name, receivedAt: new Date().toISOString(), source: "webhook", payloadJson: payload });
+      logger.info(`signal "${name}" received (webhook, event #${id})`);
+      res.json({ ok: true, id, name });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: { code: "INTERNAL_ERROR", message: (e as Error).message } });
+    }
+  });
+}
+
+/** Constant-time string compare (local twin of web.ts tokensMatch —
+ *  this module must not import the server entry). */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 export function registerAutomationRoutes(app: Express): void {
   // ── engine ────────────────────────────────────────────────
   app.get(

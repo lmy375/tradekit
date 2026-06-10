@@ -65,7 +65,10 @@ import type { OrderRow, OrderSide, OrderTrigger } from "./db.js";
  *  (matches the playbook spec dialect). */
 export type OnFillLeg = {
   side: OrderSide;
-  trigger: OrderTrigger;
+  /** Hook legs support the PRICE-DRIVEN triggers only — a signal-
+   *  armed follow-up can't be validated with fake fill data and
+   *  can't be simulated in backtests. Arm signal orders directly. */
+  trigger: Exclude<OrderTrigger, "signal">;
   price?: number | string;
   trailPct?: number | string;
   base: string;

@@ -449,6 +449,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "quote", "buy", "sell", "import_trade", "transfer", "preview_trade", "preflight_trade", "sweep_balances",
     // Conditional / limit orders surface (order create/list/show/cancel/run).
     "order_create", "order_list", "order_show", "order_cancel", "order_pause", "order_resume", "order_edit", "order_run",
+    "signal_fire", "signal_list",
     // Notification / webhook channels surface (notify list/test).
     "notify_list", "notify_test",
     // Scheduled / recurring trades surface (schedule create/list/show/pause/resume/cancel/run).

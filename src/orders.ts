@@ -49,6 +49,8 @@ import {
   pauseOrder as dbPauseOrder,
   resumeOrder as dbResumeOrder,
   cancelOcoPeers,
+  pendingSignalEvents,
+  consumeSignalEvent,
   setOrderError,
   orderCountsByStatus,
   type OrderRow,
@@ -106,6 +108,9 @@ function summarizeTrigger(order: OrderRow): string {
       return `${sym} trailing ${trail}% (activates ${dir} $${order.target_price_usd})`;
     }
     return `${sym} trailing ${trail}%`;
+  }
+  if (order.trigger_type === "signal") {
+    return `${sym} on signal "${(order as { signal_name?: string | null }).signal_name ?? "?"}"`;
   }
   const cmp = order.trigger_type === "price_below" ? "≤" : "≥";
   return `${sym} ${cmp} $${order.target_price_usd}`;
@@ -284,6 +289,9 @@ export interface CreateOrderArgs {
    *  {{filled.X}} substitution). Validated with fake fill data at
    *  create time; hook failure at fire time keeps the fill. */
   onFill?: unknown;
+  /** v35: required for trigger="signal" — the external signal name
+   *  this order arms on ([A-Za-z0-9_-]{1,64}). */
+  signalName?: string;
 }
 
 /** Resolve display symbols for the base/quote pair so list views can show
@@ -377,10 +385,10 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
   if (args.side !== "buy" && args.side !== "sell") {
     throw new ToolError("INVALID_PARAMS", `side must be "buy" or "sell" (got "${args.side}").`);
   }
-  if (args.trigger !== "price_below" && args.trigger !== "price_above" && args.trigger !== "trailing") {
+  if (args.trigger !== "price_below" && args.trigger !== "price_above" && args.trigger !== "trailing" && args.trigger !== "signal") {
     throw new ToolError(
       "INVALID_PARAMS",
-      `trigger must be "price_below", "price_above", or "trailing" (got "${args.trigger}").`,
+      `trigger must be "price_below", "price_above", "trailing", or "signal" (got "${args.trigger}").`,
     );
   }
   // Trigger-specific validation. Price-based triggers require
@@ -388,7 +396,27 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
   // as an optional activation gate.
   let trail_pct: number | null = null;
   let target_price_usd_resolved: number | null = null;
-  if (args.trigger === "trailing") {
+  let signal_name: string | null = null;
+  if (args.trigger === "signal") {
+    // v35: event-driven trigger — fires when the named external
+    // signal arrives (webhook / `signal fire` / MCP). No price, no
+    // trail; expiry / amounts / OCO / hooks all behave normally.
+    if (args.signalName == null || args.signalName === "") {
+      throw new ToolError("INVALID_PARAMS", `trigger="signal" requires signalName (the external signal this order arms on).`);
+    }
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(args.signalName)) {
+      throw new ToolError("INVALID_PARAMS", `signalName must match /^[A-Za-z0-9_-]{1,64}$/ (got "${args.signalName}").`);
+    }
+    if (args.targetPriceUsd != null) {
+      throw new ToolError("INVALID_PARAMS", `targetPriceUsd is meaningless for signal triggers — the SIGNAL is the trigger; omit it.`);
+    }
+    if (args.trailPct != null) {
+      throw new ToolError("INVALID_PARAMS", `trailPct is only meaningful with trigger="trailing"; omit it for signal triggers.`);
+    }
+    signal_name = args.signalName;
+  } else if (args.signalName != null) {
+    throw new ToolError("INVALID_PARAMS", `signalName is only meaningful with trigger="signal".`);
+  } else if (args.trigger === "trailing") {
     // Delegate to the trailingStop validator so the rules live in one
     // place (and the activation gate's interaction with side is checked
     // structurally there). The validator does NOT require targetPriceUsd
@@ -507,6 +535,7 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
     group_id: group,
     paper: args.paper === true,
     on_fill_json: onFillJson,
+    signal_name,
   };
   const id = insertOrder(insertArgs);
   const row = getOrderById(id);
@@ -825,6 +854,21 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     }
   }
 
+  // v35: load the signal inbox ONCE per tick (cheap indexed read,
+  // skipped entirely when no active order is signal-armed). An event
+  // fires every listener that was ARMED (created) before it arrived;
+  // consumption is registered when a listener actually enters the
+  // fire path (dry-run and engine-lock skips don't eat events) and
+  // applied after the loop. Signals are POINT events — at-most-once
+  // delivery per listener; a transiently-failed fire does NOT retry
+  // on the same event (the moment passed; the failure notification
+  // tells the operator).
+  const hasSignalOrders = orders.some((o) => o.trigger_type === "signal");
+  const signalInbox = hasSignalOrders ? pendingSignalEvents() : [];
+  /** eventId → first order id that consumed it (forensics). */
+  const signalConsumptions = new Map<number, number>();
+  const nowIsoForSignals = new Date().toISOString();
+
   for (const order of orders) {
     if (order.id == null) continue;
     // 1) Expiry check — runs even before the price fetch since it's free.
@@ -865,7 +909,7 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     const recordJournal = (overrides: { fired?: boolean; skipped?: boolean; expired?: boolean; notes?: string; errorMessage?: string } = {}) =>
       journalFor(order, currentPrice, overrides);
 
-    if (currentPrice == null) {
+    if (currentPrice == null && order.trigger_type !== "signal") {
       transientErrors += 1;
       setOrderError(order.id, "API_ERROR", "price unavailable from CoinGecko/DexScreener");
       await recordJournal({ errorMessage: "price unavailable from CoinGecko/DexScreener" });
@@ -880,7 +924,25 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
     //      mark — the engine persists the new mark via updateOrderWaterMark
     //      even when no fire happens (state is durable across restarts).
     let triggered_this_tick = false;
-    if (order.trigger_type === "trailing") {
+    let matchedSignalEventId: number | null = null;
+    if (order.trigger_type === "signal") {
+      // v35: fire when a pending signal matching this order's name
+      // exists AND the order was armed before the signal arrived —
+      // a late-armed order must not fire on a stale event.
+      const ev = signalInbox.find(
+        (e) => e.name === order.signal_name && order.created_at <= e.received_at && !signalConsumptions.has(e.id),
+      ) ?? signalInbox.find(
+        // Already-consumed-this-tick events still fire OTHER eligible
+        // listeners in the same tick (one alert, many armed intents).
+        (e) => e.name === order.signal_name && order.created_at <= e.received_at,
+      );
+      if (!ev) {
+        await recordJournal();
+        continue;
+      }
+      matchedSignalEventId = ev.id;
+      triggered_this_tick = true;
+    } else if (order.trigger_type === "trailing") {
       const evaluation = evaluateTrailingTrigger(order, currentPrice);
       // Persist a water-mark improvement (or first-tick write) regardless
       // of whether the order fires. This is the row's "I'm watching" state.
@@ -939,6 +1001,14 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       setOrderError(order.id, "ENGINE_LOCKED", msg);
       await recordJournal({ skipped: true, notes: msg });
       continue;
+    }
+
+    // v35: the fire path is now committed for this listener — register
+    // the signal consumption (applied after the loop). Dry-run and
+    // engine-lock skips above deliberately never reach here, so they
+    // don't eat the event.
+    if (matchedSignalEventId != null && !signalConsumptions.has(matchedSignalEventId)) {
+      signalConsumptions.set(matchedSignalEventId, order.id);
     }
 
     // v33 crash-window guard: an order fires ONCE, ever — so ANY
@@ -1186,7 +1256,9 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       // price OR fall back to currentPrice (price at trigger time). The
       // trade's `price` field is base/quote, not USD; we already have a USD
       // price for base in `currentPrice`.
-      const fillPriceUsd = currentPrice;
+      // Signal fires may have no oracle price this tick — fill_price 0
+      // is the documented "unknown at fire time" sentinel there.
+      const fillPriceUsd = currentPrice ?? 0;
       markOrderFilled(order.id, {
         tx_hash: result.txHash,
         fill_price: fillPriceUsd,
@@ -1361,6 +1433,29 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
       setOrderError(order.id, "INTERNAL_ERROR", "executeTrade returned no tx hash");
       fills.push({ orderId: order.id, status: "skipped", observedPriceUsd: currentPrice, errorCode: "INTERNAL_ERROR", errorMessage: "no tx hash" });
       await recordJournal({ errorMessage: "INTERNAL_ERROR: executeTrade returned no tx hash" });
+    }
+  }
+
+  // v35: apply registered signal consumptions, then orphan hygiene —
+  // pending events older than 1h with NO eligible active listener
+  // (name mismatch or every listener armed after arrival) are
+  // consumed unclaimed so the inbox can't grow unbounded.
+  for (const [eventId, byOrder] of signalConsumptions) {
+    try { consumeSignalEvent(eventId, nowIsoForSignals, byOrder); } catch { /* best-effort */ }
+  }
+  if (signalInbox.length > 0) {
+    const ORPHAN_MS = 3_600_000;
+    const stillActive = listOrders({ status: "active", chain: args.chain, account: args.account });
+    for (const ev of signalInbox) {
+      if (signalConsumptions.has(ev.id)) continue;
+      if (Date.now() - Date.parse(ev.received_at) < ORPHAN_MS) continue;
+      const hasListener = stillActive.some(
+        (o) => o.trigger_type === "signal" && o.signal_name === ev.name && o.created_at <= ev.received_at,
+      );
+      if (!hasListener) {
+        try { consumeSignalEvent(ev.id, nowIsoForSignals, null); } catch { /* best-effort */ }
+        args.logger.debug(`signal "${ev.name}" #${ev.id} expired unclaimed (no eligible listener after 1h)`);
+      }
     }
   }
 

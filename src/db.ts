@@ -1171,6 +1171,27 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_notification_queue_pending ON notification_queue (flushed_at, queued_at);
   `,
+
+  // v35 — signal-triggered orders. The fourth trigger type: instead
+  // of polling price, the order fires when a named external SIGNAL
+  // arrives (TradingView alert webhook, `tradekit signal fire`, MCP).
+  // signal_events is the inbox; an event fires every order that was
+  // ARMED (created) before it arrived, then is marked consumed so
+  // re-ticks don't refire and late-armed orders don't fire on stale
+  // signals.
+  `
+  ALTER TABLE orders ADD COLUMN signal_name TEXT;
+  CREATE TABLE IF NOT EXISTS signal_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL,
+    received_at       TEXT NOT NULL,
+    source            TEXT NOT NULL,
+    payload_json      TEXT,
+    consumed_at       TEXT,
+    consumed_by_order INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_signal_events_pending ON signal_events (name, consumed_at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -2911,7 +2932,7 @@ export type OrderSide = "buy" | "sell";
  * predicate, and the operator labels their own intent via the `strategy`
  * column. Decoupling means a "buy on breakout" (side=buy, trigger=
  * price_above) is expressible without inventing a new trigger type. */
-export type OrderTrigger = "price_below" | "price_above" | "trailing";
+export type OrderTrigger = "price_below" | "price_above" | "trailing" | "signal";
 
 export interface OrderRow {
   id?: number;
@@ -2978,6 +2999,8 @@ export interface OrderRow {
    *  evaluated identically; only the terminal write differs. Defaults
    *  to 0 (real trading) — pre-v24 rows are unaffected. */
   paper?: number;
+  /** v35: signal name for trigger_type='signal' (NULL otherwise). */
+  signal_name?: string | null;
   /** v31: post-fill hook spec (JSON). NULL = no hook. */
   on_fill_json: string | null;
 }
@@ -3011,6 +3034,8 @@ export interface InsertOrderArgs {
   paper?: boolean;
   /** v31: post-fill hook spec (JSON string). Optional. */
   on_fill_json?: string | null;
+  /** v35: signal name (trigger_type='signal' only). */
+  signal_name?: string | null;
 }
 
 export function insertOrder(args: InsertOrderArgs): number {
@@ -3024,8 +3049,8 @@ export function insertOrder(args: InsertOrderArgs): number {
          base_token, base_symbol, quote_token, quote_symbol,
          base_amount, quote_amount, slippage_bps, auto_slippage,
          expires_at, strategy, note,
-         attempts, group_id, paper, on_fill_json
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         attempts, group_id, paper, on_fill_json, signal_name
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       now, now, "active", args.side, args.trigger_type, args.target_price_usd, args.trail_pct,
@@ -3036,6 +3061,7 @@ export function insertOrder(args: InsertOrderArgs): number {
       args.slippage_bps, args.auto_slippage ? 1 : 0,
       args.expires_at, args.strategy, capTradeNotes(args.note),
       0, args.group_id, args.paper ? 1 : 0, args.on_fill_json ?? null,
+      args.signal_name ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -3741,6 +3767,61 @@ export function recordScheduleError(
        retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+// ── signal events (v35) ─────────────────────────────────────
+
+export interface SignalEventRow {
+  id: number;
+  name: string;
+  received_at: string;
+  source: string;
+  payload_json: string | null;
+  consumed_at: string | null;
+  consumed_by_order: number | null;
+}
+
+export function insertSignalEvent(args: {
+  name: string;
+  receivedAt: string;
+  source: string;
+  payloadJson?: string | null;
+}): number {
+  const db = openDb();
+  const r = db
+    .prepare(`INSERT INTO signal_events (name, received_at, source, payload_json) VALUES (?, ?, ?, ?)`)
+    .run(args.name, args.receivedAt, args.source, args.payloadJson ?? null);
+  return Number(r.lastInsertRowid);
+}
+
+/** Oldest unconsumed event per name. The engine consumes events
+ *  oldest-first so a burst of signals drains in arrival order. */
+export function pendingSignalEvents(): SignalEventRow[] {
+  const db = openDb();
+  return db
+    .prepare(`SELECT * FROM signal_events WHERE consumed_at IS NULL ORDER BY received_at ASC`)
+    .all() as unknown as SignalEventRow[];
+}
+
+export function consumeSignalEvent(id: number, consumedAt: string, byOrder: number | null): number {
+  const db = openDb();
+  const r = db
+    .prepare(`UPDATE signal_events SET consumed_at = ?, consumed_by_order = ? WHERE id = ? AND consumed_at IS NULL`)
+    .run(consumedAt, byOrder, id);
+  return Number(r.changes);
+}
+
+export function listSignalEvents(filter: { name?: string; limit?: number } = {}): SignalEventRow[] {
+  const db = openDb();
+  const args: unknown[] = [];
+  let sql = `SELECT * FROM signal_events WHERE 1=1`;
+  if (filter.name) {
+    sql += " AND name = ?";
+    args.push(filter.name);
+  }
+  sql += " ORDER BY received_at DESC LIMIT ?";
+  args.push(filter.limit ?? 50);
+  return db.prepare(sql).all(...(args as never[])) as unknown as SignalEventRow[];
 }
 
 /** v33 crash-window guard: look for evidence that THIS occurrence

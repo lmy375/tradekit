@@ -603,14 +603,14 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
 
   server.tool(
     "order_create",
-    "Create a conditional / limit / trailing-stop order: a standing intent the engine fires when the configured trigger fires. Three trigger types: price_below (fires when base USD ≤ targetPriceUsd), price_above (fires when ≥ targetPriceUsd), trailing (tracks a high-water mark for sells / low-water mark for buys and fires when the price retraces by trailPct% from the mark). Trailing stops can include an optional activationPriceUsd gate that defers tracking until the price first crosses that level — useful for 'only start trailing after ETH hits $3500'. At fill time, the engine routes the trade through executeTrade so every safety guardrail (USD limits, slippage cap, gas budget, blacklists, rate limit, position limits) and the audit log apply just like a manual buy/sell. The engine MUST be running for orders to fire (use `order_run` for one-shot ticks or the unified `engine_run` / `tradekit engine run` daemon). Errors: INVALID_PARAMS (bad side/trigger, missing amount, non-positive price, expiry in the past, trailPct outside (0,100], trailPct on a non-trailing trigger, targetPriceUsd missing for price_below/price_above), UNKNOWN_TOKEN (base/quote can't be resolved on this chain), UNKNOWN_CHAIN. Returns the persisted OrderRow with assigned id, status='active', water_mark_usd starting null for trailing orders. Units: targetPriceUsd / trailPct / activationPriceUsd are numbers; amounts are decimal strings; expiresAt is ISO-8601; slippageBps is basis points.",
+    "Create a conditional / limit / trailing-stop / signal-armed order: a standing intent the engine fires when the configured trigger fires. Four trigger types: price_below (fires when base USD ≤ targetPriceUsd), price_above (fires when ≥ targetPriceUsd), trailing (tracks a high-water mark for sells / low-water mark for buys and fires when the price retraces by trailPct% from the mark). Trailing stops can include an optional activationPriceUsd gate that defers tracking until the price first crosses that level — useful for 'only start trailing after ETH hits $3500'. At fill time, the engine routes the trade through executeTrade so every safety guardrail (USD limits, slippage cap, gas budget, blacklists, rate limit, position limits) and the audit log apply just like a manual buy/sell. The engine MUST be running for orders to fire (use `order_run` for one-shot ticks or the unified `engine_run` / `tradekit engine run` daemon). Errors: INVALID_PARAMS (bad side/trigger, missing amount, non-positive price, expiry in the past, trailPct outside (0,100], trailPct on a non-trailing trigger, targetPriceUsd missing for price_below/price_above), UNKNOWN_TOKEN (base/quote can't be resolved on this chain), UNKNOWN_CHAIN. Returns the persisted OrderRow with assigned id, status='active', water_mark_usd starting null for trailing orders. Units: targetPriceUsd / trailPct / activationPriceUsd are numbers; amounts are decimal strings; expiresAt is ISO-8601; slippageBps is basis points.",
     {
       chain: z.string().optional().describe("Chain to operate on (default: active chain)."),
       account: z.string().optional().describe("Account label (default: active account)."),
       side: z.enum(["buy", "sell"]).describe("buy = spend quote to acquire base; sell = sell base for quote."),
       trigger: z
-        .enum(["price_below", "price_above", "trailing"])
-        .describe("price_below: fires when base USD price ≤ targetPriceUsd. price_above: fires when ≥ target. trailing: tracks HWM (sells) / LWM (buys) and fires when price retraces by trailPct%."),
+        .enum(["price_below", "price_above", "trailing", "signal"])
+        .describe("price_below: fires when base USD price ≤ targetPriceUsd. price_above: fires when ≥ target. trailing: tracks HWM (sells) / LWM (buys) and fires when price retraces by trailPct%. signal (v35): event-driven — fires when the named external signal arrives (webhook POST /api/signal/:name, `tradekit signal fire`, or MCP signal_fire); requires signalName, no price."),
       targetPriceUsd: z
         .number()
         .positive()
@@ -641,6 +641,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
         .describe("Relative duration shorthand (30s, 15m, 2h, 7d, 4w). Converted to an absolute expiresAt at create time. Mutually exclusive with expiresAt."),
       strategy: z.string().max(100).optional().describe("Strategy tag stamped on the trade when the order fills (indexed; same column as trade strategy)."),
       note: z.string().optional().describe("Free-form note saved on the order row + on the eventual trade row."),
+      signalName: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional().describe("v35: REQUIRED for trigger='signal' — the external signal name this order arms on. The order fires when a signal with this name arrives AFTER the order was created (late-armed orders never fire on stale signals). Signals are point events: at-most-once delivery per listener."),
       onFill: z.unknown().optional().describe("Post-fill hook: { type: 'createOrder', spec: {...} } for one follow-up, or { type: 'createOrders', specs: [{...}, {...}] } for a multi-leg bracket (2–4 legs; legs without explicit `group` are auto-OCO-paired, e.g. take-profit + stop-loss that cancel each other). {{filled.X}} placeholders interpolate the fill. Auto-creates the follow-up order(s) after THIS order fills (e.g. limit buy → auto-trailing, or limit buy → TP+SL bracket). Validated with fake fill data at create time; hook failure at fire time keeps the fill; multi-leg creation is all-or-nothing (partial legs roll back). Hook orders inherit this order's paper flag."),
       group: z
         .string()
@@ -705,6 +706,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 note: input.note,
                 group: input.group,
                 onFill: input.onFill,
+                signalName: input.signalName,
               },
               config,
             );
@@ -836,6 +838,53 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
           await runTool("order_resume", rt.opts, input, undefined, async () => {
             const { resumeOrderById } = await import("../orders.js");
             return { order: resumeOrderById(input.id) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "signal_fire",
+    "v35: fire a named external signal — the manual twin of the TradingView webhook (POST /api/signal/:name). Drops ONE event in the signal inbox; the next engine tick fires EVERY active signal-armed order (trigger='signal', matching signalName) that was created BEFORE the event arrived (late-armed orders never fire on stale signals). Signals are point events: at-most-once delivery per listener; events with no eligible listener expire unclaimed after 1h. Strictly less powerful than the buy/sell tools (it can only trigger orders the operator pre-armed with their own amounts + safety rails). Returns { id, name, armedListeners }.",
+    {
+      name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).describe("Signal name to fire."),
+      payload: z.unknown().optional().describe("Optional JSON payload stored on the event for forensics (≤4KB)."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("signal_fire", rt.opts, input, undefined, async () => {
+            const { insertSignalEvent, listOrders } = await import("../db.js");
+            const payload = input.payload != null ? JSON.stringify(input.payload).slice(0, 4096) : null;
+            const id = insertSignalEvent({ name: input.name, receivedAt: new Date().toISOString(), source: "mcp", payloadJson: payload });
+            const armedListeners = listOrders({ status: "active" }).filter(
+              (o) => o.trigger_type === "signal" && o.signal_name === input.name,
+            ).length;
+            return { id, name: input.name, armedListeners };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
+    "signal_list",
+    "v35: list signal events (newest first) with consumption state — PENDING / consumed by order #N / expired unclaimed. The forensic answer to 'did my TradingView alert arrive, and what did it fire?'.",
+    {
+      name: z.string().optional().describe("Filter to one signal name."),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("signal_list", rt.opts, input, undefined, async () => {
+            const { listSignalEvents } = await import("../db.js");
+            return { events: listSignalEvents({ name: input.name, limit: input.limit }) };
           }),
         );
       } catch (e) {

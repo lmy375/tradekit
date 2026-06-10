@@ -367,7 +367,7 @@ export interface RebalanceDriftEntry {
 
 export interface PendingTriggerEntry {
   orderId: number;
-  trigger: "price_below" | "price_above" | "trailing";
+  trigger: "price_below" | "price_above" | "trailing" | "signal";
   side: "buy" | "sell";
   /** When `livePriceFn` returned a price, the current price in USD. */
   currentPriceUsd: number | null;

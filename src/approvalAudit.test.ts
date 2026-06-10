@@ -163,6 +163,7 @@ describe("auditAllowanceList (iter606)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
+    webhooks: {},
     notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
       workers: {
@@ -320,6 +321,7 @@ describe("approval freshness signal (iter617)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
+    webhooks: {},
     notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
       workers: {

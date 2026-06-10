@@ -177,7 +177,9 @@ export interface BacktestResult {
 
 export interface OrderBacktestSpec {
   side: OrderSide;
-  trigger: OrderTrigger;
+  /** Signal triggers are not backtestable (no signal history) —
+   *  the CLI/MCP validators reject them before reaching here. */
+  trigger: Exclude<OrderTrigger, "signal">;
   /** Required for price_below / price_above. For trailing, this is the
    *  optional activation gate. */
   targetPriceUsd?: number;

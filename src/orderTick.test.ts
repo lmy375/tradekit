@@ -836,3 +836,122 @@ describe("runOrderTick — percentage sizing (v35.5)", () => {
     expect(() => createOrderRow({ ...base, side: "buy", baseAmount: "50%" })).toThrow(/SPEND side/);
   });
 });
+
+// ── v35: signal-triggered orders ─────────────────────────────
+
+describe("runOrderTick — signal triggers", () => {
+  async function armSignalOrder(over: Record<string, unknown> = {}): Promise<number> {
+    const { createOrderRow } = await import("./orders.js");
+    const row = createOrderRow({
+      side: "buy",
+      trigger: "signal",
+      signalName: "tv-breakout",
+      chain: "base",
+      account: "default",
+      base: WETH as `0x${string}`,
+      quote: USDC as `0x${string}`,
+      quoteAmount: "1000",
+      paper: true,
+      ...over,
+    } as never);
+    return row.id!;
+  }
+
+  it("fires on a pending signal and consumes the event", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent, listSignalEvents, getOrderById } = await import("./db.js");
+    const id = await armSignalOrder();
+    insertSignalEvent({ name: "tv-breakout", receivedAt: new Date().toISOString(), source: "cli" });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+    expect(getOrderById(id)?.status).toBe("filled");
+    const events = listSignalEvents({ name: "tv-breakout" });
+    expect(events[0].consumed_at).not.toBeNull();
+    expect(events[0].consumed_by_order).toBe(id);
+  });
+
+  it("no pending signal → order just waits (no price needed, no transient error)", async () => {
+    const { getOrderById } = await import("./db.js");
+    const id = await armSignalOrder();
+    const report = await tick();
+    expect(report.filled).toBe(0);
+    expect(report.transientErrorCount).toBe(0);
+    expect(getOrderById(id)?.status).toBe("active");
+  });
+
+  it("a late-armed order never fires on a stale signal", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent, getOrderById } = await import("./db.js");
+    // Signal arrives FIRST…
+    insertSignalEvent({ name: "tv-breakout", receivedAt: new Date(Date.now() - 60_000).toISOString(), source: "cli" });
+    // …order armed a minute later: must not fire on the old event.
+    const id = await armSignalOrder();
+    const { openDb } = await import("./db.js");
+    openDb().prepare(`UPDATE orders SET created_at = ? WHERE id = ?`).run(new Date().toISOString(), id);
+    const report = await tick();
+    expect(report.filled).toBe(0);
+    expect(getOrderById(id)?.status).toBe("active");
+  });
+
+  it("one signal fires EVERY eligible listener", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent, getOrderById } = await import("./db.js");
+    const a = await armSignalOrder({ quoteAmount: "100" });
+    const b = await armSignalOrder({ quoteAmount: "200" });
+    insertSignalEvent({ name: "tv-breakout", receivedAt: new Date().toISOString(), source: "cli" });
+    const report = await tick();
+    expect(report.filled).toBe(2);
+    expect(getOrderById(a)?.status).toBe("filled");
+    expect(getOrderById(b)?.status).toBe("filled");
+  });
+
+  it("a consumed event never refires (at-most-once)", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent } = await import("./db.js");
+    await armSignalOrder();
+    insertSignalEvent({ name: "tv-breakout", receivedAt: new Date().toISOString(), source: "cli" });
+    await tick(); // consumes
+    const c = await armSignalOrder(); // fresh listener, same name
+    const report2 = await tick();
+    expect(report2.filled).toBe(0); // old event consumed; no new signal
+    const { getOrderById } = await import("./db.js");
+    expect(getOrderById(c)?.status).toBe("active");
+  });
+
+  it("dry-run detects the trigger but does NOT consume the event", async () => {
+    seedQuoteBalance("10000");
+    const { insertSignalEvent, listSignalEvents } = await import("./db.js");
+    await armSignalOrder();
+    insertSignalEvent({ name: "tv-breakout", receivedAt: new Date().toISOString(), source: "cli" });
+    const dry = await tick({ dryRun: true });
+    expect(dry.triggered).toBe(1);
+    expect(dry.filled).toBe(0);
+    expect(listSignalEvents({ name: "tv-breakout" })[0].consumed_at).toBeNull();
+    // The real tick afterwards still fires.
+    const real = await tick();
+    expect(real.filled).toBe(1);
+  });
+
+  it("orphan events with no eligible listener expire unclaimed after 1h", async () => {
+    const { insertSignalEvent, listSignalEvents } = await import("./db.js");
+    await armSignalOrder({ signalName: "other-name" }); // listener on a DIFFERENT name keeps the inbox path active
+    insertSignalEvent({ name: "nobody-listens", receivedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(), source: "cli" });
+    await tick();
+    const ev = listSignalEvents({ name: "nobody-listens" })[0];
+    expect(ev.consumed_at).not.toBeNull();
+    expect(ev.consumed_by_order).toBeNull();
+  });
+
+  it("createOrderRow validation: signalName required + price rejected", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    const base = {
+      side: "buy" as const, chain: "base", account: "default",
+      base: WETH as `0x${string}`, quote: USDC as `0x${string}`,
+      quoteAmount: "100", paper: true,
+    };
+    expect(() => createOrderRow({ ...base, trigger: "signal" } as never)).toThrow(/requires signalName/);
+    expect(() => createOrderRow({ ...base, trigger: "signal", signalName: "bad name!" } as never)).toThrow(/signalName must match/);
+    expect(() => createOrderRow({ ...base, trigger: "signal", signalName: "ok", targetPriceUsd: 100 } as never)).toThrow(/meaningless for signal/);
+    expect(() => createOrderRow({ ...base, trigger: "price_below", targetPriceUsd: 100, signalName: "ok" } as never)).toThrow(/only meaningful with trigger="signal"/);
+  });
+});

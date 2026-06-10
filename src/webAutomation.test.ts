@@ -40,6 +40,9 @@ let base: string;
 beforeAll(async () => {
   openDb();
   const app = express();
+  app.use(express.json());
+  const { registerSignalWebhook } = await import("./webAutomation.js");
+  registerSignalWebhook(app, { info: () => {} });
   registerAutomationRoutes(app);
   // Error handler mirroring web.ts: ToolError → 400 JSON. Express
   // identifies error middleware by arity — all four params required.
@@ -467,5 +470,49 @@ describe("/api/equity", () => {
   it("rejects bad maxPoints", async () => {
     const r = await get("/api/equity?maxPoints=99999");
     expect(r.status).toBe(400);
+  });
+});
+
+// ── v35: signal webhook ──────────────────────────────────────
+
+describe("POST /api/signal/:name", () => {
+  async function post(path: string, body?: unknown): Promise<{ status: number; body: Record<string, unknown> }> {
+    const res = await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: body != null ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  }
+
+  it("404s when no signalSecret is configured (endpoint indistinguishable from absent)", async () => {
+    const r = await post("/api/signal/tv-breakout?key=whatever");
+    expect(r.status).toBe(404);
+  });
+
+  it("authenticates with the shared secret and records the event", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, webhooks: { signalSecret: "super-secret-test-key" } } as never);
+    try {
+      const bad = await post("/api/signal/tv-breakout?key=wrong-secret-here!");
+      expect(bad.status).toBe(401);
+
+      const badName = await post("/api/signal/bad%20name?key=super-secret-test-key");
+      expect(badName.status).toBe(400);
+
+      const ok2 = await post("/api/signal/tv-breakout?key=super-secret-test-key", { price: 2701 });
+      expect(ok2.status).toBe(200);
+      expect(ok2.body.name).toBe("tv-breakout");
+
+      const { listSignalEvents, openDb } = await import("./db.js");
+      const events = listSignalEvents({ name: "tv-breakout" });
+      expect(events).toHaveLength(1);
+      expect(events[0].source).toBe("webhook");
+      expect(events[0].payload_json).toContain("2701");
+      openDb().exec("DELETE FROM signal_events");
+    } finally {
+      saveConfig(cfg);
+    }
   });
 });

@@ -18,7 +18,7 @@ import {
   redactConfigForDisplay,
 } from "./config.js";
 import { listChains, resolveToken, resolveTradePair, unknownTokenError } from "./chains.js";
-import { registerAutomationRoutes } from "./webAutomation.js";
+import { registerAutomationRoutes, registerSignalWebhook } from "./webAutomation.js";
 import { tradekitVersion } from "./version.js";
 import { activeWalletAddress, activeWalletLabel, loadWallet, type WalletContext } from "./wallet.js";
 import { listAccounts, setActiveAccount } from "./accounts.js";
@@ -174,6 +174,12 @@ export async function startWebServer(opts: WebServerOptions): Promise<void> {
       error: { code: "WALLET_LOCKED", message: "Unauthorized — missing or invalid token." },
     });
   };
+  // ── v35: inbound signal webhook ──
+  //
+  // Mounted BEFORE the auth middleware — see registerSignalWebhook
+  // for the auth + risk rationale.
+  registerSignalWebhook(app, logger);
+
   // ── Prometheus /metrics endpoint ──
   //
   // Mounted BEFORE the auth middleware: Prometheus scrapers don't carry

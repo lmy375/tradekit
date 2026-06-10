@@ -916,6 +916,17 @@ export const configSchema = z
     chains: z.record(z.string(), chainOverrideSchema).default({}),
     aggregator: aggregatorSchema,
     safety: safetySchema,
+    /** v35: inbound webhook config. signalSecret authenticates
+     *  POST /api/signal/:name (TradingView-style alert ingestion) —
+     *  a SEPARATE secret from the dashboard token because webhook
+     *  URLs get pasted into third-party UIs and leak. ≥16 chars.
+     *  Unset = the signal endpoint is disabled (404). */
+    webhooks: z
+      .object({
+        signalSecret: z.string().min(16).optional(),
+      })
+      .strict()
+      .default({}),
     notifications: notificationsSchema,
     engine: engineSchema,
     mev: mevSchema,

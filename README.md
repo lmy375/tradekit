@@ -1721,6 +1721,27 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Orders chain too (v31).** The same hook attaches to conditional orders — `order create … --on-fill '{...}'` (or `onFill` in playbook order entries / MCP `order_create`): a limit buy at \$1,800 that fills auto-creates the trailing stop for exactly the bought amount. One fire per order (`fireNumber` is always 1); `order replay` shows `hook_created` / `hook_failed` alongside the fill; `order edit --on-fill/--unset on-fill` mutates it in place; the playbook backtest simulates order hooks the same way it does schedule hooks.
 
+#### Signal-triggered orders (v35) — event-driven execution
+
+The fourth trigger type. Instead of polling price, the order fires when a named **external signal** arrives — the TradingView-alert integration pattern:
+
+```bash
+# 1. Arm the intent (amounts + safety rails are YOURS, set now):
+tradekit order create --side buy --trigger signal --signal-name tv-breakout \
+  --base ETH --quote USDC --quoteAmount 500
+
+# 2. Enable the webhook (separate secret — webhook URLs leak in third-party UIs):
+tradekit config set webhooks.signalSecret "$(openssl rand -hex 16)"
+
+# 3. Point TradingView's alert at:
+#    POST https://your-host:3030/api/signal/tv-breakout?key=<secret>
+# (or fire manually / from agents: `tradekit signal fire tv-breakout`, MCP signal_fire)
+```
+
+**Semantics, precisely.** A signal is a **point event**: one event fires every active listener **armed before it arrived** (late-armed orders never fire on stale signals), then is consumed — at-most-once delivery per listener, and a transiently-failed fire does NOT retry on the same event (the moment passed; the failure notification tells you). Dry-run ticks and engine-lock skips never consume events. Unclaimed events expire after 1h. Expiry, OCO groups, on_fill hooks, dynamic sizing, and the v33 crash-window guard all apply to signal orders exactly as to price-triggered ones — and every fire routes through `executeTrade` with the full safety stack.
+
+**Risk profile, honestly.** The webhook endpoint is the one inbound-write surface on the otherwise read-only web API. It's bounded by construction: a forged signal can only fire orders **you pre-armed with your own amounts** — it cannot choose tokens, sizes, or direction. The secret is constant-time compared, ≥16 chars, and unset means the endpoint 404s. Signal orders can't be backtested (no signal history) and hook legs can't be signal-armed (nothing to validate against) — both rejected at create with clear messages.
+
 **Hook failures don't unwind the fill.** If the hook errors at fire time (e.g. the rendered amount is too small for slippage cap), the fill stays — the trade already happened — and a `schedule.on_fill_failed` notification fires with the error code. Operators can investigate + create the follow-up manually. Success emits `schedule.on_fill_created`.
 
 **No recursion.** Hook-created orders never carry hooks themselves (the hook spec dialect has no `onFill` field). So a DCA's hook creates a trailing-stop; when the trailing-stop later fires, no further hook fires. Bounded by construction.
