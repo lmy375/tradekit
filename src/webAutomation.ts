@@ -58,6 +58,7 @@ import { collectTimeline, parseSinceDuration, type EventKind } from "./timeline.
 import { buildStrategyReport, type ReportMode, type ReportWindow } from "./strategyReport.js";
 import { readEngineStatus } from "./engine.js";
 import { getEngineLockState } from "./engineLock.js";
+import { gatherStatusReport, ALL_SECTIONS, type SectionName } from "./status.js";
 
 // ── shared helpers ──────────────────────────────────────────
 
@@ -118,6 +119,25 @@ export function registerAutomationRoutes(app: Express): void {
         status,
         lock: { active: lock.active === 1, reason: lock.reason, lockedAt: lock.locked_at, lockedBy: lock.locked_by },
       });
+    }),
+  );
+
+  // ── full status dashboard ─────────────────────────────────
+  app.get(
+    "/api/dashboard",
+    wrap((req, res) => {
+      let sections: SectionName[] | undefined;
+      const raw = qStr(req, "sections");
+      if (raw) {
+        sections = raw.split(",").map((x) => x.trim()).filter(Boolean) as SectionName[];
+        for (const sec of sections) {
+          if (!ALL_SECTIONS.includes(sec)) {
+            throw new ToolError("INVALID_PARAMS", `unknown section "${sec}"; valid: ${ALL_SECTIONS.join(", ")}.`);
+          }
+        }
+      }
+      const report = gatherStatusReport({ sections });
+      res.json({ ok: true, report, sections: sections ?? ALL_SECTIONS });
     }),
   );
 

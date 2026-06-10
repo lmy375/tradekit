@@ -1769,9 +1769,10 @@ tradekit health    [--accounts X,Y|all] [--chains a,b,c] [--summary] [--strict] 
                    # Operator dashboard: portfolio + 7d PnL + trade quality + standing approvals + nextActions.
 tradekit status    [--section S,S,...] [--json] [--watch N]
                    # Operational dashboard: engine workers, near-trigger orders, scheduled fires, rebalance drift,
-                   # playbook deployments, drawdown breaker, strategy budgets, 24h audit anomalies.
+                   # playbook deployments, drawdown breaker, strategy budgets, 24h audit anomalies,
+                   # currently-firing strategy alerts (+24h transitions), paper-trading snapshot.
                    # Composes ~10 read-side queries into one situational-awareness view; sub-100ms, zero RPC.
-                   # Sections: engine,orders,schedules,rebalance,playbooks,drawdown,budgets,activity.
+                   # Sections: engine,orders,schedules,rebalance,playbooks,drawdown,budgets,activity,alerts,paper.
 tradekit digest    [--window 1h|24h|7d|30d] [--format text|slack|json] [--compare] [--strict]
                    # Windowed activity report. Pairs with status (right-now vs window). Slack-format pipes
                    # directly into a Slack incoming webhook for daily cron reports. --strict exits 2 on critical.
@@ -2025,6 +2026,7 @@ The web server also exposes the automation engine's observability core as token-
 | Route | Returns |
 |---|---|
 | `GET /api/engine` | engine status file + lock state (`running`, per-worker ticks, lock reason) |
+| `GET /api/dashboard[?sections=…]` | the full 10-section status dashboard (same `gatherStatusReport` core as `tradekit status` / MCP `status_dashboard`) |
 | `GET /api/orders[?status&chain&account&strategy&limit]` | conditional orders; `/api/orders/:id` adds the decision-journal tail |
 | `GET /api/schedules[…]`, `/api/schedules/:id` | DCA schedules + v29 journal tail (fires, failures, retirements, hooks) |
 | `GET /api/rebalance[…]`, `/api/rebalance/:id` | rebalance plans + the drift history journal — the dashboard's "how close to firing?" series |

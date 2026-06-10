@@ -31,6 +31,9 @@ const {
   insertPlaybook,
   upsertDrawdownState,
   insertAudit,
+  upsertStrategyAlertState,
+  insertAlertEvent,
+  recordPaperTrade,
 } = await import("./db.js");
 type OrderRow = import("./db.js").OrderRow;
 const { ENGINE_STATUS_FILE } = await import("./engine.js");
@@ -51,6 +54,10 @@ beforeEach(() => {
   db.exec("DELETE FROM drawdown_state");
   db.exec("DELETE FROM audit_log");
   db.exec("DELETE FROM trades");
+  db.exec("DELETE FROM strategy_alert_state");
+  db.exec("DELETE FROM alert_events");
+  db.exec("DELETE FROM paper_trades");
+  db.exec("DELETE FROM paper_balances");
   if (existsSync(ENGINE_STATUS_FILE)) unlinkSync(ENGINE_STATUS_FILE);
 });
 
@@ -537,5 +544,84 @@ describe("gatherStatusReport — empty DB", () => {
     expect(report.drawdown.states).toEqual([]);
     expect(report.budgets.rules).toEqual([]);
     expect(report.activity.summary.totalRows).toBe(0);
+  });
+});
+
+// ── alerts + paper sections (v30) ────────────────────────────
+
+describe("gatherStatusReport — alerts section", () => {
+  it("empty install → zero alerts, empty transitions", () => {
+    const r = gatherStatusReport({ sections: ["alerts"] });
+    expect(r.alerts.activeCount).toBe(0);
+    expect(r.alerts.active).toEqual([]);
+    expect(r.alerts.recentTransitions).toEqual([]);
+  });
+
+  it("surfaces currently-firing alerts + recent 24h transitions", () => {
+    const now = new Date("2026-06-11T12:00:00Z");
+    upsertStrategyAlertState({
+      tag: "dca-eth",
+      ruleType: "failure_streak",
+      active: true,
+      firstTriggeredAt: "2026-06-11T10:00:00Z",
+      lastEvaluatedAt: "2026-06-11T11:00:00Z",
+      lastValueJson: '{"streak":3}',
+    });
+    insertAlertEvent({ at: "2026-06-11T10:00:00Z", tag: "dca-eth", ruleType: "failure_streak", event: "fired", severity: "critical" });
+    insertAlertEvent({ at: "2026-06-09T10:00:00Z", tag: "old", ruleType: "staleness", event: "fired", severity: "warn" }); // > 24h — excluded
+
+    const r = gatherStatusReport({ sections: ["alerts"], now });
+    expect(r.alerts.activeCount).toBe(1);
+    expect(r.alerts.active[0]).toMatchObject({ tag: "dca-eth", ruleType: "failure_streak" });
+    expect(r.alerts.recentTransitions).toHaveLength(1);
+    expect(r.alerts.recentTransitions[0]).toMatchObject({ event: "fired", tag: "dca-eth" });
+  });
+
+  it("section filter: alerts excluded → empty shape", () => {
+    upsertStrategyAlertState({
+      tag: "x", ruleType: "staleness", active: true,
+      firstTriggeredAt: "2026-06-11T10:00:00Z", lastEvaluatedAt: "2026-06-11T10:00:00Z", lastValueJson: null,
+    });
+    const r = gatherStatusReport({ sections: ["engine"] });
+    expect(r.alerts.activeCount).toBe(0);
+  });
+});
+
+describe("gatherStatusReport — paper section", () => {
+  const WETH2 = "0x4200000000000000000000000000000000000006";
+  const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  it("counts the book, live paper primitives, and 24h fills", async () => {
+    const { setPaperBalance } = await import("./paperTrade.js");
+    const now = new Date("2026-06-11T12:00:00Z");
+    setPaperBalance({ account: "default", chain: "base", token: USDC2, decimals: 6, amount: "1000" });
+    setPaperBalance({ account: "alt", chain: "base", token: USDC2, decimals: 6, amount: "500" });
+    insertOrder({
+      side: "sell", trigger_type: "trailing", target_price_usd: null, trail_pct: 5,
+      chain: "base", account: "default",
+      base_token: WETH2, base_symbol: "ETH", quote_token: USDC2, quote_symbol: "USDC",
+      base_amount: "1", quote_amount: null, slippage_bps: 50, auto_slippage: false,
+      expires_at: null, strategy: "t", note: null, group_id: null, paper: true,
+    } as never);
+    recordPaperTrade({
+      timestamp: "2026-06-11T11:00:00Z", source_type: "order", source_id: 1,
+      chain: "base", account: "default", direction: "sell",
+      base_token: WETH2, base_symbol: "ETH", base_amount: "0.1",
+      quote_token: USDC2, quote_symbol: "USDC", quote_amount: "200", price: "2000",
+      slippage_bps: 0, strategy: "t", notes: null,
+    });
+    recordPaperTrade({
+      timestamp: "2026-06-09T11:00:00Z", source_type: "order", source_id: 1,
+      chain: "base", account: "default", direction: "sell",
+      base_token: WETH2, base_symbol: "ETH", base_amount: "0.1",
+      quote_token: USDC2, quote_symbol: "USDC", quote_amount: "200", price: "2000",
+      slippage_bps: 0, strategy: "t", notes: null,
+    }); // > 24h
+
+    const r = gatherStatusReport({ sections: ["paper"], now });
+    expect(r.paper.balanceRows).toBe(2);
+    expect(r.paper.bookScopes).toBe(2);
+    expect(r.paper.activePaper.orders).toBe(1);
+    expect(r.paper.fills24h).toBe(1);
   });
 });

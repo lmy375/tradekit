@@ -49,6 +49,10 @@ import {
   listDrawdownStates,
   getEngineLock,
   auditSummary,
+  listStrategyAlertStates,
+  listAlertEvents,
+  listPaperBalances,
+  listPaperTrades,
   type OrderRow,
   type ScheduleRow,
   type RebalanceRow,
@@ -69,7 +73,9 @@ export type SectionName =
   | "playbooks"
   | "drawdown"
   | "budgets"
-  | "activity";
+  | "activity"
+  | "alerts"
+  | "paper";
 
 export const ALL_SECTIONS: SectionName[] = [
   "engine",
@@ -80,6 +86,8 @@ export const ALL_SECTIONS: SectionName[] = [
   "drawdown",
   "budgets",
   "activity",
+  "alerts",
+  "paper",
 ];
 
 export interface EngineSection {
@@ -213,6 +221,39 @@ export interface ActivitySection {
   topErrors: Array<{ code: string; count: number; lastSeen: string }>;
 }
 
+/** v28/v30: currently-firing strategy alerts + the most recent
+ *  transitions. The "right now" complement to digest's windowed
+ *  alert counts — an operator opening the dashboard wants "is
+ *  anything alerting?" before anything else. */
+export interface AlertsStatusSection {
+  activeCount: number;
+  active: Array<{
+    tag: string;
+    ruleType: string;
+    firstTriggeredAt: string | null;
+    lastValueJson: string | null;
+  }>;
+  /** Last 5 fired/resolved transitions from the v28 journal (24h). */
+  recentTransitions: Array<{
+    at: string;
+    tag: string;
+    ruleType: string;
+    event: "fired" | "resolved";
+  }>;
+}
+
+/** Paper-trading snapshot: book size + live paper primitives +
+ *  24h fill activity. Dry-run strategies were invisible on the
+ *  dashboard before this. */
+export interface PaperStatusSection {
+  balanceRows: number;
+  /** Distinct (account, chain) book scopes. */
+  bookScopes: number;
+  /** ACTIVE primitives flagged paper=1, by type. */
+  activePaper: { orders: number; schedules: number; rebalances: number };
+  fills24h: number;
+}
+
 export interface StatusReport {
   /** When the composer ran. */
   generatedAt: string;
@@ -224,6 +265,8 @@ export interface StatusReport {
   drawdown: DrawdownSection;
   budgets: BudgetsSection;
   activity: ActivitySection;
+  alerts: AlertsStatusSection;
+  paper: PaperStatusSection;
 }
 
 // ── orchestrator ─────────────────────────────────────────────
@@ -260,7 +303,63 @@ export function gatherStatusReport(opts: {
     drawdown: wanted.has("drawdown") ? gatherDrawdown(config) : emptyDrawdown(),
     budgets: wanted.has("budgets") ? gatherBudgets(config) : emptyBudgets(),
     activity: wanted.has("activity") ? gatherActivity(now) : emptyActivity(),
+    alerts: wanted.has("alerts") ? gatherAlertsStatus(now) : emptyAlertsStatus(),
+    paper: wanted.has("paper") ? gatherPaperStatus(now) : emptyPaperStatus(),
   };
+}
+
+// ── alerts (v30) ─────────────────────────────────────────────
+
+function gatherAlertsStatus(now: Date): AlertsStatusSection {
+  try {
+    const active = listStrategyAlertStates({ active: true });
+    const since = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+    const recent = listAlertEvents({ sinceIso: since, limit: 5 });
+    return {
+      activeCount: active.length,
+      active: active.map((a) => ({
+        tag: a.tag,
+        ruleType: a.rule_type,
+        firstTriggeredAt: a.first_triggered_at,
+        lastValueJson: a.last_value_json,
+      })),
+      recentTransitions: recent.map((e) => ({
+        at: e.at,
+        tag: e.tag,
+        ruleType: e.rule_type,
+        event: e.event,
+      })),
+    };
+  } catch {
+    return emptyAlertsStatus();
+  }
+}
+
+function emptyAlertsStatus(): AlertsStatusSection {
+  return { activeCount: 0, active: [], recentTransitions: [] };
+}
+
+// ── paper (v30) ──────────────────────────────────────────────
+
+function gatherPaperStatus(now: Date): PaperStatusSection {
+  try {
+    const balances = listPaperBalances({});
+    const scopes = new Set(balances.map((b) => `${b.account}:${b.chain}`));
+    const since = new Date(now.getTime() - 24 * 3600 * 1000).toISOString();
+    const fills24h = listPaperTrades({ sinceIso: since, limit: 5000 }).length;
+    const activePaper = {
+      orders: listOrders({ status: "active" }).filter((o) => (o.paper ?? 0) === 1).length,
+      schedules: listSchedules({ status: "active" }).filter((sc) => (sc.paper ?? 0) === 1).length,
+      rebalances: listRebalancePlans({ status: "active" }).filter((r) => (r.paper ?? 0) === 1).length,
+    };
+    return { balanceRows: balances.length, bookScopes: scopes.size, activePaper, fills24h };
+  } catch {
+    return emptyPaperStatus();
+  }
+}
+
+function emptyPaperStatus(): PaperStatusSection {
+  return { balanceRows: 0, bookScopes: 0, activePaper: { orders: 0, schedules: 0, rebalances: 0 }, fills24h: 0 };
 }
 
 // ── engine ───────────────────────────────────────────────────

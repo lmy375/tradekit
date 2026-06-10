@@ -226,6 +226,42 @@ function renderActivity(s: ActivitySection): string {
 
 // ── full report renderer ─────────────────────────────────────
 
+function renderAlertsStatus(s: import("../status.js").AlertsStatusSection): string {
+  const lines: string[] = [];
+  lines.push("ALERTS");
+  if (s.activeCount === 0) {
+    lines.push("  ✅ no active alerts");
+  } else {
+    lines.push(`  🔴 ${s.activeCount} active alert${s.activeCount === 1 ? "" : "s"}:`);
+    for (const a of s.active.slice(0, 10)) {
+      const since = a.firstTriggeredAt ? `  since ${a.firstTriggeredAt}` : "";
+      lines.push(`    ⚠ ${a.tag} / ${a.ruleType}${since}`);
+    }
+  }
+  if (s.recentTransitions.length > 0) {
+    lines.push("  Recent (24h):");
+    for (const t of s.recentTransitions) {
+      const marker = t.event === "fired" ? "🔴" : "🟢";
+      lines.push(`    ${marker} ${t.at}  ${t.event.padEnd(8)} ${t.tag} / ${t.ruleType}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function renderPaperStatus(s: import("../status.js").PaperStatusSection): string {
+  const lines: string[] = [];
+  lines.push("PAPER");
+  const live = s.activePaper.orders + s.activePaper.schedules + s.activePaper.rebalances;
+  if (s.balanceRows === 0 && live === 0) {
+    lines.push("  (no paper book / no live paper primitives)");
+    return lines.join("\n");
+  }
+  lines.push(`  Book:      ${s.balanceRows} balance row${s.balanceRows === 1 ? "" : "s"} across ${s.bookScopes} scope${s.bookScopes === 1 ? "" : "s"}`);
+  lines.push(`  Live:      ${s.activePaper.orders} order${s.activePaper.orders === 1 ? "" : "s"}, ${s.activePaper.schedules} schedule${s.activePaper.schedules === 1 ? "" : "s"}, ${s.activePaper.rebalances} rebalance${s.activePaper.rebalances === 1 ? "" : "s"}`);
+  lines.push(`  Fills 24h: ${s.fills24h}`);
+  return lines.join("\n");
+}
+
 function renderReport(report: StatusReport, sections: SectionName[]): string {
   const now = new Date(report.generatedAt);
   const header = `TRADEKIT STATUS  ·  ${report.generatedAt}`;
@@ -240,6 +276,8 @@ function renderReport(report: StatusReport, sections: SectionName[]): string {
       case "drawdown": out.push(renderDrawdown(report.drawdown)); break;
       case "budgets": out.push(renderBudgets(report.budgets)); break;
       case "activity": out.push(renderActivity(report.activity)); break;
+      case "alerts": out.push(renderAlertsStatus(report.alerts)); break;
+      case "paper": out.push(renderPaperStatus(report.paper)); break;
     }
     out.push("");
   }

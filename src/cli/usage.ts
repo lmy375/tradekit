@@ -566,7 +566,9 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
   status [--section S,S,...] [--watch N] [--json]
         Operational dashboard: engine workers, near-trigger orders, scheduled fires,
         rebalance drift, playbook deployments, drawdown breaker, strategy budgets, 24h audit.
-        Sections: engine, orders, schedules, rebalance, playbooks, drawdown, budgets, activity.
+        Sections: engine, orders, schedules, rebalance, playbooks, drawdown, budgets,
+        activity, alerts (currently-firing + 24h transitions), paper (book + live
+        paper primitives + 24h fills).
         Composes 10+ read-side queries into one situational-awareness view; sub-100ms, zero RPC.
         Different from 'health' — health is financial summary, status is operational.
   digest [--window 1h|24h|7d|30d] [--format text|slack|json] [--compare] [--strict]
@@ -684,7 +686,7 @@ MAINTENANCE
 SERVERS
   mcp [--pass <pw>]                   Start MCP stdio server for AI agents
   web [--port 3030] [--host 127.0.0.1] [--pass <pw>]  Single-page UI + REST API
-        Read-only automation routes (token-authed, zero RPC/writes): /api/engine,
+        Read-only automation routes (token-authed, zero RPC/writes): /api/engine, /api/dashboard,
         /api/orders[/:id], /api/schedules[/:id], /api/rebalance[/:id] (each :id with
         its decision-journal tail), /api/playbooks[/:id], /api/paper, /api/timeline,
         /api/alerts, /api/strategy-report/:tag — dashboard/monitor consumption.

@@ -35,12 +35,12 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
   // ── status_dashboard ───────────────────────────────────────
   server.tool(
     "status_dashboard",
-    "Operational status across engine workers + active orders / schedules / rebalance plans + playbooks + drawdown breaker + strategy budgets + 24h audit. Composes ~10 read-side queries into one situational-awareness view. Different from the `status` admin tool (which is process-status only) — this is the iter23 multi-section dashboard. Optional section filter: pass `sections` to limit (e.g. [\"orders\",\"drawdown\"]). Sub-100ms, zero RPC.",
+    "Operational status across engine workers + active orders / schedules / rebalance plans + playbooks + drawdown breaker + strategy budgets + 24h audit + currently-firing strategy alerts (with the last 24h transitions) + the paper-trading snapshot (book size, live paper primitives, 24h fills). Composes ~10 read-side queries into one situational-awareness view. Different from the `status` admin tool (which is process-status only) — this is the iter23 multi-section dashboard. Optional section filter: pass `sections` to limit (e.g. [\"orders\",\"drawdown\"]). Sub-100ms, zero RPC.",
     {
       sections: z
-        .array(z.enum(["engine", "orders", "schedules", "rebalance", "playbooks", "drawdown", "budgets", "activity"]))
+        .array(z.enum(["engine", "orders", "schedules", "rebalance", "playbooks", "drawdown", "budgets", "activity", "alerts", "paper"]))
         .optional()
-        .describe("Section filter; default = all 8 sections."),
+        .describe("Section filter; default = all 10 sections."),
     },
     async ({ sections }) => {
       try {

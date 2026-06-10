@@ -328,3 +328,24 @@ describe("/api/strategy-report/:tag", () => {
     expect((await get("/api/strategy-report/x?mode=fake")).status).toBe(400);
   });
 });
+
+describe("/api/dashboard", () => {
+  it("returns the full status report with the sections filter", async () => {
+    upsertStrategyAlertState({
+      tag: "web-test",
+      ruleType: "staleness",
+      active: true,
+      firstTriggeredAt: new Date().toISOString(),
+      lastEvaluatedAt: new Date().toISOString(),
+      lastValueJson: null,
+    });
+    const r = await get("/api/dashboard?sections=alerts,paper");
+    expect(r.status).toBe(200);
+    const report = r.body.report as { alerts: { activeCount: number }; orders: { active?: unknown[] } };
+    expect(report.alerts.activeCount).toBe(1);
+    expect(r.body.sections).toEqual(["alerts", "paper"]);
+
+    const bad = await get("/api/dashboard?sections=bogus");
+    expect(bad.status).toBe(400);
+  });
+});
