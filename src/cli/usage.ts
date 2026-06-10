@@ -278,8 +278,8 @@ CONDITIONAL ORDERS
 
 STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy report <id|tag> [--window 1d|7d|30d|90d|all] [--mode real|paper|auto]
-                           [--sections id,comp,perf,pos,risk,act,fwd] [--no-prices]
-                           [--alerts] [--json]
+                           [--sections id,comp,perf,pos,risk,act,fwd,mtm] [--no-prices]
+                           [--mtm] [--alerts] [--json]
         Comprehensive multi-section report for any strategy tag. A bare number resolves to
         playbook:N; free-form tags (\`dca-eth\`) are taken verbatim. Seven sections:
           identity     — playbook name + deployment + age + mode (real/paper)
@@ -289,6 +289,11 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
           risk         — strategy-budget consumption + per-strategy drawdown
           activity     — recent fills + failures + order journal entries
           forward      — next schedule fire + per-active-order distance-to-trigger
+        --mtm adds an eighth, opt-in VALUATION section: cost-basis positions (same
+        weighted-average core as \`paper pnl --mtm\` — numbers match across surfaces)
+        marked at live oracle prices, realized/unrealized/total + per-position detail.
+        Works in BOTH modes (real mode walks status=success trades; gas excluded —
+        \`tradekit pnl\` owns full portfolio accounting).
         --sections lets agents request a fast subset (e.g. \`identity,forward\` for
         a near-real-time tick check). Default window 30d. --no-prices skips the
         forward-section price lookup when the operator wants a network-free snapshot.

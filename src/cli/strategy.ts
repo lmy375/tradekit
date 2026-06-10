@@ -37,6 +37,8 @@ import {
 } from "../strategyReport.js";
 import { listStrategyAlertStates } from "../db.js";
 import { getCurrentPrice } from "../price.js";
+import { loadConfig } from "../config.js";
+import { defaultPaperPriceFetcher } from "../paperPnl.js";
 import { createLogger } from "../logger.js";
 import { printJson, subcommandError } from "./helpers.js";
 import { strategiesListCommand } from "./inspect.js";
@@ -54,6 +56,7 @@ const VALID_SECTIONS: ReportSection[] = [
   "risk",
   "activity",
   "forward",
+  "valuation",
 ];
 
 function parseWindow(raw: string | undefined): ReportWindow {
@@ -97,7 +100,9 @@ function parseSections(raw: string | undefined): ReportSection[] | undefined {
                 ? "activity"
                 : p === "fwd"
                   ? "forward"
-                  : p;
+                  : p === "mtm" || p === "val"
+                    ? "valuation"
+                    : p;
     if (!VALID_SECTIONS.includes(aliased as ReportSection)) {
       throw new ToolError(
         "INVALID_PARAMS",
@@ -368,6 +373,44 @@ function formatPendingRow(t: PendingTriggerEntry): string {
   return `#${String(t.orderId).padEnd(5)} ${t.side.padEnd(4)} ${trig.padEnd(10)} target ${target.padStart(12)}  current ${curr.padStart(12)}  dist ${dist.padStart(8)}  ${fireFlag}`.trimEnd();
 }
 
+function renderValuation(report: StrategyReport): string[] {
+  const v = report.valuation;
+  if (!v) return [];
+  const lines: string[] = [];
+  lines.push("Valuation (mark-to-market)");
+  lines.push("─".repeat(60));
+  const sign = (n: number) => `${n >= 0 ? "+" : ""}$${n.toFixed(2)}`;
+  const unreal = v.unrealizedQuote == null ? "— (unpriced)" : sign(v.unrealizedQuote);
+  lines.push(`  Realized:    ${sign(v.realizedQuote)}   Unrealized: ${unreal}   Total: ${sign(v.totalQuote)}`);
+  lines.push(`  Open value:  $${v.openValueQuote.toFixed(2)}   marked at ${v.markedAt}`);
+  for (const p of v.positions) {
+    if (p.amount <= 1e-9 && p.realizedQuote === 0 && p.untrackedSellBase === 0) continue;
+    const sym = p.symbol ?? p.token.slice(0, 10);
+    if (p.amount > 1e-9) {
+      const mark = p.currentPriceQuote == null
+        ? "price unavailable"
+        : `@ $${p.currentPriceQuote.toFixed(2)} (avg cost $${p.avgCostQuote.toFixed(2)})  unrealized ${p.unrealizedQuote == null ? "—" : sign(p.unrealizedQuote)}`;
+      lines.push(`    ${sym.padEnd(10)} ${p.amount.toFixed(6)} held  ${mark}`);
+    } else {
+      lines.push(`    ${sym.padEnd(10)} flat  realized ${sign(p.realizedQuote)}`);
+    }
+  }
+  if (v.unpricedPositionCount > 0) {
+    lines.push(`  ⚠ ${v.unpricedPositionCount} open position(s) unpriced — unrealized/total are partial`);
+  }
+  if (v.skippedNonStableQuote > 0) {
+    lines.push(`  ⚠ ${v.skippedNonStableQuote} fill(s) with non-stablecoin quote excluded from cost basis`);
+  }
+  if (v.untrackedSellQuote > 0) {
+    lines.push(`  ⚠ $${v.untrackedSellQuote.toFixed(2)} sell proceeds without tracked cost basis (excluded from realized)`);
+  }
+  if (report.mode === "real") {
+    lines.push(`  Note: gas not included — see \`tradekit pnl\` for full portfolio accounting.`);
+  }
+  lines.push("");
+  return lines;
+}
+
 // ── render orchestrator ─────────────────────────────────────
 
 export function renderStrategyReport(report: StrategyReport): string {
@@ -376,6 +419,7 @@ export function renderStrategyReport(report: StrategyReport): string {
   lines.push(...renderComposition(report));
   lines.push(...renderPerformance(report));
   lines.push(...renderPosition(report));
+  lines.push(...renderValuation(report));
   lines.push(...renderRisk(report));
   lines.push(...renderActivity(report));
   lines.push(...renderForward(report));
@@ -397,8 +441,18 @@ export async function strategyReportCommand(
   }
   const window = parseWindow(flags["window"]);
   const mode = parseMode(flags["mode"]);
-  const sections = parseSections(flags["sections"]);
+  let sections = parseSections(flags["sections"]);
   const noPrices = flags["no-prices"] === "true" || flags["prices"] === "false";
+
+  // --mtm: add the valuation section on top of whatever sections
+  // resolve (default = all seven + valuation). The section itself is
+  // opt-in because it needs one oracle call per held token.
+  const wantMtm = flags["mtm"] === "true" || sections?.includes("valuation") === true;
+  if (flags["mtm"] === "true" && sections && !sections.includes("valuation")) {
+    sections = [...sections, "valuation"];
+  } else if (flags["mtm"] === "true" && !sections) {
+    sections = [...VALID_SECTIONS];
+  }
 
   const quietLogger = createLogger({ stderrLevel: "silent" });
   const livePriceFn = noPrices
@@ -410,6 +464,9 @@ export async function strategyReportCommand(
           return null;
         }
       };
+  const markPriceFn = wantMtm && !noPrices
+    ? defaultPaperPriceFetcher(loadConfig(), quietLogger)
+    : undefined;
 
   const report = await buildStrategyReport({
     tag: tagArg,
@@ -417,6 +474,7 @@ export async function strategyReportCommand(
     mode,
     sections,
     livePriceFn,
+    markPriceFn,
   });
 
   // --alerts: surface currently-active alerts for the strategy. This

@@ -70,6 +70,7 @@ import {
   type DrawdownStateRow,
 } from "./db.js";
 import { loadConfig, type Config } from "./config.js";
+import { computePaperPnlMtm, type PaperPriceFetcher, type PaperPositionEntry } from "./paperPnl.js";
 import { evaluateTrailingTrigger } from "./trailingStop.js";
 import { isOrderTriggered, isOrderExpired } from "./orders.js";
 
@@ -84,7 +85,11 @@ export type ReportSection =
   | "position"
   | "risk"
   | "activity"
-  | "forward";
+  | "forward"
+  /** Opt-in (NOT in the default set — pricing open positions needs a
+   *  live oracle call per held token, which makes the report
+   *  non-deterministic). Cost-basis positions marked to market. */
+  | "valuation";
 
 export interface BuildStrategyReportArgs {
   /** The strategy tag. A bare number is interpreted as a playbook id
@@ -101,6 +106,14 @@ export interface BuildStrategyReportArgs {
    *  compute "% to trigger" distances. When null, those distances
    *  appear as null in the output. */
   livePriceFn?: (tokenAddress: string) => Promise<number | null>;
+  /** Price oracle for the valuation section: USD per unit of
+   *  (chain, token). Supplied by the caller (CLI / MCP) since price
+   *  IO belongs at the edge — defaultPaperPriceFetcher() is the
+   *  production implementation (it handles the native sentinel via
+   *  the chain's WETH). When omitted, valuation still computes cost
+   *  basis but every open position is unpriced (deterministic +
+   *  offline — useful for tests and air-gapped report generation). */
+  markPriceFn?: PaperPriceFetcher;
   /** Test seam: defaults to Date.now(). Lets tests pin the
    *  "now" used for window calculation + age display. */
   nowFn?: () => Date;
@@ -124,6 +137,7 @@ export interface StrategyReport {
   risk?: RiskSection;
   activity?: ActivitySection;
   forward?: ForwardSection;
+  valuation?: ValuationSection;
 }
 
 export interface IdentitySection {
@@ -217,6 +231,42 @@ export interface PositionEntry {
   /** "base" or "quote" — useful when rendering: base = the asset
    *  the strategy is acquiring; quote = the asset spent. */
   role: "base" | "quote";
+}
+
+/** Opt-in mark-to-market view. Positions are rebuilt from the fill
+ *  journal with the SAME weighted-average cost-basis model the
+ *  `paper pnl --mtm` surface uses (one shared core, computePaperPnlMtm
+ *  — numbers can't drift between surfaces), then open positions are
+ *  marked at current oracle prices.
+ *
+ *  Mode parity: paper mode walks paper_trades; real mode walks
+ *  status='success' trades through the same engine. Real-mode caveat
+ *  (documented, deliberate): gas is NOT included here — the
+ *  full-portfolio `tradekit pnl` report owns historically-accurate
+ *  gas accounting; this section answers the per-strategy question. */
+export interface ValuationSection {
+  /** ISO timestamp the price marks were fetched. */
+  markedAt: string;
+  /** Cost-basis realized P&L (USD ≈ quote). Differs from the
+   *  performance section's realizedNetQuote: that is raw cash flow
+   *  (a buy makes it negative even when the position is up); this
+   *  only books P&L when a tracked position is reduced. */
+  realizedQuote: number;
+  /** Open positions marked at current prices. Null when every open
+   *  position is unpriced (no oracle / no markPriceFn). */
+  unrealizedQuote: number | null;
+  /** realizedQuote + (unrealizedQuote ?? 0). */
+  totalQuote: number;
+  /** Current USD value of priced open positions. */
+  openValueQuote: number;
+  positions: PaperPositionEntry[];
+  unpricedPositionCount: number;
+  /** Fills excluded from cost basis (non-stablecoin quote). */
+  skippedNonStableQuote: number;
+  /** Base sold without a tracked cost basis (deposit-seeded paper
+   *  inventory, or real trades predating the journal) — proceeds
+   *  excluded from realizedQuote, reported for transparency. */
+  untrackedSellQuote: number;
 }
 
 export interface RiskSection {
@@ -875,6 +925,74 @@ async function buildForward(args: {
   return { nextScheduleAt, nextScheduleId, pendingTriggers };
 }
 
+// ── valuation (mark-to-market) ──────────────────────────────
+
+/** Adapt success-status real trades to the MTM walker's row shape.
+ *  The walker only reads (strategy, timestamp, id, chain, direction,
+ *  base_token/symbol/amount, quote_symbol/amount) — every one of
+ *  which TradeRow shares. */
+function toMtmRows(trades: readonly TradeRow[]): PaperTradeRow[] {
+  return trades
+    .filter((t) => t.status === "success")
+    .map((t, i) => ({
+      id: t.id ?? i,
+      timestamp: t.timestamp,
+      source_type: "manual",
+      source_id: null,
+      chain: t.chain,
+      account: t.account,
+      direction: t.direction,
+      base_token: t.base_token,
+      base_symbol: t.base_symbol,
+      base_amount: t.base_amount,
+      quote_token: t.quote_token,
+      quote_symbol: t.quote_symbol,
+      quote_amount: t.quote_amount,
+      price: t.price ?? "0",
+      slippage_bps: null,
+      strategy: t.strategy ?? null,
+      notes: null,
+    }));
+}
+
+async function buildValuation(args: {
+  tag: string;
+  trades: TradeRow[] | PaperTradeRow[];
+  isPaper: boolean;
+  markPriceFn?: PaperPriceFetcher;
+  nowIso: string;
+}): Promise<ValuationSection> {
+  const rows = args.isPaper
+    ? (args.trades as PaperTradeRow[])
+    : toMtmRows(args.trades as TradeRow[]);
+  // No oracle injected → every open position reports unpriced. Cost
+  // basis is still exact, and the section stays deterministic.
+  const fetchPrice: PaperPriceFetcher = args.markPriceFn ?? (async () => null);
+  const report = await computePaperPnlMtm(rows, fetchPrice, { nowIso: args.nowIso });
+  // Rows are pre-filtered to the tag, so there is at most one bucket
+  // (untagged rows can't reach here — the DB query filters on
+  // strategy). Defensive: merge if multiple ever appear.
+  const buckets = report.summaries;
+  const positions = buckets.flatMap((b) => b.positions);
+  const realizedQuote = buckets.reduce((acc, b) => acc + b.realizedQuote, 0);
+  const unrealizedVals = buckets.map((b) => b.unrealizedQuote).filter((v): v is number => v != null);
+  const hasOpen = positions.some((p) => p.amount > 1e-9);
+  const unrealizedQuote = hasOpen
+    ? (unrealizedVals.length > 0 ? unrealizedVals.reduce((a, v) => a + v, 0) : null)
+    : 0;
+  return {
+    markedAt: report.timestamp,
+    realizedQuote,
+    unrealizedQuote,
+    totalQuote: realizedQuote + (unrealizedQuote ?? 0),
+    openValueQuote: buckets.reduce((acc, b) => acc + b.openValueQuote, 0),
+    positions,
+    unpricedPositionCount: buckets.reduce((acc, b) => acc + b.unpricedPositionCount, 0),
+    skippedNonStableQuote: buckets.reduce((acc, b) => acc + b.skippedNonStableQuote, 0),
+    untrackedSellQuote: positions.reduce((acc, p) => acc + p.untrackedSellQuote, 0),
+  };
+}
+
 // ── mode detection ──────────────────────────────────────────
 
 /**
@@ -1013,6 +1131,16 @@ export async function buildStrategyReport(
     });
   }
 
+  if (sections.has("valuation")) {
+    report.valuation = await buildValuation({
+      tag,
+      trades: tradesForReport,
+      isPaper,
+      markPriceFn: args.markPriceFn,
+      nowIso: now.toISOString(),
+    });
+  }
+
   return report;
 }
 
@@ -1026,4 +1154,5 @@ export {
   buildActivity as _buildActivity,
   buildForward as _buildForward,
   buildIdentity as _buildIdentity,
+  buildValuation as _buildValuation,
 };

@@ -564,7 +564,7 @@ tradekit strategy report 1 --window all
 **MCP tool.** `strategy_report` exposes the same surface to agents — one call replaces 7+ pre-iter31 calls. Agents wanting a near-real-time tick check pass `sections: ["identity", "forward"]` to skip the heavier aggregation paths.
 
 **v1 limitations.**
-- Open positions are NOT marked-to-market in the report itself. The performance section reports REALIZED P&L only. For paper strategies, `tradekit paper pnl --mtm` gives the full cost-basis + unrealized view; for real trades use `tradekit pnl`.
+- ~~Open positions are NOT marked-to-market in the report itself~~ — closed: `strategy report <id> --mtm` adds an opt-in VALUATION section with cost-basis positions marked at live oracle prices (realized / unrealized / total / per-position detail), in BOTH modes via the same core `paper pnl --mtm` uses. Real-mode caveat: gas excluded — `tradekit pnl` owns full portfolio accounting.
 - Drawdown is shown for the per-strategy scope (`strategy:<tag>`) only; the `global` portfolio breaker has its own surface via `safety drawdown`.
 
 #### Strategy alerts (iter32) — proactive notifications
@@ -583,6 +583,9 @@ tradekit strategy alerts history --tag dca-eth --event fired --limit 50
 
 # Inline in the report:
 tradekit strategy report 1 --alerts
+
+# Mark-to-market: cost-basis positions at live prices (works real + paper):
+tradekit strategy report 1 --mtm
 ```
 
 **Durable transition journal (v28).** Every fired/resolved transition also lands a row in the `alert_events` table at the moment the notification is emitted — exact timestamp, the violated value, and (for resolves) the alerting duration. `strategy alerts history` (CLI) and `alert_history` (MCP) page it; `timeline_query` reads it for `alert.fired` / `alert.resolved` events (falling back to state-row reconstruction only for pre-v28 windows). Unlike `alerts list` — which shows CURRENT state — the journal keeps the full history: a flapping alert that fired and resolved five times shows all ten transitions. Prunable via `db.retention.alertEventsDays`.

@@ -985,3 +985,137 @@ describe("buildStrategyReport — end-to-end", () => {
     expect(r.identity?.displayName).toBe("tag-test");
   });
 });
+
+// ── valuation (mark-to-market) ──────────────────────────────
+
+describe("buildStrategyReport — valuation section", () => {
+  const ETH2 = "0x4200000000000000000000000000000000000006";
+  const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  function seedRealTrade(over: Record<string, unknown> = {}) {
+    insertTrade({
+      timestamp: "2026-05-20T00:00:00Z",
+      chain: "base",
+      account: "default",
+      direction: "buy",
+      base_token: ETH2,
+      base_symbol: "ETH",
+      base_amount: "1",
+      quote_token: USDC2,
+      quote_symbol: "USDC",
+      quote_amount: "2000",
+      price: "2000",
+      tx_hash: `0x${Math.floor(Math.random() * 1e9).toString(16)}`,
+      status: "success",
+      gas_used: null,
+      gas_price_wei: null,
+      gas_cost_native: null,
+      aggregator: "kyberswap",
+      fee_tier: null,
+      notes: null,
+      strategy: "val-test",
+      realized_slippage_bps: 10,
+      ...over,
+    } as never);
+  }
+
+  it("is NOT in the default section set (opt-in only)", async () => {
+    seedRealTrade();
+    const r = await buildStrategyReport({ tag: "val-test", mode: "real" });
+    expect(r.valuation).toBeUndefined();
+  });
+
+  it("real mode: marks the open position via markPriceFn (success trades only)", async () => {
+    seedRealTrade(); // buy 1 ETH @ 2000
+    // A FAILED trade must not enter cost basis.
+    seedRealTrade({ timestamp: "2026-05-21T00:00:00Z", status: "failed", quote_amount: "9999", base_amount: "5" });
+    const r = await buildStrategyReport({
+      tag: "val-test",
+      mode: "real",
+      sections: ["valuation"],
+      markPriceFn: async (_chain, token) => (token.toLowerCase() === ETH2 ? 2500 : null),
+    });
+    const v = r.valuation!;
+    expect(v.realizedQuote).toBe(0);
+    expect(v.unrealizedQuote).toBeCloseTo(500, 6); // 1 × (2500 − 2000)
+    expect(v.totalQuote).toBeCloseTo(500, 6);
+    expect(v.openValueQuote).toBeCloseTo(2500, 6);
+    expect(v.positions).toHaveLength(1);
+    expect(v.positions[0].amount).toBeCloseTo(1, 9); // failed trade excluded
+    expect(v.positions[0].avgCostQuote).toBeCloseTo(2000, 6);
+  });
+
+  it("real mode: round-trip realizes cost-basis P&L", async () => {
+    seedRealTrade(); // buy 1 @ 2000
+    seedRealTrade({ timestamp: "2026-05-22T00:00:00Z", direction: "sell", quote_amount: "2300", price: "2300" });
+    const r = await buildStrategyReport({
+      tag: "val-test",
+      mode: "real",
+      sections: ["valuation"],
+      markPriceFn: async () => 9999, // flat position — mark must not matter
+    });
+    const v = r.valuation!;
+    expect(v.realizedQuote).toBeCloseTo(300, 6);
+    expect(v.unrealizedQuote).toBe(0);
+    expect(v.totalQuote).toBeCloseTo(300, 6);
+  });
+
+  it("paper mode: same engine over paper_trades", async () => {
+    recordPaperTrade({
+      timestamp: "2026-05-20T00:00:00Z",
+      source_type: "schedule",
+      source_id: 1,
+      chain: "base",
+      account: "default",
+      direction: "buy",
+      base_token: ETH2,
+      base_symbol: "ETH",
+      base_amount: "2",
+      quote_token: USDC2,
+      quote_symbol: "USDC",
+      quote_amount: "4000",
+      price: "2000",
+      slippage_bps: 50,
+      strategy: "val-paper",
+      notes: null,
+    });
+    const r = await buildStrategyReport({
+      tag: "val-paper",
+      mode: "paper",
+      sections: ["valuation"],
+      markPriceFn: async () => 2600,
+    });
+    const v = r.valuation!;
+    expect(r.mode).toBe("paper");
+    expect(v.unrealizedQuote).toBeCloseTo(2 * 600, 6);
+    expect(v.openValueQuote).toBeCloseTo(5200, 6);
+  });
+
+  it("no markPriceFn → deterministic offline section with unpriced positions", async () => {
+    seedRealTrade();
+    const r = await buildStrategyReport({
+      tag: "val-test",
+      mode: "real",
+      sections: ["valuation"],
+    });
+    const v = r.valuation!;
+    expect(v.realizedQuote).toBe(0); // cost basis still exact
+    expect(v.unrealizedQuote).toBeNull();
+    expect(v.unpricedPositionCount).toBe(1);
+    expect(v.positions[0].avgCostQuote).toBeCloseTo(2000, 6);
+  });
+
+  it("empty trade history → empty valuation, no crash", async () => {
+    const r = await buildStrategyReport({
+      tag: "val-empty",
+      mode: "real",
+      sections: ["valuation"],
+      markPriceFn: async () => 1,
+    });
+    const v = r.valuation!;
+    expect(v.positions).toEqual([]);
+    expect(v.realizedQuote).toBe(0);
+    expect(v.unrealizedQuote).toBe(0); // nothing open
+    expect(v.totalQuote).toBe(0);
+  });
+});

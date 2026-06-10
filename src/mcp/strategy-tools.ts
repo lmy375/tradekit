@@ -720,7 +720,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
   // is anything about to fire?" tick check).
   server.tool(
     "strategy_report",
-    "Unified multi-section report for a strategy tag (or playbook id). Pulls together composition (active orders/schedules/rebalances), performance (fills + slippage), position (net token deltas), risk (budgets + drawdown), recent activity, and forward signals (next schedule fire + per-order distance-to-trigger) into one response. Bare numeric tag resolves to playbook:N. Mode auto-detects paper vs real from the primitives. --sections filter supports fast tick checks. Errors: INVALID_PARAMS (bad window/mode/section name).",
+    "Unified multi-section report for a strategy tag (or playbook id). Pulls together composition (active orders/schedules/rebalances), performance (fills + slippage), position (net token deltas), risk (budgets + drawdown), recent activity, and forward signals (next schedule fire + per-order distance-to-trigger) into one response. Bare numeric tag resolves to playbook:N. Mode auto-detects paper vs real from the primitives. --sections filter supports fast tick checks. `mtm: true` adds a VALUATION section: cost-basis positions (same weighted-average core as paper_pnl mtm — numbers match across surfaces) marked at live oracle prices, with realized/unrealized/total + per-position detail; works in BOTH modes (real mode walks status='success' trades; gas excluded — use the pnl tool for full portfolio accounting). mtm is opt-in and non-deterministic (live prices). Errors: INVALID_PARAMS (bad window/mode/section name).",
     {
       tag: z.string().min(1).describe("Strategy tag (e.g. `playbook:1`, `dca-eth`) or a bare playbook id."),
       window: z
@@ -732,21 +732,25 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
         .default("auto")
         .describe("Force paper or real mode; auto inspects primitives + trades to pick."),
       sections: z
-        .array(z.enum(["identity", "composition", "performance", "position", "risk", "activity", "forward"]))
+        .array(z.enum(["identity", "composition", "performance", "position", "risk", "activity", "forward", "valuation"]))
         .optional()
-        .describe("Subset of sections to compute. Omit for the full report."),
+        .describe("Subset of sections to compute. Omit for the full report (valuation stays opt-in via mtm)."),
       includePrices: z
         .boolean()
         .default(false)
         .describe("Look up live spot prices for the forward-signals section. Default false (MCP calls should be deterministic + network-free unless explicitly opted in)."),
+      mtm: z
+        .boolean()
+        .default(false)
+        .describe("Add the mark-to-market valuation section (cost-basis positions at live oracle prices). One memoized oracle call per held token."),
     },
-    async ({ tag, window, mode, sections, includePrices }) => {
+    async ({ tag, window, mode, sections, includePrices, mtm }) => {
       try {
         return ok(
           await runTool(
             "strategy_report",
             rt.opts,
-            { tag, window, mode, sections, includePrices },
+            { tag, window, mode, sections, includePrices, mtm },
             undefined,
             async () => {
               const { buildStrategyReport } = await import("../strategyReport.js");
@@ -762,12 +766,24 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
                     }
                   }
                 : undefined;
+              let effectiveSections = sections;
+              let markPriceFn;
+              if (mtm) {
+                const { defaultPaperPriceFetcher } = await import("../paperPnl.js");
+                markPriceFn = defaultPaperPriceFetcher(rt.getConfig(), quietLogger);
+                if (effectiveSections && !effectiveSections.includes("valuation")) {
+                  effectiveSections = [...effectiveSections, "valuation"];
+                } else if (!effectiveSections) {
+                  effectiveSections = ["identity", "composition", "performance", "position", "risk", "activity", "forward", "valuation"];
+                }
+              }
               const report = await buildStrategyReport({
                 tag,
                 window,
                 mode,
-                sections,
+                sections: effectiveSections,
                 livePriceFn,
+                markPriceFn,
               });
               return { report };
             },
