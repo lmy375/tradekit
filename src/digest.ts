@@ -41,6 +41,7 @@ import {
 } from "./db.js";
 import { computeBudgetConsumption } from "./strategyBudget.js";
 import { loadConfig, type Config } from "./config.js";
+import { buildEquityCurve } from "./equity.js";
 
 // ── window parsing ───────────────────────────────────────────
 
@@ -190,6 +191,19 @@ export interface ComparisonDelta {
   paperFills: number;
 }
 
+/** v38: equity movement inside the digest window — from the v37
+ *  snapshot feed (pure DB read). null when the feed has fewer than
+ *  two points in the window's scope. */
+export interface EquitySection {
+  accountsKey: string;
+  chainsKey: string;
+  startUsd: number;
+  endUsd: number;
+  changeAbs: number;
+  changePct: number | null;
+  points: number;
+}
+
 export interface DigestReport {
   generatedAt: string;
   /** ISO timestamp of the window's start. */
@@ -208,6 +222,8 @@ export interface DigestReport {
   errors: ErrorsSection;
   alerts: AlertsSection;
   paper: PaperSection;
+  /** v38: null when the snapshot feed has < 2 points in the window. */
+  equity: EquitySection | null;
   /** When `--compare` was set, the same digest for the immediately-
    *  prior window with the same length. */
   comparison: {
@@ -241,6 +257,30 @@ export function gatherDigest(args: GatherDigestArgs): DigestReport {
   });
 }
 
+/** v38: equity delta from the snapshot feed. Scope-disciplined like
+ *  the equity surfaces: most-snapshotted scope, never mixed. */
+function gatherEquity(args: { since: string; until?: string }): EquitySection | null {
+  try {
+    const curve = buildEquityCurve({ sinceIso: args.since });
+    let points = curve.points;
+    if (args.until) points = points.filter((p) => p.at <= args.until!);
+    if (points.length < 2) return null;
+    const first = points[0];
+    const last = points[points.length - 1];
+    return {
+      accountsKey: curve.accountsKey,
+      chainsKey: curve.chainsKey,
+      startUsd: first.totalUsd,
+      endUsd: last.totalUsd,
+      changeAbs: last.totalUsd - first.totalUsd,
+      changePct: first.totalUsd > 0 ? ((last.totalUsd - first.totalUsd) / first.totalUsd) * 100 : null,
+      points: points.length,
+    };
+  } catch {
+    return null; // feed unavailable — the digest never fails on equity
+  }
+}
+
 function gatherWindow(args: {
   nowMs: number;
   windowMs: number;
@@ -257,6 +297,7 @@ function gatherWindow(args: {
   const errors = gatherErrors({ since: windowStart });
   const alerts = gatherAlerts({ since: windowStart });
   const paper = gatherPaper({ since: windowStart });
+  const equity = gatherEquity({ since: windowStart });
 
   const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper });
 
@@ -270,6 +311,7 @@ function gatherWindow(args: {
     const priorSafety = gatherSafety({ since: priorStart, until: priorEnd, config: args.config });
     const priorAlerts = gatherAlerts({ since: priorStart, until: priorEnd });
     const priorPaper = gatherPaper({ since: priorStart, until: priorEnd });
+    const priorEquity = gatherEquity({ since: priorStart, until: priorEnd });
     const priorVerdict = classifyVerdict({
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
       alerts: priorAlerts, paper: priorPaper,
@@ -282,7 +324,7 @@ function gatherWindow(args: {
       verdict: priorVerdict.verdict,
       verdictReasons: priorVerdict.verdictReasons,
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
-      alerts: priorAlerts, paper: priorPaper,
+      alerts: priorAlerts, paper: priorPaper, equity: priorEquity,
       comparison: null,
     };
     comparison = {
@@ -311,6 +353,7 @@ function gatherWindow(args: {
     errors,
     alerts,
     paper,
+    equity,
     comparison,
   };
 }

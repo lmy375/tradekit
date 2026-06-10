@@ -1101,6 +1101,184 @@ export async function checkEngineLiveness(): Promise<CheckResult> {
   }
 }
 
+/** v38: a long-standing engine lock (especially one engaged by
+ *  panic) means automation is FULLY stopped — easy to forget after
+ *  the incident that caused it. */
+export async function checkEngineLockStale(): Promise<CheckResult> {
+  const STALE_HOURS = 24;
+  try {
+    const { getEngineLockState, isEngineLockedFromRow } = await import("./engineLock.js");
+    const lock = getEngineLockState();
+    if (!isEngineLockedFromRow(lock)) {
+      return { name: "engine lock", severity: "ok", message: "engine not locked" };
+    }
+    const ageH = lock.locked_at ? (Date.now() - Date.parse(lock.locked_at)) / 3_600_000 : null;
+    if (ageH != null && ageH > STALE_HOURS) {
+      const byPanic = lock.locked_by === "panic";
+      return {
+        name: "engine lock",
+        severity: "warn",
+        message: `engine LOCKED for ${ageH.toFixed(0)}h (by ${lock.locked_by ?? "?"}${lock.reason ? `: ${lock.reason}` : ""}) — every fire path is stopped`,
+        hint: byPanic
+          ? "release with `tradekit panic release` (primitives stay paused for selective resume)"
+          : "release with `tradekit engine unlock` if the incident is resolved",
+      };
+    }
+    return {
+      name: "engine lock",
+      severity: "ok",
+      message: `engine locked (recent — ${ageH == null ? "?" : ageH.toFixed(1)}h, by ${lock.locked_by ?? "?"})`,
+    };
+  } catch (e) {
+    return { name: "engine lock", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** v38: the equity curve is only as alive as its feed. When the
+ *  snapshot worker is ENABLED but the freshest engine-auto snapshot
+ *  is older than 2× the cadence, the worker is dead or its RPC scans
+ *  keep failing — the curve silently flatlines. */
+export async function checkSnapshotFeed(): Promise<CheckResult> {
+  try {
+    const config = loadConfig();
+    const enabled = config.engine?.workers?.snapshot?.enabled === true;
+    if (!enabled) {
+      return { name: "equity feed", severity: "ok", message: "snapshot worker off — equity curve has no auto feed (enable engine.workers.snapshot)" };
+    }
+    const everyHours = config.engine?.snapshotEveryHours ?? 24;
+    const { listPortfolioSnapshots } = await import("./db.js");
+    const { AUTO_SNAPSHOT_NOTE } = await import("./snapshotWorker.js");
+    const recent = listPortfolioSnapshots({ limit: 100 });
+    const lastAuto = recent.find((r) => r.note === AUTO_SNAPSHOT_NOTE);
+    if (!lastAuto) {
+      return {
+        name: "equity feed",
+        severity: "warn",
+        message: "snapshot worker is enabled but has NEVER recorded — equity curve has no data",
+        hint: "is the engine running? check `tradekit engine status`; the worker skips quietly when the portfolio scan fails (RPC)",
+      };
+    }
+    const ageH = (Date.now() - Date.parse(lastAuto.timestamp)) / 3_600_000;
+    if (ageH > 2 * everyHours) {
+      return {
+        name: "equity feed",
+        severity: "warn",
+        message: `last auto-snapshot is ${ageH.toFixed(0)}h old (cadence ${everyHours}h) — the equity curve is flatlining`,
+        hint: "engine down, worker disabled mid-flight, or every portfolio scan failing (RPC) — check engine status + server log",
+      };
+    }
+    return { name: "equity feed", severity: "ok", message: `last auto-snapshot ${ageH.toFixed(1)}h ago (cadence ${everyHours}h)` };
+  } catch (e) {
+    return { name: "equity feed", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** v38: quiet-hours health — a stuck flush silently eats the morning
+ *  summary; a zero-length window means the feature is configured but
+ *  never active. */
+export async function checkQuietHours(): Promise<CheckResult> {
+  try {
+    const config = loadConfig();
+    const qh = config.notifications?.quietHours;
+    if (!qh?.enabled) {
+      return { name: "quiet hours", severity: "ok", message: "quiet hours off" };
+    }
+    if (qh.startHourUtc === qh.endHourUtc) {
+      return {
+        name: "quiet hours",
+        severity: "warn",
+        message: `quiet hours enabled but startHourUtc === endHourUtc (${qh.startHourUtc}) — a zero-length window is NEVER active`,
+        hint: "set distinct hours (e.g. 22 → 7) or disable the feature",
+      };
+    }
+    const { pendingQueuedNotifications } = await import("./db.js");
+    const pending = pendingQueuedNotifications(500);
+    if (pending.length > 0) {
+      const oldest = pending[0];
+      const ageH = (Date.now() - Date.parse(oldest.queued_at)) / 3_600_000;
+      if (ageH > 24) {
+        return {
+          name: "quiet hours",
+          severity: "warn",
+          message: `${pending.length} suppressed notification(s) queued for ${ageH.toFixed(0)}h — the flush appears stuck`,
+          hint: "flush manually with `tradekit notify flush` (a failing summary webhook leaves rows queued; check `tradekit notify test`)",
+        };
+      }
+      return { name: "quiet hours", severity: "ok", message: `window ${qh.startHourUtc}→${qh.endHourUtc} UTC · ${pending.length} pending (fresh)` };
+    }
+    return { name: "quiet hours", severity: "ok", message: `window ${qh.startHourUtc}→${qh.endHourUtc} UTC · queue empty` };
+  } catch (e) {
+    return { name: "quiet hours", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** v38: a retry slot in the past means the v32 backoff parked a
+ *  schedule/plan and the engine never came back to consume it — the
+ *  occurrence is in limbo until the engine ticks. */
+export async function checkRetryParked(): Promise<CheckResult> {
+  const LIMBO_MS = 3_600_000; // 1h past the retry slot
+  try {
+    const { listSchedules } = await import("./db.js");
+    const { listRebalancePlans } = await import("./rebalance.js");
+    const now = Date.now();
+    const parked: string[] = [];
+    for (const s of listSchedules({ status: "active" })) {
+      if ((s.retry_count ?? 0) > 0 && now - Date.parse(s.next_run_at) > LIMBO_MS) {
+        parked.push(`schedule #${s.id} (attempt ${s.retry_count}, slot ${s.next_run_at})`);
+      }
+    }
+    for (const r of listRebalancePlans({ status: "active" })) {
+      if ((r.retry_count ?? 0) > 0 && r.next_run_at != null && now - Date.parse(r.next_run_at) > LIMBO_MS) {
+        parked.push(`rebalance #${r.id} (attempt ${r.retry_count}, slot ${r.next_run_at})`);
+      }
+    }
+    if (parked.length > 0) {
+      return {
+        name: "retry slots",
+        severity: "warn",
+        message: `${parked.length} primitive(s) parked on a PAST retry slot — the engine isn't consuming them: ${parked.slice(0, 3).join("; ")}${parked.length > 3 ? "; …" : ""}`,
+        hint: "the engine looks down — the occurrence stays in limbo until it ticks; check `tradekit engine status`",
+      };
+    }
+    return { name: "retry slots", severity: "ok", message: "no parked retries" };
+  } catch (e) {
+    return { name: "retry slots", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
+/** v38: everything paused + nothing active + engine unlocked smells
+ *  like a forgotten panic — the operator released the lock but never
+ *  resumed anything. */
+export async function checkPausedForgotten(): Promise<CheckResult> {
+  try {
+    const { listOrders, listSchedules } = await import("./db.js");
+    const { listRebalancePlans } = await import("./rebalance.js");
+    const { getEngineLockState, isEngineLockedFromRow } = await import("./engineLock.js");
+    const paused =
+      listOrders({ status: "paused" }).length +
+      listSchedules({ status: "paused" }).length +
+      listRebalancePlans({ status: "paused" }).length;
+    if (paused === 0) {
+      return { name: "paused primitives", severity: "ok", message: "none paused" };
+    }
+    const active =
+      listOrders({ status: "active" }).length +
+      listSchedules({ status: "active" }).length +
+      listRebalancePlans({ status: "active" }).length;
+    if (active === 0 && !isEngineLockedFromRow(getEngineLockState())) {
+      return {
+        name: "paused primitives",
+        severity: "warn",
+        message: `${paused} primitive(s) paused, ZERO active, engine unlocked — forgotten panic/breaker?`,
+        hint: "resume selectively (`tradekit strategy resume <tag>`) or everything (`tradekit panic release --resume-all`)",
+      };
+    }
+    return { name: "paused primitives", severity: "ok", message: `${paused} paused · ${active} active` };
+  } catch (e) {
+    return { name: "paused primitives", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
 export async function checkEnv(): Promise<CheckResult> {
   const SENSITIVE = new Set(["WALLET_PASS", "TRADEKIT_WEB_TOKEN"]);
   const KNOWN = [
@@ -1210,6 +1388,12 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ timestamp: strin
   results.push(await checkPaperReadiness());
   results.push(await checkAlertsCoverage());
   results.push(await checkEngineLiveness());
+  // v38 hygiene pack for the newer subsystems (all offline).
+  results.push(await checkEngineLockStale());
+  results.push(await checkSnapshotFeed());
+  results.push(await checkQuietHours());
+  results.push(await checkRetryParked());
+  results.push(await checkPausedForgotten());
 
   // RPCs (parallel)
   results.push(...(await Promise.all(chains.map((c) => checkRpc(c, opts.logger)))));

@@ -576,3 +576,38 @@ describe("gatherDigest — alerts / paper / journal-exact fires", () => {
     expect(r.comparison?.prior?.alerts.fired).toBe(1);
   });
 });
+
+// ── v38: equity section ──────────────────────────────────────
+
+describe("gatherDigest — equity section", () => {
+  it("reports the window's equity move from the snapshot feed", async () => {
+    const { insertPortfolioSnapshot, openDb } = await import("./db.js");
+    const now = Date.now();
+    insertPortfolioSnapshot({
+      timestamp: new Date(now - 20 * 3_600_000).toISOString(),
+      total_usd: 1000, accounts_key: "default", chains_key: "base",
+      token_count: 2, note: "engine-auto", data: "{}",
+    });
+    insertPortfolioSnapshot({
+      timestamp: new Date(now - 1 * 3_600_000).toISOString(),
+      total_usd: 1150, accounts_key: "default", chains_key: "base",
+      token_count: 2, note: "engine-auto", data: "{}",
+    });
+    try {
+      const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000 });
+      expect(r.equity).not.toBeNull();
+      expect(r.equity!.startUsd).toBe(1000);
+      expect(r.equity!.endUsd).toBe(1150);
+      expect(r.equity!.changeAbs).toBe(150);
+      expect(r.equity!.changePct).toBeCloseTo(15, 6);
+    } finally {
+      openDb().exec("DELETE FROM portfolio_snapshots");
+    }
+  });
+
+  it("equity is null with fewer than two points — the digest never fails on it", () => {
+    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000 });
+    expect(r.equity).toBeNull();
+    expect(r.verdict).toBeDefined();
+  });
+});

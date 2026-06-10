@@ -1844,6 +1844,8 @@ tradekit notify test --channel ops-slack
 
 **Dedup** — `config.notifications.dedupWindowMs` (default 60s) suppresses identical `(channel, dedupKey)` pairs within the window. A repeatedly-failing order produces one alert per minute, not one per tick.
 
+**Digest carries the equity move (v38).** With the v37 snapshot feed in place, the daily digest's first question — "how did the portfolio do?" — finally has a line: `EQUITY: $10,002 → $10,184 (+$182, +1.82%) · 4 snapshots`, scope-disciplined like every equity surface, and silently omitted (never failing) when the feed has fewer than two points in the window.
+
 **Quiet hours (v34) — nothing lost, nobody woken.** Severity routing has no time dimension: an info-level `schedule.fired` at 3am is noise, but muting the channel overnight also mutes the 3am `circuit_breaker`. `notifications.quietHours` adds the time axis:
 
 ```jsonc

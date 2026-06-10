@@ -41,6 +41,12 @@ SETUP
         book), alerts (automation running unwatched; CURRENTLY-FIRING alerts go warn —
         --strict in cron pages on them), engine liveness (live primitives but the
         engine never ran / status file stale).
+        v38 pack (offline): stale engine lock (>24h, names the panic release
+        lever), equity feed (snapshot worker enabled but never/stale-recorded
+        → curve flatlining), quiet hours (zero-length window; stuck flush with
+        >24h queued), parked retry slots (v32 backoff slot in the past — engine
+        not consuming), forgotten panic (everything paused + zero active +
+        unlocked).
   verify [all | backup <file> | wallet | config | db] [--pass <pw>] [--quiet] [--summary] [--json]
         Integrity check suite: backup (non-destructive decrypt+parse), wallet (re-derive address), config (orphan token refs, unknown-chain safety entries), db (schema, stale pending, audit size). Exit 1 on any failure.
         --quiet hides ok rows (iter760 — parallel to doctor/health --quiet); --summary prints a one-line cron/Slack-friendly digest (iter847).

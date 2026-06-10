@@ -322,3 +322,194 @@ describe("checkAlertsCoverage + checkEngineLiveness", () => {
     expect(r.hint).toContain("engine run");
   });
 });
+
+// ── v38 hygiene pack ─────────────────────────────────────────
+
+describe("checkEngineLockStale", () => {
+  it("ok when unlocked", async () => {
+    const { checkEngineLockStale } = await import("./doctor.js");
+    const r = await checkEngineLockStale();
+    expect(r.severity).toBe("ok");
+  });
+
+  it("warns on a >24h panic lock with the release hint", async () => {
+    const { openDb } = await import("./db.js");
+    const db = openDb();
+    const old = new Date(Date.now() - 30 * 3_600_000).toISOString();
+    db.prepare(
+      `INSERT OR REPLACE INTO engine_lock (id, active, reason, locked_at, locked_by, updated_at) VALUES (1, 1, 'PANIC: test', ?, 'panic', ?)`,
+    ).run(old, old);
+    try {
+      const { checkEngineLockStale } = await import("./doctor.js");
+      const r = await checkEngineLockStale();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(/LOCKED for 30h/);
+      expect(r.hint).toMatch(/panic release/);
+    } finally {
+      db.exec("DELETE FROM engine_lock");
+    }
+  });
+});
+
+describe("checkSnapshotFeed", () => {
+  it("ok (informational) when the worker is off", async () => {
+    const { checkSnapshotFeed } = await import("./doctor.js");
+    const r = await checkSnapshotFeed();
+    expect(r.severity).toBe("ok");
+    expect(r.message).toMatch(/worker off/);
+  });
+
+  it("warns when enabled but never recorded / stale", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({
+      ...cfg,
+      engine: { ...cfg.engine, workers: { ...cfg.engine.workers, snapshot: { enabled: true, intervalMs: 3_600_000 } } },
+    } as never);
+    try {
+      const { checkSnapshotFeed } = await import("./doctor.js");
+      const never = await checkSnapshotFeed();
+      expect(never.severity).toBe("warn");
+      expect(never.message).toMatch(/NEVER recorded/);
+
+      const { insertPortfolioSnapshot, openDb } = await import("./db.js");
+      insertPortfolioSnapshot({
+        timestamp: new Date(Date.now() - 72 * 3_600_000).toISOString(),
+        total_usd: 100, accounts_key: "default", chains_key: "base",
+        token_count: 1, note: "engine-auto", data: "{}",
+      });
+      const stale = await checkSnapshotFeed();
+      expect(stale.severity).toBe("warn");
+      expect(stale.message).toMatch(/flatlining/);
+      openDb().exec("DELETE FROM portfolio_snapshots");
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+});
+
+describe("checkQuietHours", () => {
+  it("warns on a zero-length window", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({
+      ...cfg,
+      notifications: { ...cfg.notifications, quietHours: { enabled: true, startHourUtc: 5, endHourUtc: 5, breakthroughSeverity: "critical" } },
+    } as never);
+    try {
+      const { checkQuietHours } = await import("./doctor.js");
+      const r = await checkQuietHours();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(/zero-length/);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+
+  it("warns when the flush is stuck (>24h pending)", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const { enqueueNotification, openDb } = await import("./db.js");
+    const cfg = loadConfig();
+    saveConfig({
+      ...cfg,
+      notifications: { ...cfg.notifications, quietHours: { enabled: true, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" } },
+    } as never);
+    enqueueNotification({
+      queuedAt: new Date(Date.now() - 36 * 3_600_000).toISOString(),
+      event: "x", severity: "info", title: "stuck",
+    });
+    try {
+      const { checkQuietHours } = await import("./doctor.js");
+      const r = await checkQuietHours();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(/flush appears stuck/);
+      expect(r.hint).toMatch(/notify flush/);
+    } finally {
+      openDb().exec("DELETE FROM notification_queue");
+      saveConfig(cfg);
+    }
+  });
+});
+
+describe("checkRetryParked", () => {
+  it("warns when a retry slot is >1h in the past (engine not consuming)", async () => {
+    const { insertSchedule, openDb } = await import("./db.js");
+    const id = insertSchedule({
+      name: "parked", cron_expr: "0 */6 * * *",
+      next_run_at: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      side: "buy", chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false,
+      start_at: null, end_at: null, max_runs: null,
+      strategy: null, note: null, paper: true,
+    });
+    openDb().prepare(`UPDATE schedules SET retry_count = 2 WHERE id = ?`).run(id);
+    try {
+      const { checkRetryParked } = await import("./doctor.js");
+      const r = await checkRetryParked();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(new RegExp(`schedule #${id} \\(attempt 2`));
+    } finally {
+      openDb().exec("DELETE FROM schedules");
+    }
+  });
+});
+
+describe("checkPausedForgotten", () => {
+  it("warns when everything is paused, nothing active, engine unlocked", async () => {
+    const { insertOrder, pauseOrder, openDb } = await import("./db.js");
+    // Clear leftovers from earlier suites — this check is global.
+    openDb().exec("DELETE FROM orders; DELETE FROM schedules; DELETE FROM rebalance_plans");
+    const id = insertOrder({
+      side: "buy", trigger_type: "price_below", target_price_usd: 1800, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false, expires_at: null,
+      strategy: null, note: null, group_id: null, paper: true,
+    });
+    pauseOrder(id);
+    try {
+      const { checkPausedForgotten } = await import("./doctor.js");
+      const r = await checkPausedForgotten();
+      expect(r.severity).toBe("warn");
+      expect(r.message).toMatch(/forgotten panic/);
+      expect(r.hint).toMatch(/resume/);
+    } finally {
+      openDb().exec("DELETE FROM orders");
+    }
+  });
+
+  it("ok when paused coexists with active work", async () => {
+    const { insertOrder, pauseOrder, openDb } = await import("./db.js");
+    const a = insertOrder({
+      side: "buy", trigger_type: "price_below", target_price_usd: 1800, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false, expires_at: null,
+      strategy: null, note: null, group_id: null, paper: true,
+    });
+    pauseOrder(a);
+    insertOrder({
+      side: "buy", trigger_type: "price_below", target_price_usd: 1700, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false, expires_at: null,
+      strategy: null, note: null, group_id: null, paper: true,
+    });
+    try {
+      const { checkPausedForgotten } = await import("./doctor.js");
+      const r = await checkPausedForgotten();
+      expect(r.severity).toBe("ok");
+    } finally {
+      openDb().exec("DELETE FROM orders");
+    }
+  });
+});

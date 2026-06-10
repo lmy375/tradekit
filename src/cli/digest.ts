@@ -69,6 +69,8 @@ function renderText(r: DigestReport): string {
   lines.push(``);
   lines.push(renderAlertsText(r.alerts));
   lines.push(``);
+  lines.push(renderEquityText(r.equity));
+  lines.push(``);
   lines.push(renderPaperText(r.paper));
   lines.push(``);
   lines.push(renderErrorsText(r.errors));
@@ -158,6 +160,17 @@ function renderAlertsText(a: import("../digest.js").AlertsSection): string {
     lines.push(`  Top rules: ${a.topRules.map((t) => `${t.ruleType}×${t.fired}`).join("  ")}`);
   }
   return lines.join("\n");
+}
+
+function renderEquityText(e: import("../digest.js").EquitySection | null): string {
+  if (!e) return `EQUITY: no snapshot feed in this window (enable engine.workers.snapshot)`;
+  const sign = e.changeAbs >= 0 ? "+" : "";
+  return (
+    `EQUITY (${e.accountsKey} × ${e.chainsKey}):\n` +
+    `  ${fmtUsd(e.startUsd)} → ${fmtUsd(e.endUsd)}  ` +
+    `(${sign}${fmtUsd(Math.abs(e.changeAbs)).replace("$", e.changeAbs >= 0 ? "$" : "-$")}` +
+    `${e.changePct != null ? `, ${sign}${e.changePct.toFixed(2)}%` : ""}) · ${e.points} snapshots`
+  );
 }
 
 function renderPaperText(p: import("../digest.js").PaperSection): string {
@@ -278,6 +291,10 @@ function renderSlack(r: DigestReport): string {
   if (alertParts.length > 0) lines.push(`*Alerts:* ${alertParts.join(" · ")}`);
   if (r.paper.fills > 0) {
     lines.push(`*Paper:* ${r.paper.fills} fill${r.paper.fills === 1 ? "" : "s"} · ${fmtUsd(r.paper.quoteVolume)} volume`);
+  }
+  if (r.equity) {
+    const sign = r.equity.changeAbs >= 0 ? "+" : "−";
+    lines.push(`*Equity:* ${fmtUsd(r.equity.endUsd)} (${sign}${fmtUsd(Math.abs(r.equity.changeAbs))}${r.equity.changePct != null ? `, ${sign}${Math.abs(r.equity.changePct).toFixed(2)}%` : ""})`);
   }
 
   // Safety section — show only when there's something to surface.
