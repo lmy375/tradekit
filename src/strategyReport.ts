@@ -71,6 +71,7 @@ import {
 } from "./db.js";
 import { loadConfig, type Config } from "./config.js";
 import type { RunwayBalanceFetcher, RunwayReport } from "./runway.js";
+import { capMatchesTag, netPosition, defaultFillRows } from "./positionCaps.js";
 import { computePaperPnlMtm, type PaperPriceFetcher, type PaperPositionEntry } from "./paperPnl.js";
 import { evaluateTrailingTrigger } from "./trailingStop.js";
 import { isOrderTriggered, isOrderExpired } from "./orders.js";
@@ -292,6 +293,20 @@ export interface RiskSection {
    *  drawdown table. null when no per-strategy drawdown tracking
    *  is configured. */
   drawdown: DrawdownSummary | null;
+  /** v38: position-cap rules matching this tag, with current NET
+   *  exposure and utilization. Empty when none configured. */
+  positionCaps: PositionCapSummary[];
+}
+
+export interface PositionCapSummary {
+  pattern: string;
+  token: string;
+  currentBaseAmount: number;
+  maxBaseAmount: number | null;
+  basePctUsed: number | null;
+  currentCostQuote: number;
+  maxCostQuote: number | null;
+  costPctUsed: number | null;
 }
 
 export interface BudgetSummary {
@@ -738,6 +753,7 @@ function buildRisk(args: {
   config: Config;
   drawdownLookup: (scopeKey: string) => DrawdownStateRow | null;
   spentLookup: (tag: string, sinceIso?: string) => number;
+  isPaper: boolean;
 }): RiskSection {
   const { tag, config, drawdownLookup, spentLookup } = args;
   const rules = config.safety.strategyBudgets ?? [];
@@ -787,7 +803,29 @@ function buildRisk(args: {
       trippedAt: row.tripped_at,
     };
   }
-  return { budgets, drawdown };
+  // v38: position-cap utilization — same matcher + same net-position
+  // walk the enforcement layer uses, so the report can't disagree
+  // with what executeTrade will actually do.
+  const positionCaps: PositionCapSummary[] = [];
+  const capRules = (config.safety.positionCaps ?? []).filter((c) => capMatchesTag(c, tag));
+  if (capRules.length > 0) {
+    const rows = defaultFillRows(tag, args.isPaper);
+    for (const cap of capRules) {
+      const pos = netPosition(rows, { token: cap.token });
+      positionCaps.push({
+        pattern: cap.pattern,
+        token: cap.token,
+        currentBaseAmount: pos.baseAmount,
+        maxBaseAmount: cap.maxBaseAmount ?? null,
+        basePctUsed: cap.maxBaseAmount != null && cap.maxBaseAmount > 0 ? (pos.baseAmount / cap.maxBaseAmount) * 100 : null,
+        currentCostQuote: pos.costQuote,
+        maxCostQuote: cap.maxCostQuote ?? null,
+        costPctUsed: cap.maxCostQuote != null && cap.maxCostQuote > 0 ? (pos.costQuote / cap.maxCostQuote) * 100 : null,
+      });
+    }
+  }
+
+  return { budgets, drawdown, positionCaps };
 }
 
 // ── activity ────────────────────────────────────────────────
@@ -1174,6 +1212,7 @@ export async function buildStrategyReport(
       config,
       drawdownLookup: getDrawdownState,
       spentLookup: usdSpentUnderStrategy,
+      isPaper,
     });
   }
 

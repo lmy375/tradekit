@@ -349,6 +349,30 @@ const safetySchema = z
       )
       .optional(),
 
+    /** v38: per-strategy NET-exposure caps — the third risk axis
+     *  (drawdown = portfolio value, budgets = gross spend, position
+     *  caps = net holding). Buys that would push a strategy's net
+     *  position in a token past the cap throw POSITION_CAP_EXCEEDED;
+     *  SELLS ARE NEVER BLOCKED (they reduce exposure). Net position
+     *  uses the same weighted-average model as every P&L surface;
+     *  scope is per (tag, token) ACROSS chains. */
+    positionCaps: z
+      .array(
+        z
+          .object({
+            pattern: z.string().min(1).describe("Strategy tag pattern — exact or suffix wildcard ('playbook:*')."),
+            token: z.string().min(1).describe("Token to cap: symbol (case-insensitive) or 0x address."),
+            maxBaseAmount: z.number().positive().optional().describe("Max NET base units held after a buy."),
+            maxCostQuote: z.number().positive().optional().describe("Max NET tracked cost basis (quote units)."),
+            note: z.string().optional(),
+          })
+          .strict()
+          .refine((r) => r.maxBaseAmount != null || r.maxCostQuote != null, {
+            message: "positionCaps entry requires at least one of maxBaseAmount / maxCostQuote",
+          }),
+      )
+      .optional(),
+
     /**
      * Iter20: portfolio drawdown circuit breaker. Tracks the operator's
      * portfolio peak USD value across trades and refuses new trades

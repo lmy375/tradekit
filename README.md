@@ -668,6 +668,18 @@ tradekit panic release --resume-all       # false alarm — resume everything (s
 
 The two layers are deliberate: the engine lock acts fastest, the pause makes the stop **durable across an unlock** and explicit in every list view. Release defaults to unlock-only because panic decisions are made under stress — resuming is the calm-state decision (`strategy resume <tag>` / `order resume <id>`). `--cancel-orders` always requires the explicit `--yes` (an interactive prompt under stress invites mistakes in both directions). A critical `engine.panic` notification (which breaks through quiet hours by severity) records the counts. **Not exposed over MCP** — the same CLI-only safety boundary as backup: an agent, or a prompt-injected agent, must be unable to mass-cancel orders or release a human-engaged panic.
 
+#### Position caps — the third risk axis (v38)
+
+The safety stack had two axes: the **drawdown breaker** (portfolio value falls X% from peak) and **strategy budgets** (cumulative spend). Neither expresses the most intuitive risk statement — *"strategy X may not HOLD more than 2 ETH (or $5,000 cost basis)"*. Budgets count gross spend, so sells never free room; a buy-sell-buy churn strategy exhausts its budget while holding nothing.
+
+```jsonc
+{ "safety": { "positionCaps": [
+  { "pattern": "playbook:*", "token": "WETH", "maxBaseAmount": 2, "maxCostQuote": 5000 }
+] } }
+```
+
+Position caps count **NET exposure** with the same weighted-average model every P&L surface uses (the cap can never disagree with what `strategy report` shows): buys add, sells subtract with proportional cost release — reduce the position and room comes back. Enforcement runs post-quote in BOTH execution paths (real `executeTrade` and `executePaperTrade` — the dry-run rejects exactly where real would) and throws `POSITION_CAP_EXCEEDED` with current/adding/cap numbers. Three deliberate rules: **sells are never blocked** (refusing an exit because exposure is "too high" would be actively dangerous), untagged manual trades bypass (they answer to the operator-wide USD limits), and scope is per (tag, token) **across chains** — you cap your exposure to an asset, not per-chain bookkeeping. The strategy report's risk section shows cap utilization next to budgets.
+
 #### Circuit breaker — alerts that act, not just notify
 
 A notification at 3am is only useful if someone is awake to read it. Any alert rule can carry `"action": "pause"` — when it fires, the watcher doesn't just notify: it **bulk-pauses every primitive the strategy owns** (orders, schedules, rebalance plans) and emits a critical `strategy.alert.circuit_breaker` notification listing exactly what was paused. The system protects itself first; the operator investigates at a humane hour.

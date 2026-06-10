@@ -61,6 +61,7 @@ export type ErrorCode =
   // spend, and the configured cap — so an operator's next action is unambiguous
   // (resize, wait for the window to roll, or raise the cap).
   | "STRATEGY_BUDGET_EXCEEDED"
+  | "POSITION_CAP_EXCEEDED"
   // Iter20: portfolio drawdown circuit breaker tripped (safety.drawdownCircuitBreaker).
   // The portfolio's current USD value has fallen below peak × (1 - maxDrawdownPct/100),
   // OR the breaker was already tripped from a previous trade and hasn't been reset.
@@ -397,6 +398,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "QUOTE_DEVIATION_EXCEEDED":
     case "POSITION_LIMIT_EXCEEDED":
     case "STRATEGY_BUDGET_EXCEEDED":
+    case "POSITION_CAP_EXCEEDED":
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
     case "ENGINE_LOCKED":
       return 403;

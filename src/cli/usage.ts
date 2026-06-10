@@ -69,6 +69,11 @@ CHAIN & CONFIG
                                        after the write so the change takes effect without restart.
   config push <path> <value> [--json] Append to an array field (--json: action: pushed|noop-already-present)
   config drop <path> <value> [--json] Remove an item from an array field (--json: action: dropped|noop-not-found)
+        v38 positionCaps: safety.positionCaps = [{pattern, token,
+        maxBaseAmount?, maxCostQuote?}] — NET-exposure caps per (strategy,
+        token): buys past the cap reject with POSITION_CAP_EXCEEDED; sells
+        always pass (they reduce exposure and free room). Same weighted-avg
+        model as all P&L surfaces; enforced in real AND paper paths.
   config history [--limit N] [--json]
         v36: every config save records a deduped snapshot (source-tagged:
         which command changed it). The file that controls live safety caps

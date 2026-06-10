@@ -979,6 +979,32 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
     });
   }
 
+  // ── 5a-ter. Per-strategy position caps (v38) ──
+  //
+  // Net-exposure axis: a BUY that would push the strategy's net
+  // holding of the base token past a configured cap rejects with
+  // POSITION_CAP_EXCEEDED. Sells are never blocked (they reduce
+  // exposure). Quote-time amounts are the estimate the cap checks —
+  // the same numbers the budget layer prices.
+  if (
+    ctx.config.safety.positionCaps &&
+    ctx.config.safety.positionCaps.length > 0 &&
+    req.direction === "buy" &&
+    req.strategy
+  ) {
+    const { enforcePositionCap } = await import("./positionCaps.js");
+    enforcePositionCap({
+      strategyTag: req.strategy,
+      direction: "buy",
+      baseToken: baseAddr,
+      baseSymbol: baseSym ?? null,
+      addBaseAmount: parseFloat(formatUnits(baseAmountBn, baseDec)),
+      addCostQuote: parseFloat(formatUnits(quoteAmountBn, quoteDec)),
+      caps: ctx.config.safety.positionCaps,
+      paper: false,
+    });
+  }
+
   // ── 5b. Predictive failure pattern check (iter682) ──
   // Query recent failures (last 7d) for THIS base/quote pair on this chain
   // + account. If a dominant reason has emerged, surface as a warning BEFORE

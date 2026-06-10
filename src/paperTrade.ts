@@ -402,6 +402,27 @@ export async function executePaperTrade(
     effectivePrice,
   });
 
+  // v38: per-strategy position caps — paper twin of executeTrade's
+  // enforcement (the dry-run must reject exactly where real would).
+  if (
+    ctx.config.safety.positionCaps &&
+    ctx.config.safety.positionCaps.length > 0 &&
+    req.direction === "buy" &&
+    req.strategy
+  ) {
+    const { enforcePositionCap } = await import("./positionCaps.js");
+    enforcePositionCap({
+      strategyTag: req.strategy,
+      direction: "buy",
+      baseToken: baseAddr,
+      baseSymbol: baseMeta.symbol ?? null,
+      addBaseAmount: parseFloat(amounts.baseAmount),
+      addCostQuote: parseFloat(amounts.quoteAmount),
+      caps: ctx.config.safety.positionCaps,
+      paper: true,
+    });
+  }
+
   const baseAmountBig = parseUnits(amounts.baseAmount, baseMeta.decimals);
   const quoteAmountBig = parseUnits(amounts.quoteAmount, quoteMeta.decimals);
 

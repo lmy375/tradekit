@@ -438,6 +438,7 @@ describe("buildRisk", () => {
       tag: "playbook:1",
       config: baseConfig,
       drawdownLookup: () => null,
+      isPaper: false,
       spentLookup: (_tag, since) => (since ? 50 : 300),
     });
     expect(risk.budgets).toHaveLength(1);
@@ -453,6 +454,7 @@ describe("buildRisk", () => {
       tag: "rebal-q1",
       config: baseConfig,
       drawdownLookup: () => null,
+      isPaper: false,
       spentLookup: () => 1000,
     });
     expect(risk.budgets).toHaveLength(1);
@@ -476,6 +478,7 @@ describe("buildRisk", () => {
             } as never
           : null,
       spentLookup: () => 0,
+      isPaper: false,
     });
     expect(risk.drawdown).not.toBeNull();
     expect(risk.drawdown!.drawdownPct).toBeCloseTo(5);
@@ -487,6 +490,7 @@ describe("buildRisk", () => {
       tag: "playbook:1",
       config: baseConfig,
       drawdownLookup: () => null,
+      isPaper: false,
       spentLookup: () => 0,
     });
     expect(risk.drawdown).toBeNull();

@@ -955,3 +955,58 @@ describe("runOrderTick — signal triggers", () => {
     expect(() => createOrderRow({ ...base, trigger: "price_below", targetPriceUsd: 100, signalName: "ok" } as never)).toThrow(/only meaningful with trigger="signal"/);
   });
 });
+
+// ── v38: position caps at fire time ──────────────────────────
+
+describe("runOrderTick — position caps", () => {
+  it("a capped strategy's buy rejects at fire time with POSITION_CAP_EXCEEDED", async () => {
+    const { saveConfig, loadConfig: lc } = await import("./config.js");
+    const { recordPaperTrade, getOrderById } = await import("./db.js");
+    const cfg = lc();
+    saveConfig({
+      ...cfg,
+      safety: { ...cfg.safety, positionCaps: [{ pattern: "capped", token: "WETH", maxBaseAmount: 0.6 }] },
+    } as never);
+    try {
+      seedQuoteBalance("10000");
+      // Existing net position: 0.4 WETH under the tag.
+      recordPaperTrade({
+        timestamp: "2026-06-01T00:00:00Z", source_type: "manual", source_id: null,
+        chain: "base", account: "default", direction: "buy",
+        base_token: WETH, base_symbol: "WETH", base_amount: "0.4",
+        quote_token: USDC, quote_symbol: "USDC", quote_amount: "800",
+        price: "2000", slippage_bps: null, strategy: "capped", notes: null,
+      });
+      // This order would buy ~0.5 more (1000 @ ~2000) → 0.9 > 0.6 cap.
+      const id = seedOrder({ paper: true, strategy: "capped", quote_amount: "1000", base_amount: null });
+      const report = await tick();
+      expect(report.filled).toBe(0);
+      const row = getOrderById(id)!;
+      expect(row.status).toBe("failed"); // terminal — retrying would hit the same cap
+      expect(row.last_error_code).toBe("POSITION_CAP_EXCEEDED");
+      expect(row.last_error_message).toMatch(/NET exposure/);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+
+  it("the same strategy's SELL fires fine over-cap", async () => {
+    const { saveConfig, loadConfig: lc } = await import("./config.js");
+    const { recordPaperTrade, setPaperBalance: spb } = await import("./paperTrade.js") as never;
+    void recordPaperTrade; void spb;
+    const { setPaperBalance } = await import("./paperTrade.js");
+    const cfg = lc();
+    saveConfig({
+      ...cfg,
+      safety: { ...cfg.safety, positionCaps: [{ pattern: "capped", token: "WETH", maxBaseAmount: 0.1 }] },
+    } as never);
+    try {
+      setPaperBalance({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "1" });
+      seedOrder({ paper: true, strategy: "capped", side: "sell", base_amount: "1", quote_amount: null });
+      const report = await tick();
+      expect(report.filled).toBe(1); // exits never blocked
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+});
