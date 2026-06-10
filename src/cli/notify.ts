@@ -139,6 +139,48 @@ export async function notifyTestCommand(flags: Record<string, string>) {
 
 // ── dispatcher ───────────────────────────────────────────────
 
+/** `tradekit notify queue` — inspect notifications suppressed by the
+ *  v34 quiet-hours window (pending = not yet flushed). */
+export async function notifyQueueCommand(flags: Record<string, string>) {
+  const { pendingQueuedNotifications } = await import("../db.js");
+  const pending = pendingQueuedNotifications(200);
+  if (flags["json"] === "true") {
+    printJson({ ok: true, count: pending.length, pending });
+    return;
+  }
+  if (pending.length === 0) {
+    console.log("Quiet-hours queue is empty.");
+    return;
+  }
+  console.log(`${pending.length} notification(s) queued during quiet hours:\n`);
+  for (const q of pending) {
+    console.log(`  ${q.queued_at}  [${q.severity}]  ${q.event}  ${q.title}`);
+  }
+  console.log(`\nFlush now: tradekit notify flush`);
+}
+
+/** `tradekit notify flush [--force]` — deliver the suppressed-summary
+ *  now. --force flushes even while the quiet window is still active. */
+export async function notifyFlushCommand(flags: Record<string, string>) {
+  const { flushQueuedNotifications } = await import("../notify.js");
+  const { loadConfig } = await import("../config.js");
+  const { createLogger } = await import("../logger.js");
+  const result = await flushQueuedNotifications(loadConfig(), createLogger({ stderrLevel: "warn" }), {
+    force: flags["force"] === "true",
+  });
+  if (flags["json"] === "true") {
+    printJson({ ok: true, result });
+    return;
+  }
+  if (!result) {
+    console.log("Nothing to flush (queue empty, or quiet hours still active — use --force).");
+  } else if (result.flushed > 0) {
+    console.log(`Flushed ${result.flushed} queued notification(s) as one summary${result.delivered ? "" : " (no channels configured)"}.`);
+  } else {
+    console.log("Flush attempted but summary delivery failed — rows stay queued for retry.");
+  }
+}
+
 export async function notifyCommand(
   action: string | undefined,
   flags: Record<string, string>,
@@ -150,7 +192,13 @@ export async function notifyCommand(
     case "test":
       await notifyTestCommand(flags);
       break;
+    case "queue":
+      await notifyQueueCommand(flags);
+      break;
+    case "flush":
+      await notifyFlushCommand(flags);
+      break;
     default:
-      throw subcommandError("notify", action, ["list", "test"]);
+      throw subcommandError("notify", action, ["list", "test", "queue", "flush"]);
   }
 }

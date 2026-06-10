@@ -317,6 +317,119 @@ export function clearDedupCache(): void {
   dedupCache.clear();
 }
 
+// ── quiet hours (v34) ────────────────────────────────────────
+//
+// Inside the window, sub-breakthrough notifications queue in the
+// v34 notification_queue table and flush as ONE summary when the
+// window ends. Channels with ignoreQuietHours always deliver.
+
+export interface QuietHoursConfig {
+  enabled: boolean;
+  startHourUtc: number;
+  endHourUtc: number;
+  breakthroughSeverity: NotificationSeverity;
+}
+
+/** Pure window predicate. Handles midnight wrap (start > end →
+ *  active from start to midnight AND midnight to end). start === end
+ *  is a degenerate zero-length window — never active (an "all day"
+ *  quiet config should just disable the channel instead). */
+export function inQuietHours(now: Date, cfg: Pick<QuietHoursConfig, "startHourUtc" | "endHourUtc">): boolean {
+  const h = now.getUTCHours();
+  const { startHourUtc: s, endHourUtc: e } = cfg;
+  if (s === e) return false;
+  if (s < e) return h >= s && h < e;
+  return h >= s || h < e;
+}
+
+/** Events that must never be queued: the flush summary itself (would
+ *  recurse) and the daily digest (already time-gated by its own
+ *  hourUtc — queueing it would double-delay). */
+const QUIET_EXEMPT_EVENTS = new Set(["notify.quiet_flush", "digest.daily"]);
+
+function quietHoursConfig(config: Config): QuietHoursConfig | null {
+  const qh = config.notifications?.quietHours;
+  if (!qh || !qh.enabled) return null;
+  return qh;
+}
+
+/** Should this event be suppressed-and-queued right now? Pure given
+ *  (event, config, now); exported for tests. */
+export function shouldQueueForQuietHours(
+  evt: NotificationEvent,
+  config: Config,
+  now: Date = new Date(),
+): boolean {
+  const qh = quietHoursConfig(config);
+  if (!qh) return false;
+  if (QUIET_EXEMPT_EVENTS.has(evt.event)) return false;
+  if (!inQuietHours(now, qh)) return false;
+  return SEVERITY_RANK[evt.severity] < SEVERITY_RANK[qh.breakthroughSeverity];
+}
+
+/**
+ * Flush the queued notifications as ONE summary event. Called
+ * automatically by notify() on the first delivery outside the window,
+ * by the engine digest worker tick, and manually via
+ * `tradekit notify flush`. No-op when the queue is empty or quiet
+ * hours are still active (a manual --force overrides the window).
+ *
+ * Marking: rows flip to flushed when the summary DELIVERED to at
+ * least one channel OR no channels are configured at all (nothing to
+ * wait for). A failed webhook leaves them pending for the next flush
+ * attempt.
+ */
+export async function flushQueuedNotifications(
+  config: Config,
+  logger: Logger,
+  opts: { now?: Date; force?: boolean } = {},
+): Promise<{ flushed: number; delivered: boolean } | null> {
+  const now = opts.now ?? new Date();
+  const qh = quietHoursConfig(config);
+  if (qh && inQuietHours(now, qh) && !opts.force) return null; // still quiet
+  const { pendingQueuedNotifications, markQueuedNotificationsFlushed } = await import("./db.js");
+  const pending = pendingQueuedNotifications(500);
+  if (pending.length === 0) return null;
+
+  const bySeverity = { info: 0, warn: 0, critical: 0 } as Record<NotificationSeverity, number>;
+  for (const q of pending) bySeverity[q.severity] = (bySeverity[q.severity] ?? 0) + 1;
+  const maxSeverity: NotificationSeverity =
+    bySeverity.critical > 0 ? "critical" : bySeverity.warn > 0 ? "warn" : "info";
+
+  const PREVIEW = 15;
+  const lines = pending.slice(-PREVIEW).map((q) => `[${q.severity}] ${q.queued_at.slice(11, 16)}Z ${q.title}`);
+  const omitted = pending.length - Math.min(pending.length, PREVIEW);
+
+  const summary: NotificationEvent = {
+    event: "notify.quiet_flush",
+    severity: maxSeverity,
+    title: `${pending.length} notification(s) suppressed during quiet hours`,
+    body:
+      `${bySeverity.critical} critical · ${bySeverity.warn} warn · ${bySeverity.info} info\n\n` +
+      (omitted > 0 ? `(${omitted} older omitted)\n` : "") +
+      lines.join("\n"),
+    fields: {
+      queued: pending.length,
+      critical: bySeverity.critical,
+      warn: bySeverity.warn,
+      info: bySeverity.info,
+      oldestAt: pending[0]?.queued_at,
+    },
+    dedupKey: `notify.quiet_flush:${pending[0]?.queued_at ?? ""}`,
+  };
+
+  const report = await notify(summary, config, logger);
+  const noChannels = report.channels === 0;
+  const delivered = report.delivered > 0;
+  if (delivered || noChannels) {
+    markQueuedNotificationsFlushed(pending.map((q) => q.id), now.toISOString());
+    logger.info(`quiet-hours flush: ${pending.length} queued notification(s) summarized${noChannels ? " (no channels configured)" : ""}`);
+    return { flushed: pending.length, delivered };
+  }
+  logger.warn(`quiet-hours flush: summary delivery failed — ${pending.length} row(s) stay queued for retry`);
+  return { flushed: 0, delivered: false };
+}
+
 // ── dispatch ─────────────────────────────────────────────────
 
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -329,7 +442,7 @@ export interface DispatchResult {
   /** Per-event reason for skipping: "filtered" (event not allowed by
    *  channel's events[]) | "severity" (below minSeverity) | "disabled"
    *  | "dedup" (within suppress window). Missing on successful sends. */
-  skipped?: "filtered" | "severity" | "disabled" | "dedup";
+  skipped?: "filtered" | "severity" | "disabled" | "dedup" | "quiet_hours";
   error?: string;
   elapsedMs?: number;
 }
@@ -361,12 +474,69 @@ export async function notify(
   config: Config,
   logger: Logger,
 ): Promise<NotifyReport> {
-  const channels = config.notifications?.channels ?? [];
+  const allChannels = config.notifications?.channels ?? [];
   const dedupWindowMs = config.notifications?.dedupWindowMs ?? 60_000;
   const results: DispatchResult[] = [];
-  if (channels.length === 0) {
+  if (allChannels.length === 0) {
     return { event: evt.event, channels: 0, delivered: 0, skipped: 0, failed: 0, results: [] };
   }
+
+  // v34 quiet hours. Outside the window: opportunistically flush any
+  // queued backlog FIRST so the summary lands before (and dated
+  // earlier than) the event that woke us. Inside the window:
+  // sub-breakthrough events queue once (if any non-exempt channel
+  // would have received them) and deliver only to ignoreQuietHours
+  // channels.
+  let channels = allChannels;
+  // Only consult the queue when the feature is on — operators without
+  // quiet hours configured must never pay a DB open from the notify
+  // path (it also keeps unit tests with no data dir hermetic).
+  if (evt.event !== "notify.quiet_flush" && quietHoursConfig(config) != null) {
+    try {
+      const { countPendingQueuedNotifications } = await import("./db.js");
+      if (countPendingQueuedNotifications() > 0) {
+        await flushQueuedNotifications(config, logger);
+      }
+    } catch { /* queue table unavailable (fresh db mid-migration) — never block delivery */ }
+  }
+  if (shouldQueueForQuietHours(evt, config)) {
+    const breakthrough = allChannels.filter((ch) => ch.ignoreQuietHours === true);
+    const suppressed = allChannels.filter((ch) => ch.ignoreQuietHours !== true);
+    // Queue only when a suppressed channel actually subscribes to the
+    // event — otherwise the morning summary reports noise nobody
+    // would have received anyway.
+    const anySubscriber = suppressed.some((ch) => eventMatchesChannel(ch, evt));
+    let suppressionHolds = true;
+    if (anySubscriber) {
+      try {
+        const { enqueueNotification } = await import("./db.js");
+        enqueueNotification({
+          queuedAt: new Date().toISOString(),
+          event: evt.event,
+          severity: evt.severity,
+          title: evt.title,
+          body: evt.body ?? null,
+          fieldsJson: evt.fields ? JSON.stringify(evt.fields) : null,
+          dedupKey: evt.dedupKey ?? null,
+        });
+        logger.debug(`quiet hours: queued "${evt.title}" (${evt.severity})`);
+      } catch (e) {
+        // Fail open: a broken queue must not silently eat notifications.
+        logger.warn(`quiet hours: enqueue failed (${(e as Error).message}) — delivering immediately instead`);
+        suppressionHolds = false;
+      }
+    }
+    if (suppressionHolds) {
+      for (const ch of suppressed) {
+        results.push({ channelName: ch.name, format: detectFormat(ch.url), ok: false, skipped: "quiet_hours" });
+      }
+      channels = breakthrough;
+      if (channels.length === 0) {
+        return { event: evt.event, channels: allChannels.length, delivered: 0, skipped: results.length, failed: 0, results };
+      }
+    }
+  }
+
   // Per-channel dispatch happens in parallel — a slow Slack can't block
   // a fast generic POST. Promise.allSettled so individual failures don't
   // bubble. Each settle path produces a DispatchResult.
@@ -392,7 +562,7 @@ export async function notify(
     else if (r.ok) delivered += 1;
     else failed += 1;
   }
-  return { event: evt.event, channels: channels.length, delivered, skipped, failed, results };
+  return { event: evt.event, channels: allChannels.length, delivered, skipped, failed, results };
 }
 
 async function dispatchOne(

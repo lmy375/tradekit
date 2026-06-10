@@ -89,6 +89,15 @@ TRADING
 
 NOTIFICATIONS (push-delivered alerts)
   notify list [--json]                    Show configured channels + auto-detected format. URLs path-masked
+  notify queue [--json]                   v34: notifications suppressed by quiet hours, pending flush
+  notify flush [--force] [--json]         v34: deliver the suppressed-summary now (--force: even mid-window)
+        Quiet hours: config set notifications.quietHours.enabled true
+        Inside [startHourUtc, endHourUtc) (default 22→07 UTC, wraps midnight),
+        notifications below breakthroughSeverity (default critical) queue
+        instead of delivering — flushed as ONE summary when the window ends
+        (auto on the first post-window event, on the engine digest tick, or
+        manually). Channels with "ignoreQuietHours": true always deliver —
+        set it on the pager channel. Nothing is lost, nobody is woken.
   notify test [--channel NAME] [--event EVT] [--severity info|warn|critical] [--json]
         Dispatch a synthetic event to verify wiring. Returns per-channel ok/skipped/failed report.
         Set up channels via config:

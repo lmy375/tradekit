@@ -453,6 +453,10 @@ const notificationChannelSchema = z
     /** Per-channel timeout override (ms). Default 5000. Tight cap so a hung
      *  webhook can't slow the engine more than a few seconds per tick. */
     timeoutMs: z.number().int().min(100).max(30_000).optional(),
+    /** v34: this channel delivers even during quiet hours. Set on the
+     *  pager/on-call channel so critical-adjacent routing is unaffected
+     *  by the global quiet window. */
+    ignoreQuietHours: z.boolean().optional(),
   })
   .strict();
 
@@ -480,12 +484,29 @@ const notificationsSchema = z
       })
       .strict()
       .default({ enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" }),
+    /** v34: quiet hours. Inside the window [startHourUtc, endHourUtc)
+     *  (wraps midnight when start > end), notifications BELOW
+     *  breakthroughSeverity are not delivered — they queue in
+     *  notification_queue and flush as ONE summary when the window
+     *  ends (nothing is lost, nobody is woken). Channels with
+     *  ignoreQuietHours: true always deliver. The daily digest and
+     *  the flush summary itself are exempt. */
+    quietHours: z
+      .object({
+        enabled: z.boolean().default(false),
+        startHourUtc: z.number().int().min(0).max(23).default(22),
+        endHourUtc: z.number().int().min(0).max(23).default(7),
+        breakthroughSeverity: z.enum(["info", "warn", "critical"]).default("critical"),
+      })
+      .strict()
+      .default({ enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" }),
   })
   .strict()
   .default({
     channels: [],
     dedupWindowMs: 60_000,
     digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" },
+    quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" },
   });
 
 // ── engine (unified supervisor) ──────────────────────────────
@@ -794,6 +815,8 @@ const dbRetentionSchema = z
     /** Days to keep alert_events (v28 strategy-alert transition journal).
      *  NULL = never prune. */
     alertEventsDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** v34: quiet-hours notification queue (flushed + ancient rows). */
+    notificationQueueDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep schedule_check_log (v29). NULL = never prune. */
     scheduleCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep rebalance_check_log (v29). NULL = never prune. */
@@ -812,6 +835,7 @@ const dbRetentionSchema = z
     orderCheckLogDays: null,
     engineEventsDays: null,
     alertEventsDays: null,
+    notificationQueueDays: null,
     scheduleCheckLogDays: null,
     rebalanceCheckLogDays: null,
     failedTradesDays: null,
@@ -860,6 +884,7 @@ const dbSchema = z
       orderCheckLogDays: null,
       engineEventsDays: null,
       alertEventsDays: null,
+      notificationQueueDays: null,
       scheduleCheckLogDays: null,
       rebalanceCheckLogDays: null,
       failedTradesDays: null,

@@ -163,7 +163,7 @@ describe("auditAllowanceList (iter606)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
-    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const } },
+    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
       workers: {
         orders: { enabled: true, intervalMs: 30_000 },
@@ -190,6 +190,7 @@ describe("auditAllowanceList (iter606)", () => {
         orderCheckLogDays: null,
         engineEventsDays: null,
         alertEventsDays: null,
+      notificationQueueDays: null,
         scheduleCheckLogDays: null,
         rebalanceCheckLogDays: null,
         failedTradesDays: null,
@@ -317,7 +318,7 @@ describe("approval freshness signal (iter617)", () => {
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
     safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false },
-    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const } },
+    notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
       workers: {
         orders: { enabled: true, intervalMs: 30_000 },
@@ -344,6 +345,7 @@ describe("approval freshness signal (iter617)", () => {
         orderCheckLogDays: null,
         engineEventsDays: null,
         alertEventsDays: null,
+      notificationQueueDays: null,
         scheduleCheckLogDays: null,
         rebalanceCheckLogDays: null,
         failedTradesDays: null,

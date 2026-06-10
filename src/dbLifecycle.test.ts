@@ -57,6 +57,7 @@ const defaultDb: DbConfig = {
     orderCheckLogDays: null,
     engineEventsDays: null,
     alertEventsDays: null,
+      notificationQueueDays: null,
     scheduleCheckLogDays: null,
     rebalanceCheckLogDays: null,
     failedTradesDays: null,

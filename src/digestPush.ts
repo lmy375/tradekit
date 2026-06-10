@@ -66,6 +66,17 @@ export async function runDigestPushTick(args: {
   /** Marker file override (tests). */
   markerPath?: string;
 }): Promise<DigestPushReport> {
+  // v34: the digest worker doubles as the quiet-hours flush heartbeat —
+  // if the morning is uneventful (no notify() call to trigger the
+  // opportunistic flush), this tick delivers the suppressed-summary
+  // shortly after the window ends. Best-effort; never blocks the digest.
+  if (args.config.notifications?.quietHours?.enabled) {
+    try {
+      const { flushQueuedNotifications } = await import("./notify.js");
+      await flushQueuedNotifications(args.config, args.logger, { now: args.now });
+    } catch { /* never block the digest on a flush hiccup */ }
+  }
+
   const cfg = args.config.notifications.digest;
   if (!cfg?.enabled) return { skipped: true, reason: "notifications.digest.enabled=false" };
 

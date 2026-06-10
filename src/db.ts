@@ -1152,6 +1152,25 @@ const MIGRATIONS: string[] = [
   ALTER TABLE schedules ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE rebalance_plans ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
   `,
+
+  // v34 — quiet-hours notification queue. Inside the configured quiet
+  // window, sub-breakthrough notifications are NOT delivered — they
+  // queue here and flush as ONE summary when the window ends. Nothing
+  // is lost, nobody is woken. flushed_at NULL = pending.
+  `
+  CREATE TABLE IF NOT EXISTS notification_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    queued_at   TEXT NOT NULL,
+    event       TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT,
+    fields_json TEXT,
+    dedup_key   TEXT,
+    flushed_at  TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_notification_queue_pending ON notification_queue (flushed_at, queued_at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -5260,6 +5279,74 @@ export function pruneAlertEvents(beforeIso: string): number {
   const db = openDb();
   const r = db.prepare(`DELETE FROM alert_events WHERE at < ?`).run(beforeIso);
   return Number(r.changes ?? 0);
+}
+
+// ── notification queue (v34 quiet hours) ────────────────────
+
+export interface QueuedNotificationRow {
+  id: number;
+  queued_at: string;
+  event: string;
+  severity: "info" | "warn" | "critical";
+  title: string;
+  body: string | null;
+  fields_json: string | null;
+  dedup_key: string | null;
+  flushed_at: string | null;
+}
+
+export function enqueueNotification(args: {
+  queuedAt: string;
+  event: string;
+  severity: "info" | "warn" | "critical";
+  title: string;
+  body?: string | null;
+  fieldsJson?: string | null;
+  dedupKey?: string | null;
+}): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO notification_queue (queued_at, event, severity, title, body, fields_json, dedup_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(args.queuedAt, args.event, args.severity, args.title, args.body ?? null, args.fieldsJson ?? null, args.dedupKey ?? null);
+  return Number(r.lastInsertRowid);
+}
+
+export function pendingQueuedNotifications(limit = 200): QueuedNotificationRow[] {
+  const db = openDb();
+  return db
+    .prepare(
+      `SELECT * FROM notification_queue WHERE flushed_at IS NULL ORDER BY queued_at ASC LIMIT ?`,
+    )
+    .all(limit) as unknown as QueuedNotificationRow[];
+}
+
+export function countPendingQueuedNotifications(): number {
+  const db = openDb();
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM notification_queue WHERE flushed_at IS NULL`)
+    .get() as { n: number };
+  return row.n;
+}
+
+export function markQueuedNotificationsFlushed(ids: number[], flushedAt: string): number {
+  if (ids.length === 0) return 0;
+  const db = openDb();
+  const stmt = db.prepare(`UPDATE notification_queue SET flushed_at = ? WHERE id = ? AND flushed_at IS NULL`);
+  let n = 0;
+  for (const id of ids) n += Number(stmt.run(flushedAt, id).changes);
+  return n;
+}
+
+/** Retention prune — drops rows older than the cutoff regardless of
+ *  flush state (an ancient unflushed row means the operator disabled
+ *  notifications entirely; keeping it forever serves nobody). */
+export function pruneNotificationQueue(cutoffIso: string): number {
+  const db = openDb();
+  const r = db.prepare(`DELETE FROM notification_queue WHERE queued_at < ?`).run(cutoffIso);
+  return Number(r.changes);
 }
 
 // ── schedule_check_log + rebalance_check_log (v29) ───────────

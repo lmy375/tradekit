@@ -1812,6 +1812,22 @@ tradekit notify test --channel ops-slack
 
 **Dedup** — `config.notifications.dedupWindowMs` (default 60s) suppresses identical `(channel, dedupKey)` pairs within the window. A repeatedly-failing order produces one alert per minute, not one per tick.
 
+**Quiet hours (v34) — nothing lost, nobody woken.** Severity routing has no time dimension: an info-level `schedule.fired` at 3am is noise, but muting the channel overnight also mutes the 3am `circuit_breaker`. `notifications.quietHours` adds the time axis:
+
+```jsonc
+{
+  "notifications": {
+    "quietHours": { "enabled": true, "startHourUtc": 22, "endHourUtc": 7, "breakthroughSeverity": "critical" },
+    "channels": [
+      { "name": "ops-slack", "url": "https://hooks.slack.com/..." },
+      { "name": "pager", "url": "https://...", "minSeverity": "critical", "ignoreQuietHours": true }
+    ]
+  }
+}
+```
+
+Inside the window (wraps midnight when `start > end`), notifications below `breakthroughSeverity` are **queued, not dropped** — they land in the v34 `notification_queue` table and flush as **one summary notification** when the window ends ("12 suppressed during quiet hours: 1 critical · 4 warn · 7 info" plus the last 15 titles, carrying the max severity of the batch). Three flush triggers: the first post-window delivery (opportunistic, so the summary lands before the event that woke the channel), the engine digest worker tick (covers uneventful mornings), and `tradekit notify flush` (`--force` flushes mid-window). `breakthroughSeverity` events always deliver immediately, as does any channel with `ignoreQuietHours: true` — the pager pattern. Failure honesty: if the summary webhook fails, rows stay queued for the next attempt; if the enqueue itself fails, the notification delivers immediately (fail open — a broken queue must never eat alerts). Inspect with `notify queue`; prune via `db.retention.notificationQueueDays`.
+
 **Reliability invariant** — Webhook delivery is **best-effort and never throws out of a trade or engine tick**. A Slack outage cannot block a fill. All failures land in `~/.tradekit/server.log` for after-the-fact triage.
 
 **Security** — Webhook URLs embed bearer tokens in the path. They are redacted everywhere they could leak: `notify list`, `config show` (use `--show-secrets` for the raw value), the audit log, and MCP `notify_list`. Only the on-disk config holds the raw value (mode 0600).

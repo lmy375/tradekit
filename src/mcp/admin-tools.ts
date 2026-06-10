@@ -1367,8 +1367,21 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
             const { detectFormat } = await import("../notify.js");
             const cfg = rt.getConfig();
             const channels = cfg.notifications?.channels ?? [];
+            // v34: quiet-hours state + queued backlog (only consulted
+            // when the feature is on — keeps the tool DB-free otherwise).
+            let quietHours: Record<string, unknown> | undefined;
+            if (cfg.notifications?.quietHours?.enabled) {
+              const { countPendingQueuedNotifications } = await import("../db.js");
+              const { inQuietHours } = await import("../notify.js");
+              quietHours = {
+                ...cfg.notifications.quietHours,
+                activeNow: inQuietHours(new Date(), cfg.notifications.quietHours),
+                pendingQueued: countPendingQueuedNotifications(),
+              };
+            }
             return {
               dedupWindowMs: cfg.notifications?.dedupWindowMs ?? 60_000,
+              quietHours,
               summary: {
                 total: channels.length,
                 enabled: channels.filter((c) => c.enabled).length,
