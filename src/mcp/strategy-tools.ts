@@ -37,6 +37,7 @@ import {
 } from "../backtest.js";
 import {
   insertBacktestRun,
+  listSignalEvents,
 } from "../db.js";
 import {
   parseScenariosFile,
@@ -651,11 +652,22 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
       chain: z.string().optional().describe("Chain (default: spec.chain or active chain)."),
       base: z.string().optional().describe("Override base symbol; default inferred from the playbook's first non-rebalance strategy."),
       quote: z.string().optional().describe("Override quote symbol; default inferred from the playbook's first non-rebalance strategy."),
+      signals: z
+        .array(z.object({
+          name: z.string().describe("Signal name (matches the order's signal_name)."),
+          at: z.string().describe("ISO-8601 arrival time. Signals before the series window never fire (order wasn't armed)."),
+        }))
+        .optional()
+        .describe("v39.5: signal history to replay for signal-triggered entries — hypothetical, or recorded. Providing this (even empty) lifts the signal-entry rejection. Mutually composable with signals_from_history (merged)."),
+      signals_from_history: z
+        .boolean()
+        .default(false)
+        .describe("v39.5: replay the v35 signal_events inbox — \"with the alerts I actually received, how would this have done?\". Pulls every recorded signal inside the price window."),
     },
-    async ({ spec, vars, balance, since, chain, base, quote }) => {
+    async ({ spec, vars, balance, since, chain, base, quote, signals, signals_from_history }) => {
       try {
         return ok(
-          await runTool("backtest_playbook", rt.opts, { spec, vars, balance, since, chain, base, quote }, chain, async () => {
+          await runTool("backtest_playbook", rt.opts, { spec, vars, balance, since, chain, base, quote, signals, signals_from_history }, chain, async () => {
             const parsed = renderAndParse(spec, vars as Record<string, VarValue> | undefined);
             const config = rt.getConfig();
             const chainName = chain ?? parsed.chain ?? config.activeChain;
@@ -682,7 +694,16 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
             const initialBalance: SymbolBalance = Object.fromEntries(
               Object.entries(balance).map(([k, v]) => [k.toUpperCase(), v]),
             );
-            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series });
+            let simSignals = signals as Array<{ name: string; at: string }> | undefined;
+            if (signals_from_history) {
+              const windowStart = series.points[0]?.ts ?? new Date(0).toISOString();
+              const recorded = listSignalEvents({ since: windowStart, limit: 10_000 }).map((e) => ({
+                name: e.name,
+                at: e.received_at,
+              }));
+              simSignals = [...(simSignals ?? []), ...recorded];
+            }
+            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series, signals: simSignals });
             const rowId = insertBacktestRun({
               strategyType: "playbook",
               chain: profile.name,

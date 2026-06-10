@@ -3946,13 +3946,17 @@ export function consumeSignalEvent(id: number, consumedAt: string, byOrder: numb
   return Number(r.changes);
 }
 
-export function listSignalEvents(filter: { name?: string; limit?: number } = {}): SignalEventRow[] {
+export function listSignalEvents(filter: { name?: string; limit?: number; since?: string } = {}): SignalEventRow[] {
   const db = openDb();
   const args: unknown[] = [];
   let sql = `SELECT * FROM signal_events WHERE 1=1`;
   if (filter.name) {
     sql += " AND name = ?";
     args.push(filter.name);
+  }
+  if (filter.since) {
+    sql += " AND received_at >= ?";
+    args.push(filter.since);
   }
   sql += " ORDER BY received_at DESC LIMIT ?";
   args.push(filter.limit ?? 50);

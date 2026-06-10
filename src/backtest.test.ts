@@ -1336,3 +1336,144 @@ describe("simulatePlaybook — percentage scale-out", () => {
     expect(r.finalBalance["USDC"]).toBeCloseTo(2700, 6);
   });
 });
+
+// ── v39.5: signal-history replay ─────────────────────────────
+
+describe("simulatePlaybook — signal replay", () => {
+  const entry = {
+    id: "breakout", type: "order", side: "buy", trigger: "signal", signalName: "tv-breakout",
+    base: "ETH", quote: "USDC", quoteAmount: 1000,
+  };
+  const sigSpec = (over: Record<string, unknown> = {}) =>
+    parsePlaybookSpec({ name: "sig-replay", strategies: [{ ...entry, ...over }] });
+
+  it("fires at the FIRST price point at-or-after the signal arrival", () => {
+    // Signal lands 00:30; next datapoint is 01:00 @2100 — the sim twin
+    // of "the next engine tick after the webhook".
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100, 2200]);
+    const r = simulatePlaybook({
+      spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-04-01T00:30:00Z" }],
+    });
+    const fills = r.fires.filter((f) => f.multiAction === "fill");
+    expect(fills.length).toBe(1);
+    expect(fills[0].ts).toBe("2026-04-01T01:00:00.000Z");
+    expect(fills[0].priceUsd).toBe(2100);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0, 6);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(1000 / 2100, 9);
+    expect(r.perStrategy[0].finalStatus).toBe("filled");
+  });
+
+  it("a signal BEFORE the series window is stale and never fires (armed-from rule)", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100, 2200]);
+    const r = simulatePlaybook({
+      spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-03-31T23:59:00Z" }],
+    });
+    expect(r.fires.filter((f) => f.multiAction === "fill").length).toBe(0);
+    expect(r.perStrategy[0].finalStatus).toBe("active");
+    expect(r.notes.some((n) => /never triggered/.test(n))).toBe(true);
+  });
+
+  it("non-matching signal name never fires; matching name at window start fires at point 0", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100]);
+    const miss = simulatePlaybook({
+      spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-other", at: "2026-04-01T00:00:00Z" }],
+    });
+    expect(miss.fires.filter((f) => f.multiAction === "fill").length).toBe(0);
+
+    const hit = simulatePlaybook({
+      spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-04-01T00:00:00Z" }],
+    });
+    const fills = hit.fires.filter((f) => f.multiAction === "fill");
+    expect(fills.length).toBe(1);
+    expect(fills[0].priceUsd).toBe(2000);
+  });
+
+  it("EMPTY signals array engages replay mode — no rejection, entry just never fires", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100]);
+    const r = simulatePlaybook({
+      spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [],
+    });
+    expect(r.perStrategy[0].finalStatus).toBe("active");
+  });
+
+  it("OMITTING signals keeps the teaching rejection, now pointing at the replay flag", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100]);
+    expect(() =>
+      simulatePlaybook({
+        spec: sigSpec(), baseSymbol: "ETH", quoteSymbol: "USDC",
+        initialBalance: { ETH: 0, USDC: 1000 }, series,
+      }),
+    ).toThrow(/signals-from-history/);
+  });
+
+  it("one signal fires every eligible listener on the same name (live tick semantics)", () => {
+    const spec = parsePlaybookSpec({
+      name: "two-listeners",
+      strategies: [
+        { ...entry, id: "a", quoteAmount: 400 },
+        { ...entry, id: "b", quoteAmount: 600 },
+      ],
+    });
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100, 2200]);
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-04-01T00:30:00Z" }],
+    });
+    const fills = r.fires.filter((f) => f.multiAction === "fill");
+    expect(fills.map((f) => f.strategyId).sort()).toEqual(["a", "b"]);
+    // Both fired the same tick @2100.
+    expect(fills.every((f) => f.priceUsd === 2100)).toBe(true);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(1000 / 2100, 9);
+  });
+
+  it("signal entry + on_fill bracket: the alert buys, the bracket manages the exit", () => {
+    // Signal buys 1000 USDC @2000 (00:30 alert → 01:00 tick) → spawns
+    // TP(2600)/SL(1500); price runs to 2700 → TP fires, SL cascaded.
+    const spec = sigSpec({
+      onFill: {
+        type: "createOrders",
+        specs: [
+          { side: "sell", trigger: "price_above", price: 2600, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+          { side: "sell", trigger: "price_below", price: 1500, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+        ],
+      },
+    });
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2000, 2700, 2700]);
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-04-01T00:30:00Z" }],
+    });
+    const tp = r.perStrategy.find((s) => s.strategyId === "breakout:hook#1.1")!;
+    const sl = r.perStrategy.find((s) => s.strategyId === "breakout:hook#1.2")!;
+    expect(tp.finalStatus).toBe("filled");
+    expect(sl.finalStatus).toBe("cancelled");
+    // 1000 → 0.5 ETH @2000 → sold @2700 = 1350, flat ETH.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(1350, 6);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+  });
+
+  it("expired-before-signal entry never fires even with a matching signal", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2100, 2200]);
+    const r = simulatePlaybook({
+      spec: sigSpec({ expiresAt: "2026-04-01T00:30:00Z" }),
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      signals: [{ name: "tv-breakout", at: "2026-04-01T01:30:00Z" }],
+    });
+    expect(r.fires.filter((f) => f.multiAction === "fill").length).toBe(0);
+    // Expiry parks orders as "cancelled" in the sim (established semantics).
+    expect(r.perStrategy[0].finalStatus).toBe("cancelled");
+  });
+});

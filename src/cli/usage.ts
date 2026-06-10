@@ -647,7 +647,7 @@ PLAYBOOKS (declarative strategy bundles)
         can bundle a signal-armed entry with its brackets/schedules. signalName
         is NOT pb-namespaced (the external alert name is global; several
         playbooks listening to one signal is a feature). Signal entries are
-        rejected by playbook BACKTESTS (no signal history) with a clear message.
+        replayed by playbook BACKTESTS against recorded history (--signals-from-history); rejected when no history is provided.
         Schedule entries can declare post-fill hooks inline ("onFill": {"type":"createOrder",
         "spec": {...}} or multi-leg {"type":"createOrders","specs":[...]} — same shape as
         schedule create --on-fill, {{filled.X}} placeholders supported); validated
@@ -713,7 +713,7 @@ BACKTESTING (historical strategy simulation)
   backtest playbook <file>
                     --balance '{"ETH":1,"USDC":3000}'
                     --since 30d [--chain X] [--base ETH] [--quote USDC] [--json]
-                    [--var NAME=VALUE ...] [--vars-file FILE]
+                    [--var NAME=VALUE ...] [--vars-file FILE] [--signals-from-history]
         Replay a FULL playbook spec (multiple orders + schedules) against one shared price
         series with a shared simulated balance. OCO cascade fires during simulation —
         when a peer fills, the rest of the group transitions to cancelled. Schedule
@@ -725,6 +725,11 @@ BACKTESTING (historical strategy simulation)
         single-strategy commands. Base/quote inferred from the first non-rebalance
         strategy when --base / --quote aren't passed.
         Templates supported: --var / --vars-file work identically to 'playbook deploy'.
+        Signal-triggered entries replay against RECORDED signal history with
+        --signals-from-history ("with the alerts I actually received, how would this
+        have done?") — each entry fires at the first datapoint at-or-after a matching
+        arrival in the signal inbox; without the flag they stay rejected (no history
+        to replay is a guess, not a simulation).
   backtest rebalance --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]'
                      [--drift-threshold 5] [--min-trade-usd 10] [--cron "..."|--every 6h]
                      [--quote-token USDC] [--slippage-bps N] [--max-runs N]

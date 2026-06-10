@@ -606,12 +606,30 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
     );
   }
 
+  // v39.5: replay recorded signal history against signal-triggered
+  // entries — "with the TradingView alerts I actually received, how
+  // would this strategy have done?". Signals are pulled from the v35
+  // inbox, clipped to the series window inside the simulator.
+  let signals: Array<{ name: string; at: string }> | undefined;
+  if (flags["signals-from-history"] === "true") {
+    const { listSignalEvents } = await import("../db.js");
+    const windowStart = series.points[0]?.ts ?? new Date(0).toISOString();
+    signals = listSignalEvents({ since: windowStart, limit: 10_000 }).map((e) => ({
+      name: e.name,
+      at: e.received_at,
+    }));
+    if (signals.length === 0 && flags["json"] !== "true") {
+      console.log(`⚠ --signals-from-history: no recorded signals in the backtest window (since ${windowStart}) — signal-triggered entries will never fire.`);
+    }
+  }
+
   const result = simulatePlaybook({
     spec,
     baseSymbol,
     quoteSymbol,
     initialBalance,
     series,
+    signals,
   });
 
   // Persist into backtest_runs as strategy_type='playbook'.

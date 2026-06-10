@@ -177,7 +177,8 @@ export interface BacktestResult {
 
 export interface OrderBacktestSpec {
   side: OrderSide;
-  /** Signal triggers are not backtestable (no signal history) —
+  /** Signal triggers replay only at the PLAYBOOK level (simulatePlaybook
+   *  signals[]) where history can be provided; single-order mode —
    *  the CLI/MCP validators reject them before reaching here. */
   trigger: Exclude<OrderTrigger, "signal">;
   /** Required for price_below / price_above. For trailing, this is the
@@ -690,15 +691,50 @@ export interface PlaybookBacktestResult {
  *  reuses the production trigger predicates (isOrderTriggered,
  *  evaluateTrailingTrigger, matchesAt) so behavior matches the live
  *  engine. */
+/** v39.5: a recorded (or hypothetical) signal arrival for replay.
+ *  In production these come from the v35 signal_events inbox —
+ *  "how would my strategy have done with the alerts I actually
+ *  received?". */
+export interface SimSignal {
+  name: string;
+  /** ISO arrival time. Signals before the series start are STALE
+   *  (the order wasn't armed yet) and never fire — same semantics
+   *  as the live engine's armed-from rule. */
+  at: string;
+}
+
 export function simulatePlaybook(args: {
   spec: PlaybookSpec;
   baseSymbol: string;
   quoteSymbol: string;
   initialBalance: SymbolBalance;
   series: PriceSeries;
+  /** v39.5: recorded signal history. REQUIRED for specs containing
+   *  signal-triggered entries — without it they stay rejected (no
+   *  history to replay is not a simulation, it's a guess). */
+  signals?: SimSignal[];
 }): PlaybookBacktestResult {
   const { spec, baseSymbol, quoteSymbol, initialBalance, series } = args;
-  validatePlaybookForBacktest(spec, baseSymbol, quoteSymbol);
+  // Replay mode engages when a history is PROVIDED, even if empty —
+  // "no alerts arrived, the entry never fires" is a legitimate
+  // simulation answer, not a validation error.
+  validatePlaybookForBacktest(spec, baseSymbol, quoteSymbol, { signalsProvided: args.signals != null });
+  // Normalize signal times to canonical ISO before comparing — the
+  // series carries `toISOString()` stamps ("…00.000Z") and a raw
+  // lexicographic compare against second-precision input ("…00Z")
+  // silently misorders ('Z' > '.'). Then drop stale-before-armed
+  // signals: only arrivals at/after the series start are eligible
+  // (every sim order is armed at t0).
+  const windowStart = series.points[0]?.ts ?? "";
+  const simSignals = (args.signals ?? [])
+    .map((s) => {
+      const t = Date.parse(s.at);
+      if (!Number.isFinite(t)) {
+        throw new ToolError("INVALID_PARAMS", `signals[]: "${s.at}" is not a valid ISO-8601 time (signal "${s.name}").`);
+      }
+      return { name: s.name, at: new Date(t).toISOString() };
+    })
+    .filter((s) => s.at >= windowStart);
 
   // Build per-strategy state. Local ids preserve the operator's `id`
   // field when present, fall back to "strategies[N]" otherwise — same
@@ -718,7 +754,7 @@ export function simulatePlaybook(args: {
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
       if (st.type === "order") {
-        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes });
+        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes, signals: simSignals });
       }
     }
     for (const st of states) {
@@ -852,6 +888,7 @@ function evaluateOrderTick(args: {
   states: StrategyState[];
   fires: PlaybookBacktestFire[];
   notes: string[];
+  signals?: SimSignal[];
 }): void {
   const { state, pt, balance, baseSymbol, quoteSymbol, states, fires, notes } = args;
   // Optional expires_at — drop the order without firing if past.
@@ -862,7 +899,16 @@ function evaluateOrderTick(args: {
     }
   }
   let triggered = false;
-  if (state.spec.trigger === "trailing") {
+  if (state.spec.trigger === "signal") {
+    // v39.5: fire at the FIRST price point at-or-after a matching
+    // recorded signal — the sim twin of "the next engine tick after
+    // the webhook landed". The order fires once; later signals on
+    // the same name are moot for it (matches live semantics).
+    triggered = (args.signals ?? []).some(
+      (s) => s.name === state.spec.signalName && s.at <= pt.ts,
+    );
+    if (!triggered) return;
+  } else if (state.spec.trigger === "trailing") {
     const view: TrailingOrderView = {
       side: state.spec.side,
       trigger_type: "trailing",
@@ -1099,6 +1145,7 @@ function validatePlaybookForBacktest(
   spec: PlaybookSpec,
   baseSymbol: string,
   quoteSymbol: string,
+  opts: { signalsProvided?: boolean } = {},
 ): void {
   const errors: string[] = [];
   let hasRebalance = false;
@@ -1110,9 +1157,12 @@ function validatePlaybookForBacktest(
       errors.push(`${prefix}: rebalance plans aren't supported in playbook backtest (intrinsically multi-asset)`);
       continue;
     }
-    // v37: signal triggers have no history to replay against.
-    if (s.type === "order" && s.trigger === "signal") {
-      errors.push(`${prefix}: signal-triggered orders aren't backtestable (no signal history) — replace with a price trigger for simulation, or backtest the rest of the bundle without it`);
+    // v37: signal triggers need history to replay against. v39.5:
+    // recorded (or hypothetical) signals lift the restriction —
+    // without them the rejection stands (no history is not a
+    // simulation, it's a guess).
+    if (s.type === "order" && s.trigger === "signal" && !opts.signalsProvided) {
+      errors.push(`${prefix}: signal-triggered orders need signal history to replay — pass --signals-from-history (or signals[] via MCP), or replace with a price trigger`);
       continue;
     }
     if (s.base.toUpperCase() !== baseSymbol.toUpperCase() && !(baseSymbol.toUpperCase() === "ETH" && s.base.toUpperCase() === "ETH")) {

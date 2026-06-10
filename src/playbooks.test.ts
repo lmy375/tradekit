@@ -1001,7 +1001,7 @@ describe("playbooks — signal-triggered orders", () => {
           { ts: "2026-04-02T00:00:00Z", priceUsd: 2000 },
         ] },
       }),
-    ).toThrow(/signal-triggered orders aren't backtestable/);
+    ).toThrow(/signal-triggered orders need signal history/);
   });
 
   it("replace classifies a signalName change as RECREATE (trigger identity)", async () => {
