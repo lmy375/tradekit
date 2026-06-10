@@ -296,6 +296,25 @@ export function buildBuiltinWorkers(config: Config): Worker[] {
       },
     });
   }
+  if (cfg.snapshot.enabled) {
+    // v37: equity-snapshot worker — the data feed for the equity
+    // curve. Ticks hourly but only records when the freshest
+    // engine-auto snapshot is older than engine.snapshotEveryHours.
+    // Read-only (account addresses, no keystore).
+    out.push({
+      name: "snapshot",
+      intervalMs: cfg.snapshot.intervalMs,
+      async tick(ctx) {
+        try {
+          const { runSnapshotTick } = await import("./snapshotWorker.js");
+          const report = await runSnapshotTick({ config: ctx.config, logger: ctx.logger });
+          return { ok: true, data: report };
+        } catch (e) {
+          return { ok: false, error: (e as Error).message ?? String(e) };
+        }
+      },
+    });
+  }
   if (cfg.db_maintenance.enabled) {
     // Iter40: db_maintenance worker — runs integrity check +
     // retention prune + auto-backup on internally-tracked cadences
@@ -404,7 +423,7 @@ export async function runEngineSupervisor(opts: SupervisorOptions): Promise<Supe
 
   // Refuse to start a signing worker without a password (unless dry-run).
   // reconcile + alerts are read-only — both safe without a password.
-  const READ_ONLY_WORKERS = new Set<EngineWorkerName>(["reconcile", "alerts", "db_maintenance", "digest"]);
+  const READ_ONLY_WORKERS = new Set<EngineWorkerName>(["reconcile", "alerts", "db_maintenance", "digest", "snapshot"]);
   const requiresPassword = !opts.dryRun && workers.some((w) => !READ_ONLY_WORKERS.has(w.name));
   if (requiresPassword && !opts.password) {
     lock.release();

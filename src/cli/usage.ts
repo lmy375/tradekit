@@ -375,6 +375,16 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy list [--chain X] [--account L] [--json]
         Alias for \`strategies list\` — surfaces every distinct strategy tag in the
         trades table with fill counts and last-seen timestamps.
+  equity [--accounts-key X] [--chains-key Y] [--since 30d|ISO] [--json]
+        v37: the equity curve — total portfolio USD over time, from
+        portfolio_snapshots (pure DB read; sparkline + change/peak/max-drawdown).
+        Data feed: enable the engine snapshot worker (records one auto-snapshot
+        per engine.snapshotEveryHours, default daily):
+          tradekit config set engine.workers.snapshot.enabled true
+        (the init --observability preset enables it). Manual \`tradekit snapshot\`
+        rows contribute too. Scope-disciplined: one accounts×chains scope per
+        curve (mixing scopes would jump on coverage, not value); defaults to
+        the most-snapshotted scope.
   runway [--chain X] [--account L] [--strategy TAG] [--days N] [--json]
         Funding-runway forecast: will my automation run out of money, and WHEN?
         Walks every active schedule's upcoming cron fires (respecting end-at +

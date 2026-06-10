@@ -2359,6 +2359,8 @@ export function listPortfolioSnapshots(filter: {
   limit?: number;
   accountsKey?: string;
   chainsKey?: string;
+  /** v37: inclusive lower bound on timestamp. */
+  since?: string;
 }): Omit<PortfolioSnapshotRow, "data">[] {
   const db = openDb();
   const args: unknown[] = [];
@@ -2371,12 +2373,39 @@ export function listPortfolioSnapshots(filter: {
     sql += " AND chains_key = ?";
     args.push(filter.chainsKey);
   }
+  if (filter.since != null) {
+    sql += " AND timestamp >= ?";
+    args.push(filter.since);
+  }
   sql += " ORDER BY timestamp DESC";
   if (filter.limit != null) {
     sql += " LIMIT ?";
     args.push(filter.limit);
   }
   return db.prepare(sql).all(...(args as never[])) as unknown as Omit<PortfolioSnapshotRow, "data">[];
+}
+
+/** v37: distinct snapshot scopes with counts — feeds the equity
+ *  curve's scope picker + default-scope selection (the curve only
+ *  makes sense within ONE scope; mixing scan scopes makes the line
+ *  jump on coverage, not value). */
+export function listSnapshotScopes(): Array<{
+  accounts_key: string;
+  chains_key: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+}> {
+  const db = openDb();
+  return db
+    .prepare(
+      `SELECT accounts_key, chains_key, COUNT(*) AS count,
+              MIN(timestamp) AS firstAt, MAX(timestamp) AS lastAt
+         FROM portfolio_snapshots
+        GROUP BY accounts_key, chains_key
+        ORDER BY count DESC, lastAt DESC`,
+    )
+    .all() as unknown as Array<{ accounts_key: string; chains_key: string; count: number; firstAt: string; lastAt: string }>;
 }
 
 /**

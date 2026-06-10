@@ -40,6 +40,9 @@ export function applyObservabilityPreset(config: Config): { config: Config; chan
   if (!next.engine.rebalanceJournal.enabled) {
     set("engine.rebalanceJournal.enabled", true, "engine.rebalanceJournal.enabled = true   (drift history)");
   }
+  if (!next.engine.workers.snapshot.enabled) {
+    set("engine.workers.snapshot.enabled", true, "engine.workers.snapshot.enabled = true   (daily equity-curve snapshot)");
+  }
 
   if (!next.db.retention.enabled) {
     set("db.retention.enabled", true, "db.retention.enabled = true");

@@ -583,6 +583,13 @@ async function main() {
         break;
       }
 
+      // Equity curve from portfolio snapshots (pure DB read).
+      case "equity": {
+        const { equityCommand } = await import("./cli/equity.js");
+        await equityCommand(flags);
+        break;
+      }
+
       // Emergency stop: engine lock + pause everything in one command.
       // CLI-only by design (no MCP exposure — same safety boundary as
       // backup).
@@ -738,7 +745,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

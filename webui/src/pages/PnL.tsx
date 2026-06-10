@@ -9,8 +9,56 @@ import {
   Stack,
   Table,
   Text,
+  Title,
 } from "@mantine/core";
-import { getPnL, type PnLReport, type PageProps } from "../api";
+import { getPnL, getEquity, type PnLReport, type PageProps, type EquityCurveResp } from "../api";
+
+function EquitySvg({ points }: { points: Array<{ at: string; totalUsd: number }> }) {
+  if (points.length < 2) return null;
+  const w = 640, h = 120, pad = 4;
+  const vals = points.map((p) => p.totalUsd);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = max - min || 1;
+  const xy = points.map((p, i) => {
+    const x = pad + (i / (points.length - 1)) * (w - 2 * pad);
+    const y = h - pad - ((p.totalUsd - min) / span) * (h - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const up = vals[vals.length - 1] >= vals[0];
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: 120 }} preserveAspectRatio="none">
+      <polyline
+        points={xy.join(" ")}
+        fill="none"
+        stroke={up ? "var(--mantine-color-teal-5)" : "var(--mantine-color-red-5)"}
+        strokeWidth={1.5}
+      />
+    </svg>
+  );
+}
+
+function EquityCard() {
+  const [curve, setCurve] = useState<EquityCurveResp | null>(null);
+  useEffect(() => {
+    getEquity("90d").then(setCurve).catch(() => setCurve(null));
+  }, []);
+  if (!curve || curve.points.length === 0) return null; // feed not enabled — stay quiet
+  const sign = (curve.changeAbs ?? 0) >= 0 ? "+" : "";
+  return (
+    <Card withBorder padding="sm" mb="md">
+      <Group justify="space-between" mb={4}>
+        <Title order={6}>Equity (90d) · {curve.accountsKey} × {curve.chainsKey}</Title>
+        <Text size="xs" c={(curve.changeAbs ?? 0) >= 0 ? "teal" : "red"} ff="monospace">
+          {sign}{curve.changeAbs?.toFixed(2)} ({sign}{curve.changePct?.toFixed(2)}%) · max DD {curve.maxDrawdownPct?.toFixed(1)}%
+        </Text>
+      </Group>
+      <EquitySvg points={curve.points} />
+      <Text size="xs" c="dimmed" ff="monospace">
+        now ${curve.lastUsd?.toFixed(2)} · peak ${curve.peakUsd?.toFixed(2)} · {curve.points.length} snapshots
+      </Text>
+    </Card>
+  );
+}
 
 export function PnL({ status: _status }: PageProps) {
   const [r, setR] = useState<PnLReport | null>(null);
@@ -41,6 +89,8 @@ export function PnL({ status: _status }: PageProps) {
         <Text c="dimmed">Account: <b>{r.account}</b></Text>
         <Button size="xs" variant="light" onClick={refresh} loading={loading}>Refresh</Button>
       </Group>
+
+      <EquityCard />
 
       <SimpleGrid cols={{ base: 1, sm: 4 }}>
         <Card withBorder>

@@ -687,6 +687,19 @@ A notification at 3am is only useful if someone is awake to read it. Any alert r
 
 **Failure escalation.** If the pause itself errors, the alert still fires but a `strategy.alert.circuit_breaker_failed` critical notification escalates — the operator must know the system did NOT protect itself. Breaker trips are journaled to `alert_events` (`event: "breaker_paused"`, with the paused ids) and surface in the unified timeline as `alert.breaker` events.
 
+#### Equity curve — "how has my total portfolio value moved?" (v37)
+
+The single most-wanted operator chart. `portfolio_snapshots` (iter618) already stored point-in-time totals but only on manual `tradekit snapshot` runs — so the curve had no feed. v37 adds the **engine snapshot worker** (`engine.workers.snapshot`, enabled by the init observability preset): it ticks hourly but records only when the freshest `engine-auto` snapshot is older than `engine.snapshotEveryHours` (default 24) — one full multi-chain RPC + price scan per day, not per hour. Manual snapshots contribute to the curve but don't reset the auto cadence (your afternoon portfolio inspection shouldn't skip tonight's data point).
+
+```bash
+tradekit equity --since 90d
+#   ▁▂▂▃▅▄▆▇█▇█  2026-03-12 → 2026-06-10 · 90 points
+#   now $12,840.21 · start $10,002.10 · change +$2,838.11 (+28.4%)
+#   peak $13,102.55 on 2026-06-02 · max drawdown 9.3%
+```
+
+**Scope discipline**: a curve only makes sense within ONE scan scope (`accounts_key × chains_key`) — mixing scopes makes the line jump on *coverage* changes, not value changes. Unpinned queries default to the most-snapshotted scope (echoed back as `scopeSource: "defaulted"`); `availableScopes` lists the rest. Pure DB read everywhere it's served: CLI `tradekit equity`, MCP `equity_curve`, web `GET /api/equity` + an inline 90-day chart on the PnL tab (teal up / red down, no charting dependency).
+
 #### Funding runway — "will my automation run out of money, and when?"
 
 The most common automation failure is discovered at the worst moment: a schedule fires, the balance is short, and the operator learns from a `fire_failed` notification — reactive, repeated on every subsequent fire, often at 3am. `tradekit runway` turns that into a forecast:

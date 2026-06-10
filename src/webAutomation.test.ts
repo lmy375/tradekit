@@ -441,3 +441,31 @@ describe("/api/strategy-report/:tag — sections", () => {
     expect(r.status).toBe(400);
   });
 });
+
+// ── /api/equity ──────────────────────────────────────────────
+
+describe("/api/equity", () => {
+  it("serves the curve from seeded snapshots", async () => {
+    const { insertPortfolioSnapshot } = await import("./db.js");
+    insertPortfolioSnapshot({
+      timestamp: "2026-06-01T00:00:00Z", total_usd: 1000,
+      accounts_key: "default", chains_key: "base",
+      token_count: 2, note: null, data: "{}",
+    });
+    insertPortfolioSnapshot({
+      timestamp: "2026-06-02T00:00:00Z", total_usd: 1300,
+      accounts_key: "default", chains_key: "base",
+      token_count: 2, note: null, data: "{}",
+    });
+    const r = await get("/api/equity");
+    expect(r.status).toBe(200);
+    expect((r.body.points as unknown[]).length).toBe(2);
+    expect(r.body.changeAbs).toBe(300);
+    expect(r.body.scopeSource).toBe("defaulted");
+  });
+
+  it("rejects bad maxPoints", async () => {
+    const r = await get("/api/equity?maxPoints=99999");
+    expect(r.status).toBe(400);
+  });
+});

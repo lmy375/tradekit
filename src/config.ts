@@ -605,9 +605,20 @@ const engineSchema = z
          *  until notifications.digest.enabled=true — same gating
          *  pattern as the alerts worker. */
         digest: engineWorkerSchema.default({ enabled: true, intervalMs: 300_000 }),
+        /** v37: equity-snapshot worker. Records a portfolio snapshot
+         *  (note 'engine-auto') when the freshest auto-snapshot is
+         *  older than engine.snapshotEveryHours — the data feed for
+         *  the equity curve. Default DISABLED: each snapshot is a
+         *  full multi-chain RPC + price scan. Read-only (no
+         *  keystore). The init observability preset enables it. */
+        snapshot: engineWorkerSchema.default({ enabled: false, intervalMs: 3_600_000 }),
       })
       .strict()
       .default({}),
+    /** v37: minimum hours between engine-auto portfolio snapshots.
+     *  The worker ticks on workers.snapshot.intervalMs but only
+     *  records when the last auto-snapshot is older than this. */
+    snapshotEveryHours: z.number().int().min(1).max(168).default(24),
 
     /** Iter33: resilience config — controls per-worker backoff on
      *  consecutive failures + the timing window for status display. */
@@ -687,7 +698,9 @@ const engineSchema = z
       alerts: { enabled: true, intervalMs: 300_000 },
       db_maintenance: { enabled: false, intervalMs: 3_600_000 },
       digest: { enabled: true, intervalMs: 300_000 },
+      snapshot: { enabled: false, intervalMs: 3_600_000 },
     },
+    snapshotEveryHours: 24,
     resilience: {
       enabled: true,
       thresholdFailures: 3,
@@ -702,7 +715,7 @@ const engineSchema = z
   });
 
 export type EngineConfig = z.infer<typeof engineSchema>;
-export type EngineWorkerName = "orders" | "schedules" | "reconcile" | "rebalance" | "alerts" | "db_maintenance" | "digest";
+export type EngineWorkerName = "orders" | "schedules" | "reconcile" | "rebalance" | "alerts" | "db_maintenance" | "digest" | "snapshot";
 
 // ── mev / private-mempool submission ─────────────────────────
 //

@@ -481,3 +481,22 @@ export const getStrategyReport = (tag: string, window: string, mode: string) =>
   api.get<StrategyReportResp>(
     `/api/strategy-report/${encodeURIComponent(tag)}?window=${window}&mode=${mode}`,
   );
+
+// ── equity curve ─────────────────────────────────────────────
+
+export interface EquityCurveResp {
+  ok: true;
+  accountsKey: string;
+  chainsKey: string;
+  scopeSource: "requested" | "defaulted";
+  points: Array<{ at: string; totalUsd: number }>;
+  firstUsd: number | null;
+  lastUsd: number | null;
+  changeAbs: number | null;
+  changePct: number | null;
+  peakUsd: number | null;
+  maxDrawdownPct: number | null;
+  availableScopes: Array<{ accountsKey: string; chainsKey: string; count: number; lastAt: string }>;
+}
+export const getEquity = (since?: string) =>
+  api.get<EquityCurveResp>(`/api/equity${since ? `?since=${since}` : ""}`);

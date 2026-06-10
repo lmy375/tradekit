@@ -326,6 +326,30 @@ export function registerAutomationRoutes(app: Express): void {
   );
 
   // ── strategy report ───────────────────────────────────────
+  // ── equity curve ──────────────────────────────────────────
+  // Pure DB read over portfolio_snapshots — the v37 engine snapshot
+  // worker is the feed.
+  app.get(
+    "/api/equity",
+    wrap(async (req, res) => {
+      const { buildEquityCurve } = await import("./equity.js");
+      let sinceIso: string | undefined;
+      const since = qStr(req, "since");
+      if (since) {
+        const parsed = parseSinceDuration(since);
+        if (!parsed) throw new ToolError("INVALID_PARAMS", `"since" must be a duration (30d) or ISO timestamp.`);
+        sinceIso = parsed;
+      }
+      const curve = buildEquityCurve({
+        accountsKey: qStr(req, "accountsKey"),
+        chainsKey: qStr(req, "chainsKey"),
+        sinceIso,
+        maxPoints: qInt(req, "maxPoints", { min: 2, max: 2000, fallback: 200 }),
+      });
+      res.json({ ok: true, ...curve });
+    }),
+  );
+
   // ── strategy tags ─────────────────────────────────────────
   // Union of trade-history tags and live-primitive tags so a freshly
   // deployed playbook (zero fills) still appears in the picker.

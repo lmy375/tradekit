@@ -569,6 +569,42 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── equity curve ──────────────────────────────────────────
+  server.tool(
+    "equity_curve",
+    "Equity curve: total portfolio USD value over time, built from portfolio_snapshots — a PURE DB read (no RPC, no oracle). The data feed is the v37 engine snapshot worker (engine.workers.snapshot, default off — enable it or run `tradekit snapshot` manually/cron). Scope discipline: a curve only makes sense within ONE scan scope (accountsKey × chainsKey); when unpinned, the most-snapshotted scope is selected (scopeSource: 'defaulted') and availableScopes lists the rest. Returns { accountsKey, chainsKey, scopeSource, points: [{at, totalUsd}], firstUsd, lastUsd, changeAbs, changePct, peakUsd, peakAt, maxDrawdownPct, availableScopes }. Errors: INVALID_PARAMS (bad maxPoints).",
+    {
+      accountsKey: z.string().optional().describe("Pin the accounts scope (sorted comma-joined labels, e.g. 'default')."),
+      chainsKey: z.string().optional().describe("Pin the chains scope (sorted comma-joined, e.g. 'base,ethereum')."),
+      since: z.string().optional().describe("Lower bound — ISO timestamp or duration shorthand (30d, 12h)."),
+      maxPoints: z.number().int().min(2).max(2000).optional().describe("Downsample ceiling (default 200; endpoints always kept)."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("equity_curve", rt.opts, input, undefined, async () => {
+            const { buildEquityCurve } = await import("../equity.js");
+            let sinceIso: string | undefined;
+            if (input.since) {
+              const { parseSinceDuration } = await import("../timeline.js");
+              const parsed = parseSinceDuration(input.since);
+              if (!parsed) throw new ToolError("INVALID_PARAMS", `"since" must be a duration (30d) or ISO timestamp.`);
+              sinceIso = parsed;
+            }
+            return buildEquityCurve({
+              accountsKey: input.accountsKey,
+              chainsKey: input.chainsKey,
+              sinceIso,
+              maxPoints: input.maxPoints,
+            });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── runway ─────────────────────────────────────────────────
   server.tool(
     "runway",

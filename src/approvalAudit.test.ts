@@ -173,6 +173,7 @@ describe("auditAllowanceList (iter606)", () => {
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
           digest: { enabled: true, intervalMs: 300_000 },
+        snapshot: { enabled: false, intervalMs: 3_600_000 },
       },
       resilience: { enabled: true, thresholdFailures: 3, backoffMultiplier: 2, maxBackoffMs: 600_000, tickTimingWindow: 20 },
       heartbeatIntervalMs: 3_600_000,
@@ -180,6 +181,7 @@ describe("auditAllowanceList (iter606)", () => {
       scheduleJournal: { enabled: false },
       rebalanceJournal: { enabled: false },
       fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
+      snapshotEveryHours: 24,
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {
@@ -328,6 +330,7 @@ describe("approval freshness signal (iter617)", () => {
         alerts: { enabled: true, intervalMs: 300_000 },
         db_maintenance: { enabled: false, intervalMs: 3_600_000 },
           digest: { enabled: true, intervalMs: 300_000 },
+        snapshot: { enabled: false, intervalMs: 3_600_000 },
       },
       resilience: { enabled: true, thresholdFailures: 3, backoffMultiplier: 2, maxBackoffMs: 600_000, tickTimingWindow: 20 },
       heartbeatIntervalMs: 3_600_000,
@@ -335,6 +338,7 @@ describe("approval freshness signal (iter617)", () => {
       scheduleJournal: { enabled: false },
       rebalanceJournal: { enabled: false },
       fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
+      snapshotEveryHours: 24,
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {
