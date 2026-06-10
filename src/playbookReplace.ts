@@ -254,6 +254,7 @@ const ORDER_EDITABLE_SPEC_FIELDS = new Set([
   "autoSlippage",
   "expiresAt",
   "note",
+  "onFill", // v31: orderEdit revalidates against the live pair
 ]);
 
 const SCHEDULE_EDITABLE_SPEC_FIELDS = new Set([
@@ -802,6 +803,9 @@ function orderEditChangesFromSpec(entry: OrderSpec, changedFields: string[]): Or
       case "note":
         ch.note = entry.note ?? null;
         break;
+      case "onFill":
+        ch.onFill = entry.onFill ?? null;
+        break;
     }
   }
   return ch;
@@ -926,6 +930,13 @@ function preValidate(args: {
       const o = entry as OrderSpec;
       // Resolve trade pair — catches UNKNOWN_TOKEN before cancel.
       resolveTradePair(profile, o.base, o.quote);
+      if (o.onFill != null) {
+        try {
+          parseOnFillSpec(o.onFill);
+        } catch (e) {
+          throw new ToolError("INVALID_PARAMS", `${item.localId}: onFill — ${(e as Error).message}`);
+        }
+      }
       if (o.trigger === "trailing" && (o.trailPct == null || o.trailPct <= 0 || o.trailPct > 100)) {
         throw new ToolError("INVALID_PARAMS", `${item.localId}: trailing requires trailPct in (0, 100]`);
       }

@@ -187,6 +187,34 @@ export async function orderCreateCommand(flags: Record<string, string>) {
   const { base, quote } = resolveTradePair(profile, flags["base"] ?? "ETH", flags["quote"] ?? "USDC");
   const accountLabel = flags["account"] ?? config.activeAccount ?? "default";
 
+  // v31: post-fill hook (--on-fill <json> | --on-fill-file <path>) —
+  // same dialect as schedule create. Validated by createOrderRow.
+  let onFill: unknown | undefined;
+  if (flags["on-fill"] && flags["on-fill-file"]) {
+    throw new ToolError("INVALID_PARAMS", "Pass --on-fill OR --on-fill-file, not both.");
+  }
+  if (flags["on-fill"]) {
+    try {
+      onFill = JSON.parse(flags["on-fill"]);
+    } catch (e) {
+      throw new ToolError("INVALID_PARAMS", `--on-fill is not valid JSON: ${(e as Error).message}`);
+    }
+  } else if (flags["on-fill-file"]) {
+    const { readFileSync } = await import("node:fs");
+    const { resolve: resolvePath } = await import("node:path");
+    let text: string;
+    try {
+      text = readFileSync(resolvePath(flags["on-fill-file"]), "utf8");
+    } catch (e) {
+      throw new ToolError("INVALID_PARAMS", `Cannot read --on-fill-file "${flags["on-fill-file"]}": ${(e as Error).message}`);
+    }
+    try {
+      onFill = JSON.parse(text);
+    } catch (e) {
+      throw new ToolError("INVALID_PARAMS", `--on-fill-file is not valid JSON: ${(e as Error).message}`);
+    }
+  }
+
   const row = createOrderRow(
     {
       side,
@@ -208,6 +236,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
       note: flags["note"],
       group: flags["group"],
       paper: flags["paper"] === "true",
+      onFill,
     },
     config,
   );
@@ -229,6 +258,7 @@ export async function orderCreateCommand(flags: Record<string, string>) {
     const peerCount = peers.length - 1;
     console.log(`  OCO group: ${row.group_id}${peerCount > 0 ? `  (${peerCount} peer${peerCount === 1 ? "" : "s"} active)` : "  (no peers yet)"}`);
   }
+  if (row.on_fill_json) console.log(`  On fill: auto-creates a follow-up order (hook validated)`);
   console.log("");
   console.log("  The order fires when the engine sees the price predicate hit.");
   console.log("  Start the engine with:  tradekit order run");
@@ -707,9 +737,19 @@ export async function orderEditCommand(
         case "slippage-bps":
           changes.slippageBps = null;
           break;
+        case "on-fill":
+          changes.onFill = null;
+          break;
         default:
           throw new ToolError("INVALID_PARAMS", `--unset ${f}: not a clearable field.`);
       }
+    }
+  }
+  if (flags["on-fill"] != null) {
+    try {
+      changes.onFill = JSON.parse(flags["on-fill"]);
+    } catch (e) {
+      throw new ToolError("INVALID_PARAMS", `--on-fill is not valid JSON: ${(e as Error).message}`);
     }
   }
   if (flags["target-price"] != null) {

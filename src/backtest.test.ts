@@ -1113,3 +1113,41 @@ describe("simulatePlaybook — on_fill hooks", () => {
     ).toThrow(/hook base "WBTC" doesn't match/);
   });
 });
+
+describe("simulatePlaybook — ORDER on_fill hooks (v31)", () => {
+  it("an order fill spawns its hook; the chained bracket later fires", () => {
+    // Limit buy at 1900 fills on day 1 (price dips to 1850), spawning
+    // a 10% trail sized to the bought amount; the trail tracks the
+    // run to 3000 and fires on the crash to 2400.
+    const spec = parsePlaybookSpec({
+      name: "dip-buy-bracket",
+      strategies: [
+        {
+          id: "dip", type: "order", side: "buy", trigger: "price_below", price: 1900,
+          quoteAmount: 1850, base: "ETH", quote: "USDC",
+          onFill: {
+            type: "createOrder",
+            spec: { side: "sell", trigger: "trailing", trailPct: 10, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+          },
+        },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 1850, 3000, 2400, 2400]);
+    const r = simulatePlaybook({
+      spec,
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1850 },
+      series,
+    });
+    const dip = r.perStrategy.find((s) => s.strategyId === "dip")!;
+    expect(dip.finalStatus).toBe("filled");
+    const hook = r.perStrategy.find((s) => s.strategyId === "dip:hook#1")!;
+    expect(hook.finalStatus).toBe("filled");
+    expect(hook.baseDelta).toBeCloseTo(-1, 9); // sold the full bought amount (1850/1850)
+    // Round trip: bought 1 ETH @1850, sold @2400.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(2400, 6);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+    expect(r.notes.some((n) => n.includes("1 follow-up order(s) spawned"))).toBe(true);
+  });
+});

@@ -401,3 +401,79 @@ describe("runOrderTick — journal disabled", () => {
     }
   });
 });
+
+// ── v31: order on_fill hooks ─────────────────────────────────
+
+describe("runOrderTick — on_fill hook", () => {
+  const HOOK = {
+    type: "createOrder",
+    spec: {
+      side: "sell",
+      trigger: "trailing",
+      trailPct: 5,
+      base: "WETH",
+      quote: "USDC",
+      baseAmount: "{{filled.baseAmount}}",
+    },
+  };
+
+  it("a fill chains the follow-up order, sized to the filled amount", async () => {
+    seedQuoteBalance("10000");
+    // Paper buy below 2100 — price mock is 2000 → triggers.
+    const id = seedOrder({
+      side: "buy",
+      trigger_type: "price_below",
+      target_price_usd: 2100,
+      base_amount: null,
+      quote_amount: "1000",
+      paper: true,
+      on_fill_json: JSON.stringify(HOOK),
+    });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+
+    const { listOrders } = await import("./db.js");
+    const all = listOrders({ status: "active" });
+    expect(all).toHaveLength(1); // the chained follow-up
+    const follow = all[0];
+    expect(follow.trigger_type).toBe("trailing");
+    expect(follow.side).toBe("sell");
+    // Sized to the simulated fill: 1000 USDC at ~2000 with paper
+    // worst-case slippage → just under 0.5 WETH.
+    expect(parseFloat(follow.base_amount!)).toBeGreaterThan(0.49);
+    expect(parseFloat(follow.base_amount!)).toBeLessThanOrEqual(0.5);
+    expect(follow.id).not.toBe(id);
+  });
+
+  it("hook failure does NOT unwind the fill (order stays filled, journal records hook_failed)", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, orderJournal: { ...cfg.engine.orderJournal, enabled: true } } } as never);
+    try {
+      seedQuoteBalance("10000");
+      const id = seedOrder({
+        side: "buy",
+        trigger_type: "price_below",
+        target_price_usd: 2100,
+        base_amount: null,
+        quote_amount: "1000",
+        paper: true,
+        // trailPct -5 passes structural parse but fails the order
+        // validators at hook-execution time.
+        on_fill_json: JSON.stringify({ type: "createOrder", spec: { ...HOOK.spec, trailPct: -5 } }),
+      });
+      const report = await tick();
+      expect(report.filled).toBe(1); // fill kept
+
+      const { getOrderById, replayOrderEntries } = await import("./db.js");
+      expect(getOrderById(id)?.status).toBe("filled");
+      const decisions = replayOrderEntries(id).map((e) => e.decision);
+      expect(decisions).toContain("hook_failed");
+      // No follow-up order created.
+      const { listOrders } = await import("./db.js");
+      expect(listOrders({ status: "active" })).toHaveLength(0);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+});

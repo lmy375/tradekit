@@ -1629,6 +1629,8 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Validation at create time.** The hook spec is rendered with fake fill data and run through the order-spec validator BEFORE the schedule row persists. Misconfiguration (unknown variable, missing trail_pct, invalid trigger) surfaces immediately — not months later on the first fire.
 
+**Orders chain too (v31).** The same hook attaches to conditional orders — `order create … --on-fill '{...}'` (or `onFill` in playbook order entries / MCP `order_create`): a limit buy at \$1,800 that fills auto-creates the trailing stop for exactly the bought amount. One fire per order (`fireNumber` is always 1); `order replay` shows `hook_created` / `hook_failed` alongside the fill; `order edit --on-fill/--unset on-fill` mutates it in place; the playbook backtest simulates order hooks the same way it does schedule hooks.
+
 **Hook failures don't unwind the fill.** If the hook errors at fire time (e.g. the rendered amount is too small for slippage cap), the fill stays — the trade already happened — and a `schedule.on_fill_failed` notification fires with the error code. Operators can investigate + create the follow-up manually. Success emits `schedule.on_fill_created`.
 
 **No recursion.** Only schedules carry hooks; orders don't. So a DCA's hook creates a trailing-stop; when the trailing-stop later fires, no further hook fires. Bounded by construction.

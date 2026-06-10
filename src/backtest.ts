@@ -715,7 +715,7 @@ export function simulatePlaybook(args: {
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
       if (st.type === "order") {
-        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires });
+        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes });
       }
     }
     for (const st of states) {
@@ -848,8 +848,9 @@ function evaluateOrderTick(args: {
   quoteSymbol: string;
   states: StrategyState[];
   fires: PlaybookBacktestFire[];
+  notes: string[];
 }): void {
-  const { state, pt, balance, baseSymbol, quoteSymbol, states, fires } = args;
+  const { state, pt, balance, baseSymbol, quoteSymbol, states, fires, notes } = args;
   // Optional expires_at — drop the order without firing if past.
   if (state.spec.expiresAt) {
     if (Date.parse(state.spec.expiresAt) < Date.parse(pt.ts)) {
@@ -887,6 +888,7 @@ function evaluateOrderTick(args: {
     state.baseDelta = fill.baseDelta;
     state.quoteDelta = fill.quoteDelta;
     cascadeOcoPeers(state, states, pt, fires);
+    spawnHookOrder({ parent: state, onFill: state.spec.onFill, fill, pt, states, notes });
   } else {
     // halt — insufficient balance. Park the order so it doesn't keep
     // firing on subsequent ticks.
@@ -926,51 +928,8 @@ function evaluateScheduleTick(args: {
     state.quoteDelta += fill.quoteDelta;
     state.lastFireMinute = minuteBucket;
     if (state.fireCount >= state.maxRuns) state.finalStatus = "completed";
-    // v31: on_fill hook — spawn the follow-up order with the SAME
-    // production renderer the live engine uses, fed the simulated
-    // fill context. A render failure mirrors the live semantics:
-    // the fill stays, the hook is noted, the sim continues.
-    if (state.spec.onFill != null) {
-      try {
-        const hook = parseOnFillSpec(state.spec.onFill);
-        const rendered = renderOnFillSpec({
-          spec: hook,
-          fill: {
-            baseAmount: String(Math.abs(fill.baseDelta)),
-            quoteAmount: String(Math.abs(fill.quoteDelta)),
-            fillPriceUsd: pt.priceUsd,
-            txHash: `sim:${state.id}:${state.fireCount}`,
-            fireNumber: state.fireCount,
-          },
-        }) as OnFillSpec;
-        const hs = rendered.spec;
-        states.push({
-          id: `${state.id}:hook#${state.fireCount}`,
-          type: "order",
-          spec: {
-            type: "order",
-            side: hs.side,
-            trigger: hs.trigger,
-            price: hs.price != null ? Number(hs.price) : undefined,
-            trailPct: hs.trailPct != null ? Number(hs.trailPct) : undefined,
-            base: hs.base,
-            quote: hs.quote,
-            baseAmount: hs.baseAmount != null ? String(hs.baseAmount) : undefined,
-            quoteAmount: hs.quoteAmount != null ? String(hs.quoteAmount) : undefined,
-            expiresAt: hs.expiresAt,
-            group: hs.group,
-          },
-          finalStatus: "active",
-          trailWaterMark: null,
-          fireCount: 0,
-          baseDelta: 0,
-          quoteDelta: 0,
-          spawnedBy: state.id,
-        });
-      } catch (e) {
-        notes.push(`${pt.ts}: on_fill hook for ${state.id} failed to render (${(e as Error).message.split("\n")[0]}) — fill kept, hook skipped`);
-      }
-    }
+    // v31: on_fill hook — shared spawn helper (orders use it too).
+    spawnHookOrder({ parent: state, onFill: state.spec.onFill, fill, pt, states, notes });
   } else {
     // halt — park the schedule. Some operators might want to keep
     // retrying on the next tick (a schedule with insufficient balance
@@ -978,6 +937,63 @@ function evaluateScheduleTick(args: {
     // backtest semantics are "given THIS balance + THIS timeline, what
     // would have happened"; further fires would just emit more halts.
     state.finalStatus = "cancelled";
+  }
+}
+
+/** v31: spawn an on_fill hook order with the SAME production renderer
+ *  the live engine uses, fed the simulated fill context. A render
+ *  failure mirrors live semantics: the fill stays, the hook is noted,
+ *  the sim continues. Orders fire once (fireNumber 1); schedules pass
+ *  their running fireCount. */
+function spawnHookOrder(args: {
+  parent: OrderState | ScheduleState;
+  onFill: unknown;
+  fill: PlaybookBacktestFire;
+  pt: PricePoint;
+  states: StrategyState[];
+  notes: string[];
+}): void {
+  const { parent, onFill, fill, pt, states, notes } = args;
+  if (onFill == null) return;
+  const fireNumber = parent.fireCount > 0 ? parent.fireCount : 1;
+  try {
+    const hook = parseOnFillSpec(onFill);
+    const rendered = renderOnFillSpec({
+      spec: hook,
+      fill: {
+        baseAmount: String(Math.abs(fill.baseDelta)),
+        quoteAmount: String(Math.abs(fill.quoteDelta)),
+        fillPriceUsd: pt.priceUsd,
+        txHash: `sim:${parent.id}:${fireNumber}`,
+        fireNumber,
+      },
+    }) as OnFillSpec;
+    const hs = rendered.spec;
+    states.push({
+      id: `${parent.id}:hook#${fireNumber}`,
+      type: "order",
+      spec: {
+        type: "order",
+        side: hs.side,
+        trigger: hs.trigger,
+        price: hs.price != null ? Number(hs.price) : undefined,
+        trailPct: hs.trailPct != null ? Number(hs.trailPct) : undefined,
+        base: hs.base,
+        quote: hs.quote,
+        baseAmount: hs.baseAmount != null ? String(hs.baseAmount) : undefined,
+        quoteAmount: hs.quoteAmount != null ? String(hs.quoteAmount) : undefined,
+        expiresAt: hs.expiresAt,
+        group: hs.group,
+      },
+      finalStatus: "active",
+      trailWaterMark: null,
+      fireCount: 0,
+      baseDelta: 0,
+      quoteDelta: 0,
+      spawnedBy: parent.id,
+    });
+  } catch (e) {
+    notes.push(`${pt.ts}: on_fill hook for ${parent.id} failed to render (${(e as Error).message.split("\n")[0]}) — fill kept, hook skipped`);
   }
 }
 
@@ -1078,8 +1094,9 @@ function validatePlaybookForBacktest(
       errors.push(`${prefix}: quote "${s.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
     }
     // v31: hook orders are simulated — the same-pair invariant
-    // extends INSIDE the hook spec (one price series).
-    if (s.type === "schedule" && s.onFill != null) {
+    // extends INSIDE the hook spec (one price series). Both schedule
+    // AND order entries can carry hooks.
+    if ((s.type === "schedule" || s.type === "order") && s.onFill != null) {
       try {
         const hook = parseOnFillSpec(s.onFill);
         if (hook.spec.base.toUpperCase() !== baseSymbol.toUpperCase()) {

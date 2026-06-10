@@ -823,3 +823,42 @@ describe("promotePlaybook", () => {
     expect(() => promotePlaybook({ playbookId: deploy.playbookId, to: "real" })).toThrow(/destroyed/);
   });
 });
+
+describe("playbook ORDER on_fill hooks (v31)", () => {
+  it("parses + deploys an order with a hook (persisted to on_fill_json)", () => {
+    const spec = parsePlaybookSpec({
+      name: "order-hook",
+      chain: "base",
+      account: "default",
+      strategies: [
+        {
+          id: "dip", type: "order", side: "buy", trigger: "price_below", price: 1800,
+          quoteAmount: 1000, base: "ETH", quote: "USDC",
+          onFill: {
+            type: "createOrder",
+            spec: { side: "sell", trigger: "trailing", trailPct: 5, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+          },
+        },
+      ],
+    });
+    const result = deployPlaybook({ spec, sourcePath: null });
+    const detail = getPlaybookDetail(result.playbookId);
+    expect(detail.orders[0].on_fill_json).toBeTruthy();
+    expect(JSON.parse(detail.orders[0].on_fill_json!).type).toBe("createOrder");
+  });
+
+  it("rejects a structurally-bad order hook at parse time with the path", () => {
+    let err: Error | null = null;
+    try {
+      parsePlaybookSpec({
+        name: "bad-order-hook",
+        strategies: [
+          { id: "o", type: "order", side: "buy", trigger: "price_below", price: 1800, quoteAmount: 1000, base: "ETH", quote: "USDC", onFill: { type: "nope" } },
+        ],
+      });
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err?.message).toContain("strategies[0].onFill");
+  });
+});

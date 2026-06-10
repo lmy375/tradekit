@@ -82,6 +82,9 @@ export type OrderSpec = {
   chain?: string;
   account?: string;
   note?: string;
+  /** v31: post-fill hook — same dialect as schedule onFill. The
+   *  chained order auto-creates after THIS order fills. */
+  onFill?: unknown;
 };
 
 export type ScheduleSpec = {
@@ -295,6 +298,13 @@ function validateOrderSpec(s: Record<string, unknown>, prefix: string, errors: s
   }
   if (s.slippageBps != null && (typeof s.slippageBps !== "number" || !Number.isInteger(s.slippageBps) || s.slippageBps <= 0 || s.slippageBps > 10_000)) {
     errors.push(`${prefix}.slippageBps: must be integer in (0, 10000]`);
+  }
+  if (s.onFill != null) {
+    try {
+      parseOnFillSpec(s.onFill);
+    } catch (e) {
+      errors.push(`${prefix}.onFill: ${(e as Error).message.replace(/\n\s*/g, " ")}`);
+    }
   }
 }
 
@@ -608,6 +618,7 @@ export function createOnePrimitive(args: {
         note: entry.note,
         group: entry.group ? `pb${playbookId}-${entry.group}` : undefined,
         paper,
+        onFill: entry.onFill,
       };
       const row = createOrderRow(createArgs, config);
       return {

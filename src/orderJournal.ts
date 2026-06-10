@@ -385,6 +385,8 @@ export function decisionMarker(d: OrderCheckDecision): string {
     case "error":              return "✕";
     case "edited_by_operator": return "✎";
     case "expired":            return "⌛";
+    case "hook_created":       return "↳";
+    case "hook_failed":        return "↯";
   }
 }
 
@@ -398,6 +400,8 @@ export function decisionLabel(d: OrderCheckDecision): string {
     case "triggered_fired":    return "FIRED";
     case "triggered_skipped":  return "trigger skipped";
     case "error":              return "error";
+    case "hook_created":       return "on-fill hook created follow-up";
+    case "hook_failed":        return "on-fill hook FAILED (fill kept)";
     case "edited_by_operator": return "edited by operator";
     case "expired":            return "expired";
   }

@@ -26,6 +26,7 @@
 
 import type { Address, PublicClient, WalletClient, Account, Transport, Chain } from "viem";
 import { ToolError, type NextAction } from "./errors.js";
+import { validateOnFillSpec } from "./scheduleHooks.js";
 import { executeTrade, type TradeRequest, type TradeContext, type TradeResult } from "./trade.js";
 import { executePaperTrade, type PaperTradeContext } from "./paperTrade.js";
 import { resolveTradePair } from "./chains.js";
@@ -273,6 +274,12 @@ export interface CreateOrderArgs {
    *  / watermark / expiry / OCO cascade); only the terminal FIRE step
    *  differs. Defaults to false. */
   paper?: boolean;
+  /** v31: post-fill hook — auto-create a follow-up order after THIS
+   *  order fills ("limit buy at $1800 → auto-trailing the position").
+   *  Same dialect as schedule on_fill (scheduleHooks.OnFillSpec,
+   *  {{filled.X}} substitution). Validated with fake fill data at
+   *  create time; hook failure at fire time keeps the fill. */
+  onFill?: unknown;
 }
 
 /** Resolve display symbols for the base/quote pair so list views can show
@@ -395,6 +402,22 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
   const { base, quote } = resolveTradePair(profile, args.base, args.quote);
   const { baseSym, quoteSym } = resolveSymbols(profile, base, quote);
 
+  // v31: validate the post-fill hook BEFORE inserting — same gate
+  // createScheduleRow uses (fake fill render through the order
+  // validators), so a bad hook fails at create, not on first fill.
+  let onFillJson: string | null = null;
+  if (args.onFill != null) {
+    validateOnFillSpec({
+      raw: args.onFill,
+      chain: profile.name,
+      account: args.account,
+      config,
+      baseAddress: base,
+      quoteAddress: quote,
+    });
+    onFillJson = JSON.stringify(args.onFill);
+  }
+
   const insertArgs: InsertOrderArgs = {
     side: args.side,
     trigger_type: args.trigger,
@@ -418,6 +441,7 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
     note: args.note ?? null,
     group_id: group,
     paper: args.paper === true,
+    on_fill_json: onFillJson,
   };
   const id = insertOrder(insertArgs);
   const row = getOrderById(id);
@@ -1010,6 +1034,87 @@ export async function runOrderTick(args: OrderTickArgs): Promise<OrderTickReport
         firedAs: "filled",
         firedReason: `${result.txHash}`,
       });
+      // v31: post-fill hook — chain the follow-up order. Failure does
+      // NOT unwind the fill (the trade already happened); it notifies
+      // + journals so the operator can create the follow-up manually.
+      if (order.on_fill_json) {
+        try {
+          const { parseOnFillSpec, executeOnFillHook } = await import("./scheduleHooks.js");
+          const hookSpec = parseOnFillSpec(JSON.parse(order.on_fill_json));
+          const hookResult = executeOnFillHook({
+            spec: hookSpec,
+            fill: {
+              baseAmount: result.baseAmount ?? "0",
+              quoteAmount: result.quoteAmount ?? "0",
+              fillPriceUsd,
+              txHash: result.txHash,
+              fireNumber: 1, // orders fire once
+            },
+            chain: order.chain,
+            account: order.account,
+            baseAddress: order.base_token as Address | "ETH",
+            quoteAddress: order.quote_token as Address,
+            strategyTag: order.strategy ?? null,
+            config,
+          });
+          if (journalConfig.enabled) {
+            const { insertOrderCheckEntry } = await import("./db.js");
+            try {
+              insertOrderCheckEntry({
+                orderId: order.id,
+                checkedAt: new Date().toISOString(),
+                priceUsd: currentPrice,
+                waterMarkUsd: order.water_mark_usd,
+                thresholdUsd: null,
+                decision: "hook_created",
+                notes: `on_fill created order #${hookResult.orderId}`,
+              });
+            } catch { /* journal is best-effort */ }
+          }
+          await tryNotify(
+            {
+              event: "order.on_fill_created",
+              severity: "info",
+              title: `Order #${order.id} on-fill hook created order #${hookResult.orderId}`,
+              body: `After the fill (tx ${result.txHash}), auto-created the follow-up order from the on_fill spec.`,
+              fields: { orderId: order.id, followUpOrderId: hookResult.orderId, chain: order.chain },
+              dedupKey: `order.on_fill_created:${order.id}`,
+            },
+            config,
+            args.logger,
+          );
+        } catch (e) {
+          const code = (e as { code?: string }).code ?? "INTERNAL_ERROR";
+          const msg = (e as Error).message ?? String(e);
+          if (journalConfig.enabled) {
+            const { insertOrderCheckEntry } = await import("./db.js");
+            try {
+              insertOrderCheckEntry({
+                orderId: order.id,
+                checkedAt: new Date().toISOString(),
+                priceUsd: currentPrice,
+                waterMarkUsd: order.water_mark_usd,
+                thresholdUsd: null,
+                decision: "hook_failed",
+                notes: `[${code}] ${msg.slice(0, 180)}`,
+              });
+            } catch { /* journal is best-effort */ }
+          }
+          args.logger.error(`order #${order.id} on_fill hook failed: ${msg}`);
+          await tryNotify(
+            {
+              event: "order.on_fill_failed",
+              severity: "warn",
+              title: `Order #${order.id} on-fill hook failed: ${code}`,
+              body: `Fill succeeded (tx ${result.txHash}) but the on_fill hook errored. Trade NOT unwound; manual follow-up required.\n\n${msg}`,
+              fields: { orderId: order.id, chain: order.chain, errorCode: code, txHash: result.txHash },
+              dedupKey: `order.on_fill_failed:${order.id}`,
+            },
+            config,
+            args.logger,
+          );
+        }
+      }
     } else if (result && result.status === "failed") {
       // Trade landed on-chain but reverted. Terminal — flip to failed.
       const msg = result.simulation?.revertReason ?? "trade reverted on-chain";

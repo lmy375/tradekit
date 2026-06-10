@@ -641,6 +641,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
         .describe("Relative duration shorthand (30s, 15m, 2h, 7d, 4w). Converted to an absolute expiresAt at create time. Mutually exclusive with expiresAt."),
       strategy: z.string().max(100).optional().describe("Strategy tag stamped on the trade when the order fills (indexed; same column as trade strategy)."),
       note: z.string().optional().describe("Free-form note saved on the order row + on the eventual trade row."),
+      onFill: z.unknown().optional().describe("v31 post-fill hook: { type: 'createOrder', spec: {...} } with {{filled.X}} placeholders — auto-creates a follow-up order after THIS order fills (e.g. limit buy → auto-trailing). Validated with fake fill data at create time; hook failure at fire time keeps the fill."),
       group: z
         .string()
         .regex(/^[A-Za-z0-9_-]+$/, "group must match /^[A-Za-z0-9_-]+$/ (letters, digits, dash, underscore)")
@@ -703,6 +704,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 strategy: input.strategy,
                 note: input.note,
                 group: input.group,
+                onFill: input.onFill,
               },
               config,
             );
@@ -822,6 +824,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       strategy: z.string().optional().describe("New strategy tag."),
       note: z.string().optional().describe("New free-text note."),
       paper: z.boolean().optional().describe("Toggle paper mode (iter30)."),
+      onFill: z.unknown().optional().describe("Replacement on_fill hook spec (object). Pass null to remove an existing hook. Revalidated against the order's pair."),
     },
     async (input) => {
       try {
@@ -841,6 +844,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
             if ("strategy" in input) changes.strategy = input.strategy;
             if ("note" in input) changes.note = input.note;
             if ("paper" in input) changes.paper = input.paper;
+            if ("onFill" in input) changes.onFill = input.onFill;
             const result = editOrder({ id: input.id, changes });
             return {
               orderId: input.id,
@@ -1110,6 +1114,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
             if ("strategy" in input) changes.strategy = input.strategy;
             if ("note" in input) changes.note = input.note;
             if ("paper" in input) changes.paper = input.paper;
+            if ("onFill" in input) changes.onFill = input.onFill;
             if ("onFill" in input) changes.onFill = input.onFill;
             const result = editSchedule({ id: input.id, changes });
             return {

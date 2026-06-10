@@ -31,6 +31,8 @@
 // ──────────────────────────────────────────────────────────────────
 
 import { ToolError } from "./errors.js";
+import type { Address } from "viem";
+import { validateOnFillSpec } from "./scheduleHooks.js";
 import { loadConfig, type Config } from "./config.js";
 import {
   getOrderById,
@@ -55,6 +57,9 @@ export interface OrderEditChanges {
   strategy?: string | null;
   note?: string | null;
   paper?: boolean;
+  /** v31: replacement on_fill hook spec (object). Pass null to remove
+   *  an existing hook. Revalidated against the order's pair. */
+  onFill?: unknown;
 }
 
 export interface EditOrderArgs {
@@ -304,6 +309,31 @@ export function validateOrderEdit(args: {
     if (current !== v) {
       dbChanges.paper = v;
       diff.push({ field: "paper", oldValue: current, newValue: v });
+    }
+  }
+
+  // ── on_fill hook (v31) ────────────────────────────────────
+  if ("onFill" in changes) {
+    const v = changes.onFill;
+    if (v == null) {
+      if (order.on_fill_json) {
+        dbChanges.on_fill_json = null;
+        diff.push({ field: "onFill", oldValue: order.on_fill_json, newValue: null });
+      }
+    } else {
+      validateOnFillSpec({
+        raw: v,
+        chain: order.chain,
+        account: order.account,
+        config,
+        baseAddress: order.base_token as Address | "ETH",
+        quoteAddress: order.quote_token as Address,
+      });
+      const serialized = JSON.stringify(v);
+      if (order.on_fill_json !== serialized) {
+        dbChanges.on_fill_json = serialized;
+        diff.push({ field: "onFill", oldValue: order.on_fill_json ?? null, newValue: serialized });
+      }
     }
   }
 

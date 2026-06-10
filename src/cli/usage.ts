@@ -248,6 +248,10 @@ CONDITIONAL ORDERS
                --base ETH|<addr> --quote USDC|<addr>
                (--baseAmount A | --quoteAmount A) [--slippage <bps>] [--auto-slippage]
                [--expires-in 30s|15m|2h|7d|4w | --expires-at <ISO>]
+               [--on-fill '<json>' | --on-fill-file <path>]  ← v31: chain a follow-up
+               order after THIS order fills (same {{filled.X}} dialect as schedule
+               hooks; e.g. limit buy → auto-trailing the position). --unset on-fill
+               via 'order edit' removes it.
                [--group <id>] [--strategy TAG] [--note "..."] [--chain X] [--account L] [--json]
         Standing intent that fires when the configured trigger satisfies. At fire time the
         engine routes through executeTrade — so every safety guardrail (USD limits, slippage

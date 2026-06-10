@@ -1128,6 +1128,16 @@ const MIGRATIONS: string[] = [
   CREATE INDEX IF NOT EXISTS idx_rebalance_check_plan ON rebalance_check_log (plan_id, checked_at);
   CREATE INDEX IF NOT EXISTS idx_rebalance_check_at   ON rebalance_check_log (checked_at);
   `,
+
+  // v31 — order on_fill hooks. Schedules grew post-fill hooks in
+  // iter27 ("DCA fire → auto-bracket the slice"); orders get the
+  // symmetric capability: "limit buy at $1800 fills → auto-trailing
+  // the position". Same hook dialect (scheduleHooks.ts OnFillSpec,
+  // {{filled.X}} substitution), same validation gates, same
+  // hook-failure-keeps-the-fill semantics. NULL = no hook.
+  `
+  ALTER TABLE orders ADD COLUMN on_fill_json TEXT;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -2906,6 +2916,8 @@ export interface OrderRow {
    *  evaluated identically; only the terminal write differs. Defaults
    *  to 0 (real trading) — pre-v24 rows are unaffected. */
   paper?: number;
+  /** v31: post-fill hook spec (JSON). NULL = no hook. */
+  on_fill_json: string | null;
 }
 
 export interface InsertOrderArgs {
@@ -2935,6 +2947,8 @@ export interface InsertOrderArgs {
   /** Iter30: when true the order fires against the virtual book instead
    *  of executing on-chain. Default false. Validated upstream. */
   paper?: boolean;
+  /** v31: post-fill hook spec (JSON string). Optional. */
+  on_fill_json?: string | null;
 }
 
 export function insertOrder(args: InsertOrderArgs): number {
@@ -2948,8 +2962,8 @@ export function insertOrder(args: InsertOrderArgs): number {
          base_token, base_symbol, quote_token, quote_symbol,
          base_amount, quote_amount, slippage_bps, auto_slippage,
          expires_at, strategy, note,
-         attempts, group_id, paper
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         attempts, group_id, paper, on_fill_json
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       now, now, "active", args.side, args.trigger_type, args.target_price_usd, args.trail_pct,
@@ -2959,7 +2973,7 @@ export function insertOrder(args: InsertOrderArgs): number {
       args.base_amount, args.quote_amount,
       args.slippage_bps, args.auto_slippage ? 1 : 0,
       args.expires_at, args.strategy, capTradeNotes(args.note),
-      0, args.group_id, args.paper ? 1 : 0,
+      0, args.group_id, args.paper ? 1 : 0, args.on_fill_json ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -3202,6 +3216,7 @@ export interface OrderEditableFields {
   strategy?: string | null;
   note?: string | null;
   paper?: boolean;
+  on_fill_json?: string | null;
 }
 
 /** Apply a targeted in-place edit to an active order. Returns the
@@ -3256,6 +3271,10 @@ export function updateOrderEditable(
   if ("paper" in changes) {
     sets.push("paper = ?");
     args.push(changes.paper ? 1 : 0);
+  }
+  if ("on_fill_json" in changes) {
+    sets.push("on_fill_json = ?");
+    args.push(changes.on_fill_json ?? null);
   }
   if (sets.length === 0) return 0;
   const now = new Date().toISOString();
@@ -4517,6 +4536,10 @@ export type OrderCheckDecision =
   | "triggered_fired"
   | "triggered_skipped"
   | "error"
+  // v31: post-fill hook outcomes — the chained order's id (or the
+  // error) lands in notes, alongside the fire in `order replay`.
+  | "hook_created"
+  | "hook_failed"
   // Iter34: operator mutated the order in-place. The notes field
   // carries the JSON-encoded diff (old → new per field). HWM /
   // attempts / journal continuity stay intact across edits, so
