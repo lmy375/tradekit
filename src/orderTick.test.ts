@@ -731,3 +731,76 @@ describe("runOrderTick — v33 crash-window recovery", () => {
     }
   });
 });
+
+// ── v35: position-level "max" sizing ─────────────────────────
+
+describe("runOrderTick — max sizing", () => {
+  it("a trailing sell with baseAmount max sells the ENTIRE virtual position", async () => {
+    const { setPaperBalance: setBal } = await import("./paperTrade.js");
+    const { getOrderById, listPaperTrades } = await import("./db.js");
+    // Position: 1.75 WETH on the paper book; quote book empty.
+    setBal({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "1.75" });
+    const id = seedOrder({
+      side: "sell",
+      trigger_type: "price_below",
+      target_price_usd: 2100, // mock price 2000 → triggered
+      base_amount: "max",
+      quote_amount: null,
+      paper: true,
+    });
+    const report = await tick();
+    expect(report.filled).toBe(1);
+    expect(getOrderById(id)?.status).toBe("filled");
+    const fills = listPaperTrades({});
+    expect(fills).toHaveLength(1);
+    // The whole 1.75 WETH position, not a fixed slice.
+    expect(parseFloat(fills[0].base_amount)).toBeCloseTo(1.75, 9);
+    expect(fills[0].direction).toBe("sell");
+  });
+
+  it("max with an empty book fails the fire with PAPER_INSUFFICIENT_BALANCE (terminal)", async () => {
+    const { getOrderById } = await import("./db.js");
+    const id = seedOrder({
+      side: "sell",
+      trigger_type: "price_below",
+      target_price_usd: 2100,
+      base_amount: "max",
+      quote_amount: null,
+      paper: true,
+    });
+    const report = await tick();
+    expect(report.filled).toBe(0);
+    const row = getOrderById(id)!;
+    expect(row.status).toBe("failed");
+    expect(row.last_error_code).toBe("PAPER_INSUFFICIENT_BALANCE");
+  });
+});
+
+describe("createOrderRow — v35 amount validation", () => {
+  const base = {
+    trigger: "price_below" as const,
+    targetPriceUsd: 1800,
+    chain: "base",
+    account: "default",
+    base: WETH as `0x${string}`,
+    quote: USDC as `0x${string}`,
+    paper: true,
+  };
+  it("accepts spend-side max and normalizes case", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    const sell = createOrderRow({ ...base, side: "sell", baseAmount: "MAX" });
+    expect(sell.base_amount).toBe("max");
+    const buy = createOrderRow({ ...base, side: "buy", quoteAmount: "Max" });
+    expect(buy.quote_amount).toBe("max");
+  });
+  it("rejects receive-side max with a teaching error", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    expect(() => createOrderRow({ ...base, side: "buy", baseAmount: "max" })).toThrow(/SPEND side/);
+    expect(() => createOrderRow({ ...base, side: "sell", quoteAmount: "max" })).toThrow(/SPEND side/);
+  });
+  it("rejects garbage amounts at create (not at first fire)", async () => {
+    const { createOrderRow } = await import("./orders.js");
+    expect(() => createOrderRow({ ...base, side: "sell", baseAmount: "lots" })).toThrow(/positive decimal or "max"/);
+    expect(() => createOrderRow({ ...base, side: "buy", quoteAmount: "-5" })).toThrow(/positive decimal or "max"/);
+  });
+});

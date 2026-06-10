@@ -895,3 +895,36 @@ describe("runScheduleTick — v33 crash-window recovery", () => {
     }
   });
 });
+
+// ── v35: "max" sizing on schedules ───────────────────────────
+
+describe("runScheduleTick — max sizing", () => {
+  it("a sell-max schedule liquidates the whole virtual position per fire", async () => {
+    const { setPaperBalance: setBal } = await import("./paperTrade.js");
+    setBal({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "0.8" });
+    const id = seedSchedule({ side: "sell", base_amount: "max", quote_amount: null });
+    const report = await tick();
+    expect(report.fired).toBe(1);
+    const fills = listPaperTrades({});
+    expect(fills).toHaveLength(1);
+    expect(parseFloat(fills[0].base_amount)).toBeCloseTo(0.8, 9);
+    expect(fills[0].direction).toBe("sell");
+    void id;
+  });
+
+  it("createScheduleRow rejects receive-side max", async () => {
+    const { createScheduleRow } = await import("./schedules.js");
+    expect(() =>
+      createScheduleRow({
+        side: "buy",
+        every: "1d",
+        chain: "base",
+        account: "default",
+        base: WETH as `0x${string}`,
+        quote: USDC as `0x${string}`,
+        baseAmount: "max", // receive side of a buy
+        paper: true,
+      }),
+    ).toThrow(/SPEND side/);
+  });
+});

@@ -339,6 +339,11 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
     return b;
   };
 
+  const skipReason = (side: string, raw: string | null): string =>
+    raw != null && raw.toLowerCase() === "max"
+      ? `${side} sized "max" — spend resolves to the live balance at fire time; excluded from runway math (it spends whatever is there)`
+      : `${side} sized in the opposite denomination — spend per fire needs a price; excluded from runway math`;
+
   for (const s of schedules) {
     if (s.id == null) continue;
     const spend = spendOf(s);
@@ -346,7 +351,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
       skipped.push({
         kind: "schedule",
         id: s.id,
-        reason: `${s.side} sized in the opposite denomination — spend per fire needs a price; excluded from runway math`,
+        reason: skipReason(s.side, s.side === "buy" ? s.quote_amount : s.base_amount),
       });
       continue;
     }
@@ -385,7 +390,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
       skipped.push({
         kind: "order",
         id: o.id,
-        reason: `${o.side} sized in the opposite denomination — spend needs a price; excluded from runway math`,
+        reason: skipReason(o.side, o.side === "buy" ? o.quote_amount : o.base_amount),
       });
       continue;
     }

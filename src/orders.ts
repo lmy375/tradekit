@@ -318,6 +318,55 @@ function resolveSymbols(
  *   - expiresAt (if set) is in the future
  *   - side / trigger are recognized literals
  */
+/**
+ * v35: amount validation shared by the order + schedule engines.
+ * Each provided amount must be a positive finite decimal OR the
+ * "max" sentinel — and "max" is legal ONLY on the SPEND side
+ * (sell → baseAmount, buy → quoteAmount): the receive side is
+ * derived from the live quote at fire time, so "max" there is
+ * meaningless. "max" resolves at FIRE time to the current balance
+ * (on-chain for real fires, the virtual book for paper) — the
+ * position-level dynamic sizing that makes "ONE trailing stop
+ * protecting my whole growing position" expressible.
+ *
+ * Returns the normalized values ("MAX" → "max"). Exported for the
+ * schedule engine + tests.
+ */
+export function validateSpendAmounts(args: {
+  side: OrderSide;
+  baseAmount?: string | null;
+  quoteAmount?: string | null;
+  context: string;
+}): { baseAmount: string | null; quoteAmount: string | null } {
+  const check = (field: "baseAmount" | "quoteAmount", raw: string): string => {
+    if (raw.toLowerCase() === "max") {
+      const isSpendSide =
+        (args.side === "sell" && field === "baseAmount") ||
+        (args.side === "buy" && field === "quoteAmount");
+      if (!isSpendSide) {
+        throw new ToolError(
+          "INVALID_PARAMS",
+          `${args.context}: "max" is only valid on the SPEND side (sell → baseAmount, buy → quoteAmount). ` +
+            `The ${field} of a ${args.side} is the RECEIVE side — it's derived from the live quote at fire time.`,
+        );
+      }
+      return "max";
+    }
+    const n = parseFloat(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new ToolError(
+        "INVALID_PARAMS",
+        `${args.context}: ${field} must be a positive decimal or "max" (got "${raw}").`,
+      );
+    }
+    return raw;
+  };
+  return {
+    baseAmount: args.baseAmount != null && args.baseAmount !== "" ? check("baseAmount", args.baseAmount) : null,
+    quoteAmount: args.quoteAmount != null && args.quoteAmount !== "" ? check("quoteAmount", args.quoteAmount) : null,
+  };
+}
+
 export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfig()): OrderRow {
   if (args.side !== "buy" && args.side !== "sell") {
     throw new ToolError("INVALID_PARAMS", `side must be "buy" or "sell" (got "${args.side}").`);
@@ -368,6 +417,13 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
       "Specify exactly one of baseAmount / quoteAmount (matches the trade quote contract — the other side is derived at fill time from the live quote).",
     );
   }
+  // v35: positive decimal or spend-side "max" (normalized lowercase).
+  const normalizedAmounts = validateSpendAmounts({
+    side: args.side,
+    baseAmount: args.baseAmount,
+    quoteAmount: args.quoteAmount,
+    context: "order",
+  });
   if (args.slippageBps != null && (!Number.isInteger(args.slippageBps) || args.slippageBps <= 0 || args.slippageBps > 10_000)) {
     throw new ToolError("INVALID_PARAMS", `slippageBps must be an integer in (0, 10000] (got ${args.slippageBps}).`);
   }
@@ -435,8 +491,8 @@ export function createOrderRow(args: CreateOrderArgs, config: Config = loadConfi
     base_symbol: baseSym,
     quote_token: quote as string,
     quote_symbol: quoteSym,
-    base_amount: hasBase ? args.baseAmount! : null,
-    quote_amount: hasQuote ? args.quoteAmount! : null,
+    base_amount: normalizedAmounts.baseAmount,
+    quote_amount: normalizedAmounts.quoteAmount,
     slippage_bps: args.slippageBps ?? null,
     auto_slippage: args.autoSlippage ?? false,
     expires_at: args.expiresAt ?? null,

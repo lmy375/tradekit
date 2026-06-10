@@ -62,6 +62,7 @@ import type { ChainProfile } from "./chains.js";
 import { loadWallet, loadReadOnlyWallet } from "./wallet.js";
 import { tryNotify } from "./notify.js";
 import { validateOnFillSpec } from "./scheduleHooks.js";
+import { validateSpendAmounts } from "./orders.js";
 
 export type { ScheduleRow, ScheduleStatus, ScheduleFilter } from "./db.js";
 
@@ -155,6 +156,14 @@ export function createScheduleRow(args: CreateScheduleArgs, config: Config = loa
       "Specify exactly one of baseAmount / quoteAmount (matches the trade contract — the other side is derived at fill time from the live quote).",
     );
   }
+  // v35: positive decimal or spend-side "max" — "sell max weekly" is a
+  // staged-liquidation schedule; "buy with max quote" is all-in DCA.
+  const normalizedAmounts = validateSpendAmounts({
+    side: args.side,
+    baseAmount: args.baseAmount,
+    quoteAmount: args.quoteAmount,
+    context: "schedule",
+  });
   if (args.slippageBps != null && (!Number.isInteger(args.slippageBps) || args.slippageBps <= 0 || args.slippageBps > 10_000)) {
     throw new ToolError("INVALID_PARAMS", `slippageBps must be an integer in (0, 10000] (got ${args.slippageBps}).`);
   }
@@ -240,8 +249,8 @@ export function createScheduleRow(args: CreateScheduleArgs, config: Config = loa
     base_symbol: baseSym,
     quote_token: quote as string,
     quote_symbol: quoteSym,
-    base_amount: hasBase ? args.baseAmount! : null,
-    quote_amount: hasQuote ? args.quoteAmount! : null,
+    base_amount: normalizedAmounts.baseAmount,
+    quote_amount: normalizedAmounts.quoteAmount,
     slippage_bps: args.slippageBps ?? null,
     auto_slippage: args.autoSlippage ?? false,
     start_at: startAt,

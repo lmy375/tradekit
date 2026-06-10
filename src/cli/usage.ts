@@ -272,7 +272,13 @@ CONDITIONAL ORDERS
   order create --side buy|sell --trigger price_below|price_above|trailing
                (price triggers: --price <USD>) (trailing: --trail-pct <N> [--price <activation>])
                --base ETH|<addr> --quote USDC|<addr>
-               (--baseAmount A | --quoteAmount A) [--slippage <bps>] [--auto-slippage]
+               (--baseAmount A|max | --quoteAmount A|max) [--slippage <bps>] [--auto-slippage]
+               v35 "max": resolves to the LIVE balance at fire time (sell →
+               whole base position; buy → whole quote balance). ONE trailing
+               stop with --baseAmount max protects the entire growing position
+               — no fixed slice, no restacking after each DCA fire. Spend side
+               only; works for real (on-chain balance), paper (virtual book),
+               and backtests (sim balance).
                [--expires-in 30s|15m|2h|7d|4w | --expires-at <ISO>]
                [--on-fill '<json>' | --on-fill-file <path>]  ← v31: chain follow-up
                order(s) after THIS order fills (same {{filled.X}} dialect as schedule

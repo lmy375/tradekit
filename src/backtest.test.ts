@@ -1235,3 +1235,64 @@ describe("simulatePlaybook — multi-leg bracket hooks", () => {
     ).toThrow(/specs\[1\].*WBTC/s);
   });
 });
+
+// ── v35: "max" sizing in the simulator ───────────────────────
+
+describe("simulatePlaybook — max sizing", () => {
+  it("a trailing-max stop sells the WHOLE accumulated DCA position", () => {
+    // Daily DCA buys 0.5 ETH/day (1000 quote @2000) for 3 days → 1.5 ETH.
+    // A standalone trailing-max order (10%) rides the pump to 3000 and
+    // fires on the crash to 2400 — selling ALL 1.5 ETH, not a fixed slice.
+    const spec = parsePlaybookSpec({
+      name: "dca-plus-max-stop",
+      strategies: [
+        {
+          id: "dca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 1000,
+          base: "ETH", quote: "USDC", maxRuns: 3,
+        },
+        {
+          id: "stop", type: "order", side: "sell", trigger: "trailing", trailPct: 10,
+          base: "ETH", quote: "USDC", baseAmount: "max",
+        },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2000, 2000, 3000, 2400, 2400]);
+    const r = simulatePlaybook({
+      spec,
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 3000 },
+      series,
+    });
+    const stop = r.perStrategy.find((s) => s.strategyId === "stop")!;
+    expect(stop.finalStatus).toBe("filled");
+    // Sold the entire accumulated position: 3 × 0.5 = 1.5 ETH @ 2400.
+    expect(stop.baseDelta).toBeCloseTo(-1.5, 9);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 9);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(1.5 * 2400, 6);
+  });
+
+  it("buy with quoteAmount max goes all-in from the sim balance", () => {
+    const spec = parsePlaybookSpec({
+      name: "all-in",
+      strategies: [
+        {
+          id: "dip", type: "order", side: "buy", trigger: "price_below", price: 1900,
+          base: "ETH", quote: "USDC", quoteAmount: "max",
+        },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 1800, 1800]);
+    const r = simulatePlaybook({
+      spec,
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 900 },
+      series,
+    });
+    const dip = r.perStrategy.find((s) => s.strategyId === "dip")!;
+    expect(dip.finalStatus).toBe("filled");
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0, 9);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(900 / 1800, 9);
+  });
+});

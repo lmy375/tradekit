@@ -1699,6 +1699,8 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Strategy tag propagates.** The auto-created order inherits the schedule's `strategy` column verbatim. A schedule tagged `playbook:1` produces orders tagged `playbook:1` → tradekit's playbook + strategy-budget filters cover them automatically.
 
+**Position-level sizing — `"max"` (v35).** Order and schedule amounts accept the `max` sentinel on the **spend side** (sell → `baseAmount`, buy → `quoteAmount`): it resolves to the live balance at **fire time** — on-chain for real fires, the virtual book for paper, the sim balance in backtests. This makes the most natural stop-loss finally expressible: a DCA grows your position week after week, and ONE `order create --side sell --trigger trailing --trail-pct 10 --baseAmount max` protects **all of it** — no fixed slice, no per-fire restacking, the stop automatically covers whatever you hold when it fires. Receive-side `max` is rejected at create with a teaching error (that side is derived from the quote), garbage amounts now fail at create instead of at first fire, and the funding runway lists `max`-sized primitives under `skipped` with an explicit reason (their spend is by definition "whatever is there"). Caveat: multiple simultaneous `max` stops on the same token race — the first to fire takes the position; pair them in an OCO group.
+
 **Per-fire OCO brackets.** Combine `{{filled.fireNumber}}` with the `group` field to give each fire its own OCO group:
 
 ```jsonc

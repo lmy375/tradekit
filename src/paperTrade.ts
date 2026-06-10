@@ -353,10 +353,47 @@ export async function executePaperTrade(
     req.slippageBps ?? ctx.config.defaultSlippageBps ?? DEFAULT_PAPER_SLIPPAGE_BPS;
   const effectivePrice = applyWorstCaseSlippage(spot, req.direction, slipBps);
 
+  // v35: resolve the "max" sentinel against the VIRTUAL book before
+  // the amount math — the paper twin of executeTrade's on-chain max
+  // resolution (sell max → full base balance; buy with max → full
+  // quote balance). An empty book is a real insufficient-balance
+  // failure, not a zero-amount trade.
+  let reqBaseAmount = req.baseAmount ?? null;
+  let reqQuoteAmount = req.quoteAmount ?? null;
+  const chainKey = ctx.profile.name.toLowerCase();
+  if (reqBaseAmount != null && reqBaseAmount.toLowerCase() === "max") {
+    if (req.direction !== "sell") {
+      throw new ToolError("INVALID_PARAMS", `baseAmount "max" is only valid on sells (the spend side).`);
+    }
+    const bal = readVirtualBalance(ctx.accountLabel, chainKey, baseAddr, baseMeta.decimals);
+    if (bal === 0n) {
+      throw new ToolError(
+        "PAPER_INSUFFICIENT_BALANCE",
+        `Virtual ${baseMeta.symbol} balance is zero — "max" has nothing to sell. Seed the book via: tradekit paper deposit`,
+        { details: { chain: chainKey, account: ctx.accountLabel, token: baseAddr } },
+      );
+    }
+    reqBaseAmount = formatUnits(bal, baseMeta.decimals);
+  }
+  if (reqQuoteAmount != null && reqQuoteAmount.toLowerCase() === "max") {
+    if (req.direction !== "buy") {
+      throw new ToolError("INVALID_PARAMS", `quoteAmount "max" is only valid on buys (the spend side).`);
+    }
+    const bal = readVirtualBalance(ctx.accountLabel, chainKey, quoteAddr, quoteMeta.decimals);
+    if (bal === 0n) {
+      throw new ToolError(
+        "PAPER_INSUFFICIENT_BALANCE",
+        `Virtual ${quoteMeta.symbol} balance is zero — "max" has nothing to spend. Seed the book via: tradekit paper deposit`,
+        { details: { chain: chainKey, account: ctx.accountLabel, token: quoteAddr } },
+      );
+    }
+    reqQuoteAmount = formatUnits(bal, quoteMeta.decimals);
+  }
+
   // Amount math.
   const amounts = computeOppositeAmount({
-    baseAmount: req.baseAmount ?? null,
-    quoteAmount: req.quoteAmount ?? null,
+    baseAmount: reqBaseAmount,
+    quoteAmount: reqQuoteAmount,
     effectivePrice,
   });
 

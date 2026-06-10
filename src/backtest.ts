@@ -1013,10 +1013,19 @@ function simulateFillForState(args: {
   quoteSymbol: string;
 }): PlaybookBacktestFire {
   const { state, pt, balance, baseSymbol, quoteSymbol } = args;
+  // v35: the "max" sentinel resolves against the SIM balance at fire
+  // time — the backtest twin of executeTrade's on-chain resolution.
+  // A zero balance resolves to 0 and the existing insufficient-
+  // balance halt path reports it.
+  const isMax = (v: unknown) => typeof v === "string" && v.toLowerCase() === "max";
   const fillSpec = {
     side: state.spec.side,
-    baseAmount: numericOrUndefined(state.spec.baseAmount),
-    quoteAmount: numericOrUndefined(state.spec.quoteAmount),
+    baseAmount: isMax(state.spec.baseAmount)
+      ? (balance[baseSymbol] ?? 0)
+      : numericOrUndefined(state.spec.baseAmount),
+    quoteAmount: isMax(state.spec.quoteAmount)
+      ? (balance[quoteSymbol] ?? 0)
+      : numericOrUndefined(state.spec.quoteAmount),
   };
   const single = simulateFillAt({
     spec: fillSpec,
