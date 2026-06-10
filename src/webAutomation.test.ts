@@ -392,3 +392,52 @@ describe("/api/runway", () => {
     expect((r.body.buckets as unknown[])).toHaveLength(0);
   });
 });
+
+// ── /api/strategies + strategy-report sections ───────────────
+
+describe("/api/strategies", () => {
+  it("unions trade-history tags with live-primitive tags (zero-fill playbooks appear)", async () => {
+    const { insertTrade } = await import("./db.js");
+    // A tag with trade history but no live primitives…
+    insertTrade({
+      timestamp: "2026-06-01T00:00:00Z",
+      chain: "base", account: "default", direction: "buy",
+      base_token: WETH, base_symbol: "ETH", base_amount: "0.1",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: "200",
+      price: "2000", tx_hash: "0xs1", status: "success",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: "kyberswap", fee_tier: null, notes: null,
+      strategy: "old-tag", realized_slippage_bps: null,
+    });
+    // …and a freshly deployed schedule with zero fills.
+    seedSchedule(); // strategy web-test, active
+    const r = await get("/api/strategies");
+    expect(r.status).toBe(200);
+    const strategies = r.body.strategies as Array<{ tag: string; live: boolean; tradeCount: number }>;
+    const oldTag = strategies.find((s) => s.tag === "old-tag")!;
+    const fresh = strategies.find((s) => s.tag === "web-test")!;
+    expect(oldTag.live).toBe(false);
+    expect(oldTag.tradeCount).toBe(1);
+    expect(fresh.live).toBe(true);
+    expect(fresh.tradeCount).toBe(0);
+    // Live tags sort first.
+    expect(strategies.indexOf(fresh)).toBeLessThan(strategies.indexOf(oldTag));
+  });
+});
+
+describe("/api/strategy-report/:tag — sections", () => {
+  it("subsets to the requested core sections", async () => {
+    seedSchedule();
+    const r = await get("/api/strategy-report/web-test?sections=identity,forward");
+    expect(r.status).toBe(200);
+    const report = r.body.report as Record<string, unknown>;
+    expect(report.identity).toBeDefined();
+    expect(report.forward).toBeDefined();
+    expect(report.performance).toBeUndefined();
+  });
+
+  it("rejects non-core sections (valuation/runway need IO this route refuses)", async () => {
+    const r = await get("/api/strategy-report/web-test?sections=valuation");
+    expect(r.status).toBe(400);
+  });
+});

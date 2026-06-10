@@ -408,3 +408,76 @@ export interface RunwayResp {
 }
 
 export const getRunway = (days = 90) => api.get<RunwayResp>(`/api/runway?days=${days}`);
+
+// ── strategy report ──────────────────────────────────────────
+
+export interface StrategyTag {
+  tag: string;
+  tradeCount: number;
+  lastUsed: string | null;
+  live: boolean;
+}
+export const getStrategies = () =>
+  api.get<{ ok: true; count: number; strategies: StrategyTag[] }>("/api/strategies");
+
+export interface StrategyReportResp {
+  ok: true;
+  report: {
+    tag: string;
+    mode: "real" | "paper";
+    window: string;
+    generatedAt: string;
+    identity?: {
+      displayName: string;
+      playbookId: number | null;
+      playbookStatus: string | null;
+      deployedAt: string | null;
+      ageSeconds: number | null;
+    };
+    composition?: {
+      totals: { orders: number; schedules: number; rebalances: number };
+      lifecycle: Record<string, number>;
+      primitives: Array<{
+        kind: string; id: number; status: string; summary: string;
+        chain: string; account: string; paper: boolean; createdAt: string;
+      }>;
+    };
+    performance?: {
+      fills: number; failures: number; successRate: number | null;
+      buyCount: number; sellCount: number;
+      realizedQuoteSpent: number; realizedQuoteReceived: number; realizedNetQuote: number;
+      avgSlippageBps: number | null; p50SlippageBps: number | null; p95SlippageBps: number | null;
+    };
+    position?: {
+      positions: Array<{ chain: string; token: string; symbol: string | null; netAmount: string; role: string }>;
+    };
+    risk?: {
+      budgets: Array<{
+        pattern: string;
+        lifetimeUsd: number | null; lifetimeSpentUsd: number | null; lifetimePctUsed: number | null;
+        dailyUsd: number | null; dailySpentUsd: number | null; dailyPctUsed: number | null;
+      }>;
+      drawdown: { peakUsd: number; lastValueUsd: number | null; drawdownPct: number | null; tripped: boolean } | null;
+    };
+    activity?: {
+      recentFills: Array<{ at: string; summary: string; txHash: string | null }>;
+      recentFailures: Array<{ at: string; summary: string; txHash: string | null }>;
+    };
+    forward?: {
+      nextScheduleAt: string | null;
+      nextScheduleId: number | null;
+      pendingTriggers: Array<{
+        orderId: number; summary?: string; description?: string;
+        distancePct?: number | null; [k: string]: unknown;
+      }>;
+      rebalanceDrift: Array<{
+        planId: number; name: string | null; lastDriftPct: number | null;
+        thresholdPct: number; pctOfThreshold: number | null; nextRunAt: string;
+      }>;
+    };
+  };
+}
+export const getStrategyReport = (tag: string, window: string, mode: string) =>
+  api.get<StrategyReportResp>(
+    `/api/strategy-report/${encodeURIComponent(tag)}?window=${window}&mode=${mode}`,
+  );

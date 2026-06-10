@@ -55,7 +55,7 @@ import { listRebalancePlans, getRebalancePlanById, type RebalanceStatus } from "
 import { getPlaybookDetail } from "./playbooks.js";
 import { summarizePaperPnl } from "./paperTrade.js";
 import { collectTimeline, parseSinceDuration, ALL_EVENT_KINDS, type EventKind } from "./timeline.js";
-import { buildStrategyReport, type ReportMode, type ReportWindow } from "./strategyReport.js";
+import { buildStrategyReport, type ReportMode, type ReportWindow, type ReportSection } from "./strategyReport.js";
 import { readEngineStatus } from "./engine.js";
 import { getEngineLockState } from "./engineLock.js";
 import { gatherStatusReport, ALL_SECTIONS, type SectionName } from "./status.js";
@@ -326,6 +326,39 @@ export function registerAutomationRoutes(app: Express): void {
   );
 
   // ── strategy report ───────────────────────────────────────
+  // ── strategy tags ─────────────────────────────────────────
+  // Union of trade-history tags and live-primitive tags so a freshly
+  // deployed playbook (zero fills) still appears in the picker.
+  app.get(
+    "/api/strategies",
+    wrap(async (_req, res) => {
+      const { listDistinctStrategies } = await import("./db.js");
+      const fromTrades = listDistinctStrategies({});
+      const byTag = new Map<string, { tag: string; tradeCount: number; lastUsed: string | null; live: boolean }>();
+      for (const r of fromTrades) {
+        if (!r.strategy) continue;
+        byTag.set(r.strategy, { tag: r.strategy, tradeCount: r.tradeCount, lastUsed: r.lastUsed, live: false });
+      }
+      // live = has ACTIVE primitives (enumerateActiveTags would also
+      // include trade-only tags — its semantics are "worth alerting
+      // on", not "currently deployed").
+      const liveTags = new Set<string>();
+      for (const o of listOrders({ status: "active" })) if (o.strategy) liveTags.add(o.strategy);
+      for (const s of listSchedules({ status: "active" })) if (s.strategy) liveTags.add(s.strategy);
+      for (const r of listRebalancePlans({ status: "active" })) if (r.strategy) liveTags.add(r.strategy);
+      for (const tag of liveTags) {
+        const existing = byTag.get(tag);
+        if (existing) existing.live = true;
+        else byTag.set(tag, { tag, tradeCount: 0, lastUsed: null, live: true });
+      }
+      const strategies = Array.from(byTag.values()).sort((a, z) => {
+        if (a.live !== z.live) return a.live ? -1 : 1; // live first
+        return (z.lastUsed ?? "").localeCompare(a.lastUsed ?? "");
+      });
+      res.json({ ok: true, count: strategies.length, strategies });
+    }),
+  );
+
   app.get(
     "/api/strategy-report/:tag",
     wrap(async (req, res) => {
@@ -340,9 +373,22 @@ export function registerAutomationRoutes(app: Express): void {
         throw new ToolError("INVALID_PARAMS", `"mode" must be real | paper | auto.`);
       }
       // Deterministic + network-free by design: no livePriceFn (forward
-      // distances show null) and no valuation section. Live-priced views
-      // stay on the CLI/MCP surfaces where the cost is opted into.
-      const report = await buildStrategyReport({ tag, window, mode });
+      // distances show null) and no valuation/runway sections (they need
+      // oracle/balance IO). Live-priced views stay on the CLI/MCP
+      // surfaces where the cost is opted into. `sections` may subset
+      // the seven core sections.
+      const CORE_SECTIONS = ["identity", "composition", "performance", "position", "risk", "activity", "forward"] as const;
+      let sections: ReportSection[] | undefined;
+      const rawSections = qStr(req, "sections");
+      if (rawSections) {
+        sections = rawSections.split(",").map((x) => x.trim()).filter(Boolean) as ReportSection[];
+        for (const s of sections) {
+          if (!(CORE_SECTIONS as readonly string[]).includes(s)) {
+            throw new ToolError("INVALID_PARAMS", `unknown/unavailable section "${s}"; this route serves: ${CORE_SECTIONS.join(", ")}.`);
+          }
+        }
+      }
+      const report = await buildStrategyReport({ tag, window, mode, sections });
       res.json({ ok: true, report });
     }),
   );

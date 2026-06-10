@@ -2144,6 +2144,7 @@ The server prints a one-time URL with an embedded per-session auth token; open i
 - **Trade** — execute or simulate from the browser, with size-fraction safety hints
 - **Automation** — the engine's situational view: liveness + lock + per-worker health, currently-firing alerts, orders/schedules/rebalance tables with decision-journal drill-in (rebalance rows render drift as a progress bar toward the threshold), deployed playbooks, the paper book, and an on-demand funding-runway card (per spend-token verdicts, red under 7 days); 15s auto-refresh, read-only by construction
 - **Timeline** — the forensic event stream in the browser: every subsystem in one chronological view (trades, decision journals incl. v32 retries + v33 recoveries, alert fires/resolves/breaker trips, engine lifecycle), with window / severity / kind-group / strategy filters, expandable per-event details, date dividers, 30s auto-refresh
+- **Strategy** — the per-tag deep dive: identity + lifecycle composition, window performance (fills / success rate / net quote / slippage percentiles), net positions, risk (budget consumption bars + drawdown), forward signals (next fire, pending triggers, rebalance drift bars), recent activity. Same `buildStrategyReport` core as the CLI — numbers match by construction; deliberately network-free (live-priced valuation stays on the CLI where oracle cost is opted into)
 - **Chart** — TradingView Lightweight Charts driven by OKX public candles
 - **Trades / PnL / Audit** — history tables backed by SQLite
 - **Approvals** — per-row revoke and bulk **Revoke ALL**
@@ -2164,6 +2165,7 @@ The web server also exposes the automation engine's observability core as token-
 | `GET /api/paper[?account&chain]` | virtual balances + realized P&L (same `summarizePaperPnl` core) |
 | `GET /api/timeline[?since&until&kinds&strategy&minSeverity&limit]` | the unified forensic event stream (every kind in `ALL_EVENT_KINDS` — the CLI, MCP, and web whitelists now share one registry) |
 | `GET /api/runway[?days&chain&account&strategy]` | the funding-runway forecast (on-demand — real buckets read on-chain balances) |
+| `GET /api/strategies` | strategy tags: trade history ∪ live primitives (zero-fill playbooks included, live-first sort) |
 | `GET /api/alerts[?tag&limit]` | active alert states + the v28 transition history |
 | `GET /api/strategy-report/:tag[?window&mode]` | the full multi-section strategy report (offline build — no live prices; MTM stays on CLI/MCP where it's explicitly opted into) |
 
