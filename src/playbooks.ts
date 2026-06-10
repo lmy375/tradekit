@@ -854,6 +854,110 @@ function handleOnePrimitive(
 
 // ── promote (paper ⇄ real, in place) ─────────────────────────
 
+/** v36: promote preflight — "if I flipped this paper playbook right
+ *  now, could the REAL wallet fund it?" Runs the funding runway with
+ *  assumeReal (paper primitives bucket as real; balances read the
+ *  actual wallet) scoped to the playbook tag, plus the gas estimate.
+ *  Non-gating by default: the caller decides (CLI --require-funded /
+ *  MCP requireFunded) using preflightBlocker(). */
+export interface PromotePreflight {
+  report: import("./runway.js").RunwayReport;
+  /** Operator-facing findings, worst first. Empty = clean. */
+  warnings: string[];
+  /** True when every evaluable spend/gas bucket covers at least the
+   *  first upcoming fire. Unknown balances do NOT fail this (a dead
+   *  RPC must not block a promote the operator wants) — they warn. */
+  fundedForFirstFire: boolean;
+}
+
+export async function promotePreflight(args: {
+  playbookId: number;
+  config?: Config;
+  horizonDays?: number;
+  /** Test seams — default to the production fetchers. */
+  balanceFetcher?: import("./runway.js").RunwayBalanceFetcher;
+  gasStatsFn?: (chain: string, account: string) => { avgGasNative: number; samples: number } | null;
+  now?: Date;
+}): Promise<PromotePreflight> {
+  const config = args.config ?? loadConfig();
+  const { computeFundingRunway, defaultRunwayBalanceFetcher } = await import("./runway.js");
+  const report = await computeFundingRunway({
+    strategy: `playbook:${args.playbookId}`,
+    assumeReal: true,
+    horizonDays: args.horizonDays ?? 30,
+    balanceFetcher: args.balanceFetcher ?? defaultRunwayBalanceFetcher(config),
+    gasStatsFn: args.gasStatsFn,
+    now: args.now,
+  });
+
+  const warnings: string[] = [];
+  let fundedForFirstFire = true;
+
+  for (const b of report.buckets) {
+    const sym = b.symbol ?? (b.token === "native" ? "native" : b.token.slice(0, 10));
+    const hasObligations = b.totalFiresInHorizon > 0 || b.oneShotReserved > 0;
+    if (!hasObligations) continue;
+    if (b.balance == null) {
+      warnings.push(`${sym} (${b.account}/${b.chain}): real balance UNKNOWN (RPC failed) — cannot verify funding`);
+      continue;
+    }
+    if (b.firesCovered === 0 && (b.totalFiresInHorizon > 0 || b.balance < b.oneShotReserved)) {
+      warnings.push(
+        `${sym} (${b.account}/${b.chain}): real balance ${b.balance} cannot fund even ONE fire ` +
+          `(needs ${b.oneShotReserved > 0 ? `${b.oneShotReserved} reserved for orders` : "the first scheduled fire"}) — the promote would fail immediately`,
+      );
+      fundedForFirstFire = false;
+    } else if (b.exhaustsAt != null) {
+      warnings.push(
+        `${sym} (${b.account}/${b.chain}): covers ${b.firesCovered}/${b.totalFiresInHorizon} fires — runs out ~${b.exhaustsAt.slice(0, 10)} (${b.runwayDays?.toFixed(1)}d)`,
+      );
+    }
+  }
+
+  for (const g of report.gas) {
+    const fires = g.totalFiresInHorizon + g.oneShotOrders;
+    if (fires === 0) continue;
+    if (g.balance == null) {
+      warnings.push(`gas (${g.account}/${g.chain}): native balance UNKNOWN (RPC failed)`);
+      continue;
+    }
+    if (g.avgGasPerFire == null) {
+      warnings.push(`gas (${g.account}/${g.chain}): no trade history on this account — per-fire gas unknown (balance ${g.balance})`);
+      continue;
+    }
+    if (g.firesCovered === 0) {
+      warnings.push(
+        `gas (${g.account}/${g.chain}): native balance ${g.balance} cannot fund even ONE fire at ~${g.avgGasPerFire}/fire — the promote would fail immediately`,
+      );
+      fundedForFirstFire = false;
+    } else if (g.exhaustsAt != null) {
+      warnings.push(
+        `gas (${g.account}/${g.chain}): covers ${g.firesCovered}/${fires} fires — runs out ~${g.exhaustsAt.slice(0, 10)}`,
+      );
+    }
+  }
+
+  // Worst first: hard failures, then unknowns, then soft runway notes.
+  warnings.sort((a, z) => {
+    const rank = (w: string) => (w.includes("even ONE fire") ? 0 : w.includes("UNKNOWN") ? 1 : 2);
+    return rank(a) - rank(z);
+  });
+
+  return { report, warnings, fundedForFirstFire };
+}
+
+/** Pure gate decision for requireFunded callers: returns the blocking
+ *  message, or null when the promote may proceed. */
+export function preflightBlocker(preflight: PromotePreflight): string | null {
+  if (preflight.fundedForFirstFire) return null;
+  const hard = preflight.warnings.filter((w) => w.includes("even ONE fire"));
+  return (
+    `Preflight failed — the real wallet cannot fund the first fire:\n  ` +
+    hard.join("\n  ") +
+    `\nFund the wallet (or run without --require-funded to promote anyway).`
+  );
+}
+
 export interface PromoteResult {
   playbookId: number;
   /** Target mode after the promotion. */

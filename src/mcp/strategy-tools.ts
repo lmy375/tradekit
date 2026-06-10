@@ -289,22 +289,38 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
   // ── playbook_promote ───────────────────────────────────────
   server.tool(
     "playbook_promote",
-    "Flip a deployed playbook between paper and real trading IN PLACE — the dry-run loop's graduation step. Every live primitive (active orders; active+paused schedules/rebalance plans) routes through the same edit machinery as order_edit/schedule_edit/rebalance_edit, so trailing HWM water marks, run counters, and drift telemetry ALL survive: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real. Symmetric: to='paper' demotes a live strategy back to the sandbox without losing state. Rows already in the target mode (or terminal) are reported in skipped[] with reasons; alreadyInTarget=true means nothing flipped. Real balances are NOT pre-checked (same fire-time failure surface as any real primitive) — sanity-check funding with holdings + preview the next fire via strategy_report sections=['forward']. Destructive direction (to real fires actual trades from the next engine tick) requires `yes: true`. Errors: INVALID_PARAMS (id not found, not deployed, no owned primitives, yes missing).",
+    "Flip a deployed playbook between paper and real trading IN PLACE — the dry-run loop's graduation step. Every live primitive (active orders; active+paused schedules/rebalance plans) routes through the same edit machinery as order_edit/schedule_edit/rebalance_edit, so trailing HWM water marks, run counters, and drift telemetry ALL survive: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real. Symmetric: to='paper' demotes a live strategy back to the sandbox without losing state. Rows already in the target mode (or terminal) are reported in skipped[] with reasons; alreadyInTarget=true means nothing flipped. v36: promotes to real run an as-if-real funding PREFLIGHT (the runway machinery with paper primitives bucketed as real — spend tokens AND gas vs the actual wallet); the result's preflight.warnings list findings worst-first and requireFunded=true aborts with INSUFFICIENT_BALANCE when the wallet cannot fund even one fire. Preflight is advisory by default and best-effort (a dead RPC warns, never blocks; skipPreflight disables). Destructive direction (to real fires actual trades from the next engine tick) requires `yes: true`. Errors: INVALID_PARAMS (id not found, not deployed, no owned primitives, yes missing).",
     {
       id: z.number().int().positive().describe("Deployed playbook id."),
       to: z.enum(["real", "paper"]).default("real").describe("Target mode. Default real (graduate the dry-run)."),
       yes: z.literal(true).describe("Confirmation — promotion to real fires actual trades from the next tick; must be `true`."),
+      requireFunded: z.boolean().optional().describe("v36: abort (INSUFFICIENT_BALANCE) when the preflight finds the REAL wallet cannot fund even one fire (spend token or gas). Strongly recommended for agent-driven promotes."),
+      skipPreflight: z.boolean().optional().describe("Skip the as-if-real funding preflight entirely (RPC-less environments). The result then has preflight: null."),
     },
-    async ({ id, to, yes }) => {
+    async ({ id, to, yes, requireFunded, skipPreflight }) => {
       try {
         return ok(
-          await runTool("playbook_promote", rt.opts, { id, to, yes }, undefined, async () => {
+          await runTool("playbook_promote", rt.opts, { id, to, yes, requireFunded, skipPreflight }, undefined, async () => {
             if (yes !== true) {
               throw new ToolError("INVALID_PARAMS", `Confirmation flag required: pass yes=true.`);
             }
-            const { promotePlaybook } = await import("../playbooks.js");
+            const { promotePlaybook, promotePreflight, preflightBlocker } = await import("../playbooks.js");
+            // v36 preflight: as-if-real funding runway scoped to the
+            // playbook. Best-effort (a dead RPC reports as warnings,
+            // never blocks) unless requireFunded gates on the hard
+            // cannot-fund-one-fire findings.
+            let preflight: Awaited<ReturnType<typeof promotePreflight>> | null = null;
+            if (to === "real" && skipPreflight !== true) {
+              try {
+                preflight = await promotePreflight({ playbookId: id });
+              } catch { /* preflight unavailable — proceed (it is advisory by default) */ }
+              if (preflight && requireFunded === true) {
+                const blocker = preflightBlocker(preflight);
+                if (blocker) throw new ToolError("INSUFFICIENT_BALANCE", blocker);
+              }
+            }
             const result = promotePlaybook({ playbookId: id, to });
-            return { ok: true, ...result };
+            return { ok: true, ...result, preflight };
           }),
         );
       } catch (e) {

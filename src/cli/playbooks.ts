@@ -627,13 +627,43 @@ export async function playbookPromoteCommand(flags: Record<string, string>, posi
     }
   }
 
+  // v36 preflight: before flipping to REAL, ask the funding runway
+  // whether the real wallet could actually fund this playbook
+  // (assumeReal buckets + gas estimate). Non-gating by default;
+  // --require-funded aborts on a cannot-fund-one-fire finding;
+  // --skip-preflight for RPC-less environments.
+  let preflight: import("../playbooks.js").PromotePreflight | null = null;
+  if (to === "real" && flags["skip-preflight"] !== "true") {
+    const { promotePreflight, preflightBlocker } = await import("../playbooks.js");
+    try {
+      preflight = await promotePreflight({ playbookId: id });
+    } catch (e) {
+      console.log(`  (preflight unavailable: ${(e as Error).message})`);
+    }
+    if (preflight) {
+      if (flags["json"] !== "true") {
+        if (preflight.warnings.length === 0) {
+          console.log(`  Preflight: ✓ real wallet covers the playbook's upcoming fires (30d window).`);
+        } else {
+          console.log(`  Preflight findings:`);
+          for (const w of preflight.warnings) console.log(`    ${w.includes("even ONE fire") ? "✗" : "⚠"} ${w}`);
+        }
+      }
+      if (flags["require-funded"] === "true") {
+        const blocker = preflightBlocker(preflight);
+        if (blocker) throw new ToolError("INSUFFICIENT_BALANCE", blocker);
+      }
+    }
+  }
+
   const { promotePlaybook } = await import("../playbooks.js");
   const result = promotePlaybook({ playbookId: id, to });
 
   if (flags["json"] === "true") {
-    printJson({ ok: true, ...result });
+    printJson({ ok: true, ...result, preflight });
     return;
   }
+
   if (result.alreadyInTarget) {
     console.log(`Playbook #${id} "${existing.name}" — every live primitive is already ${to}. Nothing to flip.`);
   } else {

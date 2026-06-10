@@ -286,6 +286,11 @@ export interface ComputeRunwayArgs {
   /** Exact strategy tag filter — scopes the forecast to one
    *  strategy's own primitives (used by the funding_runway alert). */
   strategy?: string;
+  /** v36: treat PAPER primitives as real — buckets key paper:false
+   *  and balances read the REAL wallet. The promote preflight's
+   *  question: "if I flipped this paper playbook right now, could
+   *  the real wallet fund it?" */
+  assumeReal?: boolean;
   horizonDays?: number;
   balanceFetcher: RunwayBalanceFetcher;
   /** Historical gas estimator (test seam). Defaults to db
@@ -350,6 +355,9 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
       ? `${side} sized "${raw}" — spend resolves against the live balance at fire time; excluded from runway math (it spends a function of whatever is there)`
       : `${side} sized in the opposite denomination — spend per fire needs a price; excluded from runway math`;
 
+  const effectivePaper = (rowPaper: number | undefined): boolean =>
+    args.assumeReal ? false : (rowPaper ?? 0) === 1;
+
   for (const s of schedules) {
     if (s.id == null) continue;
     const spend = spendOf(s);
@@ -370,7 +378,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
       amountPerFire: spend.amount,
       cron: s.cron_expr,
     };
-    const b = bucketFor(s, (s.paper ?? 0) === 1, spend);
+    const b = bucketFor(s, effectivePaper(s.paper), spend);
     b.obligations.push(obligation);
     b.schedules.push({
       obligation,
@@ -408,7 +416,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
       amountPerFire: spend.amount,
       cron: null,
     };
-    const b = bucketFor(o, (o.paper ?? 0) === 1, spend);
+    const b = bucketFor(o, effectivePaper(o.paper), spend);
     b.obligations.push(obligation);
     b.oneShot += spend.amount;
   }
@@ -483,7 +491,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
   }
   const gasGroups = new Map<string, GasAccum>();
   for (const s of schedules) {
-    if (s.id == null || (s.paper ?? 0) === 1) continue;
+    if (s.id == null || effectivePaper(s.paper)) continue;
     const key = `${s.account} ${s.chain.toLowerCase()}`;
     let g = gasGroups.get(key);
     if (!g) {
@@ -499,7 +507,7 @@ export async function computeFundingRunway(args: ComputeRunwayArgs): Promise<Run
     });
   }
   for (const o of orders) {
-    if (o.id == null || (o.paper ?? 0) === 1) continue;
+    if (o.id == null || effectivePaper(o.paper)) continue;
     const key = `${o.account} ${o.chain.toLowerCase()}`;
     let g = gasGroups.get(key);
     if (!g) {

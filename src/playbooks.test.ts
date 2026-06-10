@@ -862,3 +862,88 @@ describe("playbook ORDER on_fill hooks (v31)", () => {
     expect(err?.message).toContain("strategies[0].onFill");
   });
 });
+
+// ── v36: promote preflight ───────────────────────────────────
+
+describe("promotePreflight", () => {
+  const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  function deployPaperDca() {
+    const spec = parsePlaybookSpec({
+      name: "preflight-test",
+      chain: "base",
+      account: "default",
+      strategies: [
+        { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+      ],
+    });
+    return deployPlaybook({ spec, sourcePath: null, paper: true });
+  }
+
+  /** Deterministic as-if-real fetcher: paper flag must arrive FALSE. */
+  function realFetcher(balances: Record<string, number | null>, calls?: Array<{ token: string; paper: boolean }>) {
+    return async ({ token, paper }: { account: string; chain: string; token: string; paper: boolean }) => {
+      calls?.push({ token, paper });
+      const v = balances[token];
+      return v === undefined || v === null ? null : { amount: v };
+    };
+  }
+
+  it("buckets paper primitives AS REAL and reads the real wallet", async () => {
+    const { promotePreflight } = await import("./playbooks.js");
+    const deploy = deployPaperDca();
+    const calls: Array<{ token: string; paper: boolean }> = [];
+    const pf = await promotePreflight({
+      playbookId: deploy.playbookId,
+      balanceFetcher: realFetcher({ [USDC2]: 1000, native: 1 }, calls),
+      gasStatsFn: () => ({ avgGasNative: 0.001, samples: 10 }),
+    });
+    // Every balance read was as-if-real.
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((c) => c.paper === false)).toBe(true);
+    const usdc = pf.report.buckets.find((b) => b.token === USDC2)!;
+    expect(usdc.paper).toBe(false);
+    expect(pf.fundedForFirstFire).toBe(true);
+    // 1000 covers plenty in 30d — only soft/no warnings.
+    expect(pf.warnings.filter((w) => w.includes("even ONE fire"))).toHaveLength(0);
+  });
+
+  it("an unfunded real wallet fails fundedForFirstFire with a hard warning", async () => {
+    const { promotePreflight, preflightBlocker } = await import("./playbooks.js");
+    const deploy = deployPaperDca();
+    const pf = await promotePreflight({
+      playbookId: deploy.playbookId,
+      balanceFetcher: realFetcher({ [USDC2]: 50, native: 1 }), // < 100/fire
+      gasStatsFn: () => ({ avgGasNative: 0.001, samples: 10 }),
+    });
+    expect(pf.fundedForFirstFire).toBe(false);
+    expect(pf.warnings[0]).toMatch(/cannot fund even ONE fire/);
+    const blocker = preflightBlocker(pf);
+    expect(blocker).toMatch(/Preflight failed/);
+  });
+
+  it("an empty GAS tank fails the gate even when the spend token is funded", async () => {
+    const { promotePreflight } = await import("./playbooks.js");
+    const deploy = deployPaperDca();
+    const pf = await promotePreflight({
+      playbookId: deploy.playbookId,
+      balanceFetcher: realFetcher({ [USDC2]: 10_000, native: 0.0000001 }),
+      gasStatsFn: () => ({ avgGasNative: 0.001, samples: 25 }),
+    });
+    expect(pf.fundedForFirstFire).toBe(false);
+    expect(pf.warnings[0]).toMatch(/gas .* cannot fund even ONE fire/);
+  });
+
+  it("unknown balances WARN but never block (a dead RPC must not gate)", async () => {
+    const { promotePreflight, preflightBlocker } = await import("./playbooks.js");
+    const deploy = deployPaperDca();
+    const pf = await promotePreflight({
+      playbookId: deploy.playbookId,
+      balanceFetcher: realFetcher({}), // every fetch fails
+      gasStatsFn: () => null,
+    });
+    expect(pf.fundedForFirstFire).toBe(true);
+    expect(pf.warnings.some((w) => w.includes("UNKNOWN"))).toBe(true);
+    expect(preflightBlocker(pf)).toBeNull();
+  });
+});
