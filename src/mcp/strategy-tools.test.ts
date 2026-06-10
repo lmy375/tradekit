@@ -100,7 +100,7 @@ function parseResult(result: { content: { type: "text"; text: string }[] }): unk
 // ── registration ─────────────────────────────────────────────
 
 describe("registerStrategyTools — tool registration", () => {
-  it("registers all 9 expected tools", () => {
+  it("registers all 11 expected tools", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
     const names = Array.from(registered.keys());
@@ -109,12 +109,15 @@ describe("registerStrategyTools — tool registration", () => {
     expect(names).toContain("playbook_list");
     expect(names).toContain("playbook_show");
     expect(names).toContain("playbook_destroy");
+    // v2: strategy iteration over MCP.
+    expect(names).toContain("playbook_diff");
+    expect(names).toContain("playbook_replace");
     expect(names).toContain("backtest_order");
     expect(names).toContain("backtest_playbook");
     expect(names).toContain("backtest_compare");
     // Iter31: unified strategy observability.
     expect(names).toContain("strategy_report");
-    expect(names.length).toBe(9);
+    expect(names.length).toBe(11);
   });
 
   it("every tool has a non-empty description", () => {
@@ -326,6 +329,199 @@ describe("playbook_deploy lifecycle", () => {
     registerStrategyTools(server as never, makeRuntime() as never);
     const show = await registered.get("playbook_show")!.handler({ id: 99999 });
     expect(show.isError).toBe(true);
+  });
+
+  it("paper:true cascades to every owned primitive", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = await registered.get("playbook_deploy")!.handler({
+      spec: {
+        name: "paper-deploy-test",
+        chain: "base",
+        account: "default",
+        strategies: [
+          { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+          { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+        ],
+      },
+      paper: true,
+    });
+    const { playbook_id, paper } = parseResult(deploy) as { playbook_id: number; paper: boolean };
+    expect(paper).toBe(true);
+    const show = parseResult(await registered.get("playbook_show")!.handler({ id: playbook_id })) as {
+      primitives: { orders: { paper: number }[]; schedules: { paper: number }[] };
+    };
+    expect(show.primitives.orders[0].paper).toBe(1);
+    expect(show.primitives.schedules[0].paper).toBe(1);
+  });
+});
+
+// ── playbook_diff + playbook_replace (strategy iteration) ────
+
+const ITER_SPEC_V1 = {
+  name: "iter-test",
+  chain: "base",
+  account: "default",
+  strategies: [
+    { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 5, baseAmount: 1, base: "ETH", quote: "USDC" },
+    { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+  ],
+};
+const ITER_SPEC_V2 = {
+  ...ITER_SPEC_V1,
+  strategies: [
+    { id: "trail", type: "order", side: "sell", trigger: "trailing", trailPct: 8, baseAmount: 1, base: "ETH", quote: "USDC" },
+    { id: "dca", type: "schedule", side: "buy", every: "7d", quoteAmount: 100, base: "ETH", quote: "USDC" },
+  ],
+};
+
+describe("playbook_diff", () => {
+  it("classifies an editable trailPct change as modified + applyMode=edit", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+
+    const diff = parseResult(await registered.get("playbook_diff")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V2 })) as {
+      ok: boolean;
+      diff: {
+        noChanges: boolean;
+        summary: { unchanged: number; modified: number };
+        willResetTrailingHwm: boolean;
+        entries: { status: string; applyMode?: string; fieldChanges: { path: string }[] }[];
+      };
+    };
+    expect(diff.ok).toBe(true);
+    expect(diff.diff.noChanges).toBe(false);
+    expect(diff.diff.summary.modified).toBe(1);
+    expect(diff.diff.summary.unchanged).toBe(1);
+    const modified = diff.diff.entries.find((e) => e.status === "modified")!;
+    expect(modified.applyMode).toBe("edit");
+    expect(modified.fieldChanges.map((c) => c.path)).toEqual(["trailPct"]);
+    expect(diff.diff.willResetTrailingHwm).toBe(false); // edit keeps HWM
+
+    // Read-only: nothing changed in the DB.
+    const show = parseResult(await registered.get("playbook_show")!.handler({ id: deploy.playbook_id })) as {
+      primitives: { orders: { trail_pct: number }[] };
+    };
+    expect(show.primitives.orders[0].trail_pct).toBe(5);
+  });
+
+  it("missing id and non-deployed playbook both return isError", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const missing = await registered.get("playbook_diff")!.handler({ id: 99999, spec: ITER_SPEC_V1 });
+    expect(missing.isError).toBe(true);
+
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+    await registered.get("playbook_destroy")!.handler({ id: deploy.playbook_id, yes: true });
+    const destroyed = await registered.get("playbook_diff")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V2 });
+    expect(destroyed.isError).toBe(true);
+  });
+});
+
+describe("playbook_replace", () => {
+  it("edits the trailing order in place — same row id, HWM preserved", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+
+    // Engine has been tracking a HWM.
+    const db = openDb();
+    const orderRow = db.prepare(`SELECT id FROM orders WHERE strategy = ?`).get(`playbook:${deploy.playbook_id}`) as { id: number };
+    db.prepare(`UPDATE orders SET water_mark_usd = 3500 WHERE id = ?`).run(orderRow.id);
+
+    const replace = parseResult(
+      await registered.get("playbook_replace")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V2, yes: true }),
+    ) as {
+      ok: boolean;
+      no_changes: boolean;
+      edited: { type: string; rowId: number; fields: string[] }[];
+      cancelled: number[];
+      created: unknown[];
+      paper: boolean;
+    };
+    expect(replace.ok).toBe(true);
+    expect(replace.no_changes).toBe(false);
+    expect(replace.edited).toEqual([{ type: "order", rowId: orderRow.id, localId: "trail", fields: ["trailPct"] }]);
+    expect(replace.cancelled).toEqual([]);
+    expect(replace.created).toEqual([]);
+    expect(replace.paper).toBe(false);
+
+    const after = db.prepare(`SELECT trail_pct, water_mark_usd, status FROM orders WHERE id = ?`).get(orderRow.id) as {
+      trail_pct: number; water_mark_usd: number; status: string;
+    };
+    expect(after.trail_pct).toBe(8);
+    expect(after.water_mark_usd).toBe(3500);
+    expect(after.status).toBe("active");
+  });
+
+  it("identical spec is a no-op that doesn't touch the playbook row", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+    const db = openDb();
+    const before = db.prepare(`SELECT deployed_at, source_hash FROM playbooks WHERE id = ?`).get(deploy.playbook_id) as { deployed_at: string; source_hash: string };
+
+    const replace = parseResult(
+      await registered.get("playbook_replace")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V1, yes: true }),
+    ) as { ok: boolean; no_changes: boolean };
+    expect(replace.ok).toBe(true);
+    expect(replace.no_changes).toBe(true);
+
+    const afterRow = db.prepare(`SELECT deployed_at, source_hash FROM playbooks WHERE id = ?`).get(deploy.playbook_id) as { deployed_at: string; source_hash: string };
+    expect(afterRow).toEqual(before);
+  });
+
+  it("preserve_state:false recreates with fresh HWM", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+    const db = openDb();
+    const orderRow = db.prepare(`SELECT id FROM orders WHERE strategy = ?`).get(`playbook:${deploy.playbook_id}`) as { id: number };
+    db.prepare(`UPDATE orders SET water_mark_usd = 3500 WHERE id = ?`).run(orderRow.id);
+
+    const replace = parseResult(
+      await registered.get("playbook_replace")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V2, preserve_state: false, yes: true }),
+    ) as { edited: unknown[]; cancelled: number[]; created: unknown[] };
+    expect(replace.edited).toEqual([]);
+    expect(replace.cancelled).toEqual([orderRow.id]);
+    expect(replace.created.length).toBe(1);
+
+    const active = db.prepare(`SELECT id, water_mark_usd FROM orders WHERE strategy = ? AND status = 'active' AND trigger_type = 'trailing'`).get(`playbook:${deploy.playbook_id}`) as { id: number; water_mark_usd: number | null };
+    expect(active.id).not.toBe(orderRow.id);
+    expect(active.water_mark_usd).toBeNull();
+  });
+
+  it("paper deployment stays paper through replace (added primitives inherit)", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(
+      await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1, paper: true }),
+    ) as { playbook_id: number };
+
+    const withTp = {
+      ...ITER_SPEC_V1,
+      strategies: [
+        ...ITER_SPEC_V1.strategies,
+        { id: "tp", type: "order", side: "sell", trigger: "price_above", price: 5000, baseAmount: 0.5, base: "ETH", quote: "USDC" },
+      ],
+    };
+    const replace = parseResult(
+      await registered.get("playbook_replace")!.handler({ id: deploy.playbook_id, spec: withTp, yes: true }),
+    ) as { paper: boolean; created: { rowId: number }[] };
+    expect(replace.paper).toBe(true);
+
+    const db = openDb();
+    const tp = db.prepare(`SELECT paper FROM orders WHERE id = ?`).get(replace.created[0].rowId) as { paper: number };
+    expect(tp.paper).toBe(1);
+  });
+
+  it("requires yes=true", async () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const deploy = parseResult(await registered.get("playbook_deploy")!.handler({ spec: ITER_SPEC_V1 })) as { playbook_id: number };
+    const r = await registered.get("playbook_replace")!.handler({ id: deploy.playbook_id, spec: ITER_SPEC_V2 });
+    expect(r.isError).toBe(true);
   });
 });
 

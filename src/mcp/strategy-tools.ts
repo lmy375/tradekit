@@ -1,5 +1,6 @@
 // MCP strategy tools: playbook lifecycle (validate / deploy / list /
-// show / destroy) + backtest surface (order / playbook / compare).
+// show / diff / replace / destroy) + backtest surface (order /
+// playbook / compare).
 //
 // Composes the iter17 / iter18 / iter21 / iter22 features into an
 // agent-callable interface. Operators using tradekit through an MCP
@@ -22,7 +23,8 @@ import {
   renderTemplate,
   type VarValue,
 } from "../playbookTemplate.js";
-import { listPlaybooks } from "../db.js";
+import { computePlaybookDiff, replacePlaybook } from "../playbookReplace.js";
+import { listPlaybooks, getPlaybookById } from "../db.js";
 import { loadConfig, resolveProfile } from "../config.js";
 import { resolveTradePair } from "../chains.js";
 import {
@@ -114,22 +116,112 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
   // ── playbook_deploy ────────────────────────────────────────
   server.tool(
     "playbook_deploy",
-    "Atomically deploy a playbook spec → creates orders / schedules / rebalance plans transactionally. Any per-primitive failure rolls back the whole bundle and deletes the playbook row. Idempotent on spec hash (same hash + same name = no-op returning the existing id). Errors: INVALID_PARAMS (spec validation failure; same-name-different-hash conflict — message names the existing id and `tradekit playbook destroy` to clear).",
+    "Atomically deploy a playbook spec → creates orders / schedules / rebalance plans transactionally. Any per-primitive failure rolls back the whole bundle and deletes the playbook row. Idempotent on spec hash (same hash + same name = no-op returning the existing id). `paper: true` cascades to EVERY primitive in the spec — the whole strategy fires against the virtual book (seed it with paper_deposit first), no real trades, no keystore. Errors: INVALID_PARAMS (spec validation failure; same-name-different-hash conflict — message names the existing id and `tradekit playbook destroy` to clear).",
     {
       spec: playbookSpecShape,
       vars: varsShape,
+      paper: z.boolean().optional().describe("Deploy in paper mode: every order/schedule/rebalance fires against the virtual book instead of trading. The full dry-run loop — pair with paper_balances / paper_trades / paper_pnl."),
     },
-    async ({ spec, vars }) => {
+    async ({ spec, vars, paper }) => {
       try {
         return ok(
-          await runTool("playbook_deploy", rt.opts, { spec, vars }, undefined, async () => {
+          await runTool("playbook_deploy", rt.opts, { spec, vars, paper }, undefined, async () => {
             const parsed = renderAndParse(spec, vars as Record<string, VarValue> | undefined);
-            const result = deployPlaybook({ spec: parsed, sourcePath: null });
+            const result = deployPlaybook({ spec: parsed, sourcePath: null, ...(paper === true ? { paper: true } : {}) });
             return {
               ok: true,
               playbook_id: result.playbookId,
               already_deployed: result.alreadyDeployed,
+              paper: paper === true,
               items: result.items,
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── playbook_diff ──────────────────────────────────────────
+  server.tool(
+    "playbook_diff",
+    "Read-only preview of what playbook_replace would change: compares a deployed playbook's spec against a new spec WITHOUT touching state. Each primitive lands in one of four buckets (unchanged / modified / added / removed); modified entries carry field-level changes plus an `applyMode` — 'edit' (applied IN PLACE on replace: trailing HWM, run counters, journal continuity all preserved) or 'recreate' (cancel + create; `recreateReason` names the frozen field that forced it — OCO group, chain, account, schedule startAt/name; rebalance plans always recreate but carry run counters). `willResetTrailingHwm: true` warns that a modified trailing order must be recreated and loses its high-water mark. Templates supported via `vars`. Returns { ok, diff: { oldHash, newHash, noChanges, entries[], summary, willResetTrailingHwm } }. Errors: INVALID_PARAMS (id not found, playbook not deployed, spec validation failure).",
+    {
+      id: z.number().int().positive().describe("Deployed playbook id (from playbook_list)."),
+      spec: playbookSpecShape,
+      vars: varsShape,
+    },
+    async ({ id, spec, vars }) => {
+      try {
+        return ok(
+          await runTool("playbook_diff", rt.opts, { id, spec, vars }, undefined, async () => {
+            const row = getPlaybookById(id);
+            if (!row) throw new ToolError("INVALID_PARAMS", `No playbook with id ${id}.`);
+            if (row.status !== "deployed") {
+              throw new ToolError("INVALID_PARAMS", `Playbook #${id} is "${row.status}" — diff requires a deployed playbook.`);
+            }
+            const newSpec = renderAndParse(spec, vars as Record<string, VarValue> | undefined);
+            const oldSpec = parsePlaybookSpec(JSON.parse(row.spec_json));
+            const diff = computePlaybookDiff({ oldSpec, newSpec, playbookId: id });
+            return { ok: true, diff };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  // ── playbook_replace ───────────────────────────────────────
+  server.tool(
+    "playbook_replace",
+    "Atomically apply a new spec to a deployed playbook — the strategy-iteration path (vs destroy+deploy, which loses ALL running state). Modified primitives whose changes are in-place editable (price, trailPct, amounts, slippage, expiry/endAt, maxRuns, cadence, note) are EDITED via the same machinery as order_edit/schedule_edit: same row id, trailing HWM, run_count/max_runs accounting, and journal continuity survive. Frozen-field changes (OCO group, chain, account, schedule startAt/name) force cancel+recreate; recreated schedules/rebalance plans still carry their run counters. Pre-validates EVERYTHING before cancelling anything, so a defective spec can't leave partial state. Paper-ness is inferred from the playbook's owned rows (replacing a paper deployment stays paper) — override with `paper`. `preserve_state: false` recreates every modified primitive with fresh state (HWM + counters reset). Returns { ok, no_changes } when specs are identical (nothing touched), else { ok, diff, edited[], cancelled[], created[], paper, oldHash, newHash }. Destructive (cancels primitives); requires `yes: true`. Preview first with playbook_diff. Errors: INVALID_PARAMS (id not found, not deployed, spec/edit validation failure, yes missing).",
+    {
+      id: z.number().int().positive().describe("Deployed playbook id to replace."),
+      spec: playbookSpecShape,
+      vars: varsShape,
+      preserve_state: z.boolean().optional().describe("Default true: edit-in-place where possible + carry run counters on recreate. false = v1 behavior, recreate everything with fresh state."),
+      paper: z.boolean().optional().describe("Override paper inference for recreated/added primitives. Omit to inherit the deployment's paper-ness from its owned rows."),
+      yes: z.literal(true).describe("Confirmation flag — replace cancels primitives; must be `true`."),
+    },
+    async ({ id, spec, vars, preserve_state, paper, yes }) => {
+      try {
+        return ok(
+          await runTool("playbook_replace", rt.opts, { id, spec, vars, preserve_state, paper, yes }, undefined, async () => {
+            if (yes !== true) {
+              throw new ToolError("INVALID_PARAMS", `Confirmation flag required: pass yes=true.`);
+            }
+            const row = getPlaybookById(id);
+            if (!row) throw new ToolError("INVALID_PARAMS", `No playbook with id ${id}.`);
+            if (row.status !== "deployed") {
+              throw new ToolError("INVALID_PARAMS", `Playbook #${id} is "${row.status}" — replace requires a deployed playbook.`);
+            }
+            const newSpec = renderAndParse(spec, vars as Record<string, VarValue> | undefined);
+            // Mirror the CLI: identical specs are a read-only no-op —
+            // don't touch the playbook row (deployed_at would bump).
+            const oldSpec = parsePlaybookSpec(JSON.parse(row.spec_json));
+            const preview = computePlaybookDiff({ oldSpec, newSpec, playbookId: id });
+            if (preview.noChanges) {
+              return { ok: true, no_changes: true };
+            }
+            const result = replacePlaybook({
+              playbookId: id,
+              newSpec,
+              newSourcePath: null,
+              ...(preserve_state === false ? { preserveState: false } : {}),
+              ...(paper != null ? { paper } : {}),
+            });
+            return {
+              ok: true,
+              no_changes: false,
+              diff: result.diff,
+              edited: result.edited,
+              cancelled: result.cancelled,
+              created: result.created,
+              paper: result.paper,
+              oldHash: result.oldHash,
+              newHash: result.newHash,
             };
           }),
         );

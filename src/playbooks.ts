@@ -450,21 +450,40 @@ export function deployPlaybook(args: {
     if (existing.source_hash === hash) {
       return { playbookId: existing.id, alreadyDeployed: true, items: [] };
     }
-    // The error text names the exact recovery command. We don't attach a
-    // structured `nextActions` because playbooks are CLI-only in v1 (no
-    // MCP surface yet) and the invariant in errors.test.ts requires every
-    // nextAction.tool to map to a registered MCP tool name.
+    // Recovery paths, best first: playbook_replace applies the new spec
+    // to the EXISTING deployment with state preservation (trailing HWM,
+    // run counters survive) — destroy+redeploy is the state-losing
+    // fallback. Both exist as MCP tools, so structured nextActions are
+    // attached for agent dispatch (errors.test.ts pins the tool names).
     throw new ToolError(
       "INVALID_PARAMS",
       `Playbook "${spec.name}" is already deployed as #${existing.id} with a different spec. ` +
-        `Destroy the existing deployment first with \`tradekit playbook destroy ${existing.id}\`, ` +
-        `then redeploy.`,
+        `To iterate on the deployed strategy WITHOUT losing running state, use ` +
+        `\`tradekit playbook replace ${existing.id} <spec-file>\` (or the playbook_replace MCP tool). ` +
+        `To start over, destroy first with \`tradekit playbook destroy ${existing.id}\`, then redeploy.`,
       {
         details: {
           existing_id: existing.id,
           existing_hash: existing.source_hash,
           incoming_hash: hash,
         },
+        nextActions: [
+          {
+            tool: "playbook_diff",
+            params: { id: existing.id },
+            reason: "Preview what the new spec would change against the deployed playbook (read-only).",
+          },
+          {
+            tool: "playbook_replace",
+            params: { id: existing.id, yes: true },
+            reason: "Apply the new spec to the existing deployment — preserves trailing HWM + run counters where possible.",
+          },
+          {
+            tool: "playbook_destroy",
+            params: { id: existing.id, yes: true },
+            reason: "Tear down the existing deployment to start fresh (loses all running state).",
+          },
+        ],
       },
     );
   }

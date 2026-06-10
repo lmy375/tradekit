@@ -1933,13 +1933,13 @@ In `--summary` mode the same check renders as one line, suitable for piping into
 tradekit mcp --pass <password>
 ```
 
-Starts an MCP stdio server exposing 104 tools across six groups:
+Starts an MCP stdio server exposing 106 tools across six groups:
 
 - **Data / inspect** (18) — `chains`, `gas`, `price`, `check_price`, `holdings`, `portfolio`, `portfolio_snapshot`, `portfolio_history`, `portfolio_diff`, `trending`, `pnl`, `viewTx`, `health`, `token_info`, `aggregator_stats`, `pair_stats`, `slippage_suggest`, `strategies_list`
 - **Trade & automation** (29) — `quote`, `buy`, `sell`, `transfer`, `import_trade`, `preview_trade`, `preflight_trade`, `sweep_balances`, `order_create`, `order_list`, `order_show`, `order_cancel`, `order_edit`, `order_run`, `schedule_create`, `schedule_list`, `schedule_show`, `schedule_pause`, `schedule_resume`, `schedule_cancel`, `schedule_edit`, `schedule_run`, `rebalance_create`, `rebalance_list`, `rebalance_show`, `rebalance_pause`, `rebalance_resume`, `rebalance_cancel`, `rebalance_run`
 - **Security** (8) — `allowances`, `audit_allowances`, `approve`, `revoke`, `revoke_all`, `check_token`, `safety_drawdown`, `safety_reset_drawdown`
 - **Admin / diagnostics** (26) — `status`, `accounts`, `audit`, `reconcile`, `recent_trades`, `config`, `config_preflight`, `doctor`, `verify`, `sync_trades`, `list_sync_bookmarks`, `address`, `analyze_trade`, `diagnose_pending`, `speedup_tx`, `cancel_tx`, `notify_list`, `notify_test`, `engine_run`, `engine_status`, `engine_lock`, `engine_unlock`, `bulk_halt`, `bulk_resume`, `db_stats`, `db_integrity_check`
-- **Strategy & backtest** (9) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
+- **Strategy & backtest** (11) — `playbook_validate`, `playbook_deploy`, `playbook_list`, `playbook_show`, `playbook_diff`, `playbook_replace`, `playbook_destroy`, `backtest_order`, `backtest_playbook`, `backtest_compare`, `strategy_report`
 - **Observability** (10) — `status_dashboard`, `digest_summary`, `order_replay`, `backtest_list`, `backtest_show`, `backtest_compare_list`, `backtest_compare_show`, `timeline_query`, `engine_events`, `price_stats`
 - **Paper trading** (5) — `paper_balances`, `paper_trades`, `paper_pnl`, `paper_deposit`, `paper_reset` — manage the virtual book that `paper: true` orders / schedules / playbooks trade against (seed funds, inspect positions + fills, realized P&L, reset) so an agent can dry-run a whole strategy without touching real capital.
 
@@ -2204,10 +2204,12 @@ Tools exposed via the `tradekit mcp` server, grouped by domain:
 - `paper_reset` is destructive (wipes balances + fill journal for a scope) and requires `confirm: true`; omitting both `account` and `chain` wipes the whole book
 
 **Iter26 — strategy lifecycle (playbooks + backtests):**
-- **Playbook management:** `playbook_validate` `playbook_deploy` `playbook_list` `playbook_show` `playbook_destroy`
+- **Playbook management:** `playbook_validate` `playbook_deploy` `playbook_list` `playbook_show` `playbook_diff` `playbook_replace` `playbook_destroy`
   - All accept structured JSON specs directly (no file paths required)
   - Template support: pass `vars: { NAME: value }` to render `{{NAME}}` placeholders before validation
-  - `playbook_deploy` is atomic (mid-deploy failure rolls back) and idempotent on spec hash
+  - `playbook_deploy` is atomic (mid-deploy failure rolls back), idempotent on spec hash, and takes `paper: true` to deploy the whole strategy against the virtual book — the complete dry-run loop over MCP (deploy paper → watch `paper_trades` → read `paper_pnl mtm:true` → `playbook_replace` to iterate → redeploy real)
+  - `playbook_diff` is the read-only preview: four buckets (unchanged/modified/added/removed), field-level changes, and per-entry `applyMode` (edit-in-place vs cancel+recreate) so an agent knows whether a change preserves trailing HWM / run counters BEFORE applying
+  - `playbook_replace` applies a new spec atomically with the v2 state-preservation semantics (in-place edits where possible, run-counter carry on recreate, paper-ness inherited from owned rows); `preserve_state: false` opts into a full state reset; requires `yes: true`
   - `playbook_destroy` requires `yes: true` and cascades cancel to all owned primitives
 - **Backtests:** `backtest_order` `backtest_playbook` `backtest_compare` `backtest_list` `backtest_show` `backtest_compare_list` `backtest_compare_show`
   - Single-strategy + multi-strategy + multi-scenario comparison
