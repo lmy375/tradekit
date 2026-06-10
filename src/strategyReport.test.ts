@@ -1245,3 +1245,58 @@ describe("sparkline (CLI helper)", () => {
     expect(wide[39]).toBe("█");
   });
 });
+
+// ── runway section (opt-in) ─────────────────────────────────
+
+describe("buildStrategyReport — runway section", () => {
+  const WETH2 = "0x4200000000000000000000000000000000000006";
+  const USDC2 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+  it("scopes the forecast to the tag's own primitives via the injected fetcher", async () => {
+    insertSchedule({
+      name: "dca-mine",
+      cron_expr: "0 0 * * 1",
+      next_run_at: "2026-06-15T00:00:00.000Z",
+      side: "buy",
+      chain: "base",
+      account: "default",
+      base_token: WETH2, base_symbol: "WETH",
+      quote_token: USDC2, quote_symbol: "USDC",
+      base_amount: null, quote_amount: "100",
+      slippage_bps: 50, auto_slippage: false,
+      start_at: null, end_at: null, max_runs: null,
+      strategy: "runway-tag", note: null, paper: false,
+    });
+    insertSchedule({
+      name: "dca-other",
+      cron_expr: "0 0 * * 1",
+      next_run_at: "2026-06-15T00:00:00.000Z",
+      side: "buy",
+      chain: "base",
+      account: "default",
+      base_token: WETH2, base_symbol: "WETH",
+      quote_token: USDC2, quote_symbol: "USDC",
+      base_amount: null, quote_amount: "999",
+      slippage_bps: 50, auto_slippage: false,
+      start_at: null, end_at: null, max_runs: null,
+      strategy: "someone-else", note: null, paper: false,
+    });
+
+    const report = await buildStrategyReport({
+      tag: "runway-tag",
+      sections: ["identity", "runway"],
+      nowFn: () => new Date("2026-06-10T00:00:00.000Z"),
+      runwayBalanceFetcher: async () => ({ amount: 250 }),
+    });
+    expect(report.runway).toBeDefined();
+    expect(report.runway!.buckets).toHaveLength(1);
+    const b = report.runway!.buckets[0];
+    expect(b.obligations).toHaveLength(1); // only the tag's own schedule
+    expect(b.obligations[0].name).toBe("dca-mine");
+    // 250 covers 2 × 100 fires; the 3rd (Jun 29) exhausts.
+    expect(b.firesCovered).toBe(2);
+    expect(b.exhaustsAt).toBe("2026-06-29T00:00:00.000Z");
+    // Sections not requested stay absent.
+    expect(report.forward).toBeUndefined();
+  });
+});

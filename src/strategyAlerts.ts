@@ -513,6 +513,70 @@ export const evaluateDriftProximity: EvaluateFn<
   });
 };
 
+/** funding_runway — the strategy's spend-token balance is projected
+ *  to run out within thresholdDays. Reads the opt-in runway report
+ *  section (balance reads happen at report-build time, same edge-IO
+ *  pattern as trigger_proximity's live price). The shortest-runway
+ *  bucket decides; buckets with unknown balances are skipped (a dead
+ *  RPC must not page anyone). Catches insufficient-balance failures
+ *  BEFORE the first fire_failed — and composes with action:"pause"
+ *  (out of fuel → stop firing into guaranteed failures). */
+export const evaluateFundingRunway: EvaluateFn<
+  Extract<StrategyAlertRule, { type: "funding_runway" }>
+> = ({ tag, rule, report }) => {
+  const evaluation = (over: Partial<AlertEvaluation>): AlertEvaluation => ({
+    tag,
+    ruleType: rule.type,
+    rule,
+    applicable: false,
+    violated: false,
+    message: "",
+    value: {},
+    ...over,
+  });
+  const runway = report.runway;
+  if (!runway) return evaluation({ message: "runway section missing" });
+  let shortest: typeof runway.buckets[number] | null = null;
+  for (const b of runway.buckets) {
+    if (b.balance == null) continue; // balance fetch failed — skip, don't guess
+    if (b.totalFiresInHorizon === 0 && b.oneShotReserved === 0) continue; // nothing burns this token
+    if (b.runwayDays == null) continue; // survives the whole horizon
+    if (!shortest || (shortest.runwayDays ?? Infinity) > b.runwayDays) shortest = b;
+  }
+  if (!shortest) {
+    const evaluable = runway.buckets.some((b) => b.balance != null && (b.totalFiresInHorizon > 0 || b.oneShotReserved > 0));
+    if (!evaluable) return evaluation({ message: "no recurring spend (or balances unknown)" });
+    return evaluation({
+      applicable: true,
+      violated: false,
+      message: `all spend tokens survive the ${runway.horizonDays}d horizon`,
+      value: { horizonDays: runway.horizonDays },
+    });
+  }
+  const violated = shortest.runwayDays! <= rule.thresholdDays;
+  const sym = shortest.symbol ?? shortest.token;
+  return evaluation({
+    applicable: true,
+    violated,
+    message: violated
+      ? `${sym} runs out in ${shortest.runwayDays!.toFixed(1)}d (≤ ${rule.thresholdDays}d): balance ${shortest.balance!.toFixed(4)} covers ${shortest.firesCovered}/${shortest.totalFiresInHorizon} upcoming fires`
+      : `shortest runway ${shortest.runwayDays!.toFixed(1)}d on ${sym} (> ${rule.thresholdDays}d)`,
+    value: {
+      token: shortest.token,
+      symbol: shortest.symbol,
+      chain: shortest.chain,
+      account: shortest.account,
+      paper: shortest.paper,
+      balance: shortest.balance,
+      runwayDays: shortest.runwayDays,
+      exhaustsAt: shortest.exhaustsAt,
+      firesCovered: shortest.firesCovered,
+      totalFiresInHorizon: shortest.totalFiresInHorizon,
+      thresholdDays: rule.thresholdDays,
+    },
+  });
+};
+
 const EVALUATORS = {
   staleness: evaluateStaleness,
   slippage_trend: evaluateSlippageTrend,
@@ -522,6 +586,7 @@ const EVALUATORS = {
   drawdown_threshold: evaluateDrawdownThreshold,
   trigger_proximity: evaluateTriggerProximity,
   drift_proximity: evaluateDriftProximity,
+  funding_runway: evaluateFundingRunway,
 } as const;
 
 /** Evaluate every applicable rule against a single strategy's
@@ -649,6 +714,7 @@ const SEVERITY_BY_RULE: Record<StrategyAlertRule["type"], NotificationEvent["sev
   drawdown_threshold: "critical",
   trigger_proximity: "info",
   drift_proximity: "info",
+  funding_runway: "warn",
 };
 
 // ── runner ──────────────────────────────────────────────────
@@ -974,7 +1040,7 @@ export async function runAlertTick(args: RunAlertTickArgs): Promise<AlertTickRep
 /** Determine which report sections are needed to evaluate a given
  *  rule set. Exported for testing. */
 export function sectionsForRules(rules: StrategyAlertRule[]) {
-  const needed = new Set<"identity" | "composition" | "performance" | "position" | "risk" | "activity" | "forward">();
+  const needed = new Set<"identity" | "composition" | "performance" | "position" | "risk" | "activity" | "forward" | "runway">();
   // Always include identity for the displayName in notifications.
   needed.add("identity");
   for (const rule of rules) {
@@ -997,6 +1063,9 @@ export function sectionsForRules(rules: StrategyAlertRule[]) {
       case "trigger_proximity":
       case "drift_proximity":
         needed.add("forward");
+        break;
+      case "funding_runway":
+        needed.add("runway");
         break;
     }
   }

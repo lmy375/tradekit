@@ -336,6 +336,16 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   strategy list [--chain X] [--account L] [--json]
         Alias for \`strategies list\` — surfaces every distinct strategy tag in the
         trades table with fill counts and last-seen timestamps.
+  runway [--chain X] [--account L] [--strategy TAG] [--days N] [--json]
+        Funding-runway forecast: will my automation run out of money, and WHEN?
+        Walks every active schedule's upcoming cron fires (respecting end-at +
+        remaining max-runs budget) + reserves active orders' one-shot spends,
+        replayed against current balances (paper book for paper primitives,
+        on-chain read for real). Price-free spend accounting: buys burn quote,
+        sells burn base; opposite-denomination sizing is listed as skipped.
+        "USDC covers 3 more DCA fires; runs out Thursday" — BEFORE the first
+        fire_failed. Pair with the funding_runway alert rule for push (or
+        action:"pause" to stop firing into guaranteed failures).
   strategy pause <tag> [--json]
         Bulk-pause EVERY active primitive (orders / schedules / rebalance plans)
         owned by the strategy tag in one command. Non-destructive — nothing is

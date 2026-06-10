@@ -70,6 +70,7 @@ import {
   type DrawdownStateRow,
 } from "./db.js";
 import { loadConfig, type Config } from "./config.js";
+import type { RunwayBalanceFetcher, RunwayReport } from "./runway.js";
 import { computePaperPnlMtm, type PaperPriceFetcher, type PaperPositionEntry } from "./paperPnl.js";
 import { evaluateTrailingTrigger } from "./trailingStop.js";
 import { isOrderTriggered, isOrderExpired } from "./orders.js";
@@ -89,7 +90,12 @@ export type ReportSection =
   /** Opt-in (NOT in the default set — pricing open positions needs a
    *  live oracle call per held token, which makes the report
    *  non-deterministic). Cost-basis positions marked to market. */
-  | "valuation";
+  | "valuation"
+  /** Opt-in (NOT in the default set — needs balance reads: paper
+   *  book for paper primitives, on-chain balanceOf for real ones).
+   *  Funding runway: how long current balances sustain the
+   *  strategy's upcoming schedule fires + reserved order spends. */
+  | "runway";
 
 export interface BuildStrategyReportArgs {
   /** The strategy tag. A bare number is interpreted as a playbook id
@@ -114,6 +120,10 @@ export interface BuildStrategyReportArgs {
    *  basis but every open position is unpriced (deterministic +
    *  offline — useful for tests and air-gapped report generation). */
   markPriceFn?: PaperPriceFetcher;
+  /** Balance source for the runway section. Defaults to the
+   *  production fetcher (paper book / on-chain balanceOf). Tests
+   *  inject a deterministic one. */
+  runwayBalanceFetcher?: RunwayBalanceFetcher;
   /** Test seam: defaults to Date.now(). Lets tests pin the
    *  "now" used for window calculation + age display. */
   nowFn?: () => Date;
@@ -138,6 +148,7 @@ export interface StrategyReport {
   activity?: ActivitySection;
   forward?: ForwardSection;
   valuation?: ValuationSection;
+  runway?: RunwayReport;
 }
 
 export interface IdentitySection {
@@ -1193,6 +1204,19 @@ export async function buildStrategyReport(
       isPaper,
       markPriceFn: args.markPriceFn,
       nowIso: now.toISOString(),
+    });
+  }
+
+  if (sections.has("runway")) {
+    // Scoped to THIS strategy's primitives — "does my DCA have fuel",
+    // not "does the wallet have money" (the wallet may be funding
+    // five other strategies; the global view is `tradekit runway`).
+    const { computeFundingRunway, defaultRunwayBalanceFetcher } = await import("./runway.js");
+    report.runway = await computeFundingRunway({
+      strategy: tag,
+      horizonDays: 90,
+      balanceFetcher: args.runwayBalanceFetcher ?? defaultRunwayBalanceFetcher(config),
+      now,
     });
   }
 

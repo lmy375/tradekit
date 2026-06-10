@@ -576,4 +576,35 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
       }
     },
   );
+
+  // ── runway ─────────────────────────────────────────────────
+  server.tool(
+    "runway",
+    "Funding-runway forecast: will live automation run out of money, and when? Walks every ACTIVE schedule's upcoming cron occurrences (respecting end_at + remaining max_runs budget) and reserves every ACTIVE order's one-shot spend, then replays them chronologically against CURRENT balances — paper book for paper primitives, on-chain balanceOf for real ones (read-only, no keystore). Spend accounting is price-free and exact: buys burn the quote token, sells burn the base token; primitives sized in the opposite denomination are listed in `skipped` (their spend needs a price). Rebalance plans are out of scope (drift-dependent trades have no fixed burn rate). Returns { generatedAt, horizonDays, buckets: [{account, chain, paper, token, symbol, balance, oneShotReserved, burn30d, totalFiresInHorizon, firesCovered, exhaustsAt, runwayDays, obligations}], skipped } sorted shortest-runway-first. Pair with the funding_runway alert rule for push notification (or action:'pause' to stop firing into guaranteed failures). Errors: INVALID_PARAMS (bad horizonDays).",
+    {
+      chain: z.string().optional().describe("Filter to one chain."),
+      account: z.string().optional().describe("Filter to one account label."),
+      strategy: z.string().optional().describe("Exact strategy tag — scope the forecast to one strategy's own primitives."),
+      horizonDays: z.number().int().min(1).max(366).optional().describe("Forecast horizon (default 90). exhaustsAt=null means the balance survives the whole horizon."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("runway", rt.opts, input, input.chain, async () => {
+            const { computeFundingRunway, defaultRunwayBalanceFetcher } = await import("../runway.js");
+            const { loadConfig } = await import("../config.js");
+            return await computeFundingRunway({
+              chain: input.chain,
+              account: input.account,
+              strategy: input.strategy,
+              horizonDays: input.horizonDays,
+              balanceFetcher: defaultRunwayBalanceFetcher(loadConfig()),
+            });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
 };

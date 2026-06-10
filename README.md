@@ -621,7 +621,7 @@ tradekit strategy report 1 --mtm
 }
 ```
 
-**Eight rule types**:
+**Nine rule types**:
 
 | Rule                  | Triggers when…                                                              |
 |-----------------------|------------------------------------------------------------------------------|
@@ -633,6 +633,7 @@ tradekit strategy report 1 --mtm
 | `drawdown_threshold`  | Per-strategy drawdown ≥ `alertPct` (early warn vs portfolio breaker)        |
 | `trigger_proximity`   | Any active order within `alertDistancePct` of firing (heads-up)             |
 | `drift_proximity`     | Any owned rebalance plan's last drift ≥ `alertPctOfThreshold`% of its threshold |
+| `funding_runway`      | The strategy's spend-token balance runs out within `thresholdDays` (forecast)  |
 
 Each rule supports an optional `appliesTo` filter (`["playbook:*", "dca-eth"]`) to scope thresholds per strategy, `note` for free-text rationale that ships in the notification body, and `action` to choose what a fire DOES (see the circuit breaker below).
 
@@ -664,6 +665,35 @@ A notification at 3am is only useful if someone is awake to read it. Any alert r
 **Manual twin.** `tradekit strategy pause <tag>` / `strategy resume <tag>` (MCP: `strategy_pause` / `strategy_resume`) run the same machinery by hand — one command to take a whole strategy offline while you investigate, instead of hand-pausing 12 orders, 2 schedules, and a rebalance plan. Individual orders gained pause/resume parity too: `order pause <id>` / `order resume <id>` (MCP: `order_pause` / `order_resume`).
 
 **Failure escalation.** If the pause itself errors, the alert still fires but a `strategy.alert.circuit_breaker_failed` critical notification escalates — the operator must know the system did NOT protect itself. Breaker trips are journaled to `alert_events` (`event: "breaker_paused"`, with the paused ids) and surface in the unified timeline as `alert.breaker` events.
+
+#### Funding runway — "will my automation run out of money, and when?"
+
+The most common automation failure is discovered at the worst moment: a schedule fires, the balance is short, and the operator learns from a `fire_failed` notification — reactive, repeated on every subsequent fire, often at 3am. `tradekit runway` turns that into a forecast:
+
+```bash
+tradekit runway                       # all accounts/chains, 90d horizon
+tradekit runway --strategy playbook:7 --days 30
+tradekit runway --json | jq '.buckets[0]'
+```
+
+```
+USDC  ·  default/base
+  ✗  runs out 2026-07-06 (26.0d) — covers 3/12 fires
+  balance 350  ·  one-shot reserved 0  ·  burn/30d 400
+    schedule #4 (dca-weekly): 100 per fire, cron "0 0 * * 1"  [playbook:7]
+```
+
+**How it computes.** Walks every ACTIVE schedule's upcoming cron occurrences (respecting `end_at` and the remaining `max_runs` budget), reserves every ACTIVE order's one-shot spend up-front (an order can fire any moment), and replays them chronologically against the current balance of each spend token — the paper book for paper primitives, on-chain `balanceOf` for real ones (read-only; no keystore). Buckets key on (account, chain, paper, token): a paper DCA never counts against the real wallet.
+
+**Price-free and exact.** Buys burn the quote token (`quote_amount` per fire); sells burn the base token. Primitives sized in the *opposite* denomination (a buy specified in base amount) have an unknowable spend without a price oracle — they're listed under `skipped` rather than silently guessed. Rebalance plans are out of scope by design: their trades are drift-dependent and sells fund the buys — no fixed burn rate exists.
+
+**Push, not pull.** The `funding_runway` alert rule closes the loop:
+
+```jsonc
+{ "type": "funding_runway", "thresholdDays": 7 }
+```
+
+fires when any spend token is projected to run dry within a week — and with `"action": "pause"` the circuit breaker stops the strategy from firing into guaranteed failures until it's refunded. The rule reads the opt-in `runway` report section (`strategy report <tag> --sections identity,runway`), so balance reads happen only when the rule is configured. Buckets whose balance fetch failed are skipped, never guessed — a dead RPC must not page anyone. MCP: the `runway` tool returns the same report for agents.
 
 #### DB lifecycle (iter40) — integrity / retention / auto-backup
 

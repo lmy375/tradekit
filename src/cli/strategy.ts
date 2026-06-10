@@ -57,6 +57,7 @@ const VALID_SECTIONS: ReportSection[] = [
   "activity",
   "forward",
   "valuation",
+  "runway",
 ];
 
 function parseWindow(raw: string | undefined): ReportWindow {
@@ -458,6 +459,33 @@ function renderValuation(report: StrategyReport): string[] {
   return lines;
 }
 
+function renderRunway(report: StrategyReport): string[] {
+  const rw = report.runway;
+  if (!rw) return [];
+  const lines: string[] = [];
+  lines.push(`Funding runway (${rw.horizonDays}d horizon)`);
+  if (rw.buckets.length === 0) {
+    lines.push(`  no computable spend (no active schedules/orders sized in the spend token)`);
+    lines.push("");
+    return lines;
+  }
+  for (const b of rw.buckets) {
+    const sym = b.symbol ?? (b.token === "native" ? "native" : `${b.token.slice(0, 8)}…`);
+    const scope = `${b.account}/${b.chain}${b.paper ? " [paper]" : ""}`;
+    let verdict: string;
+    if (b.balance == null) verdict = "balance unknown";
+    else if (b.exhaustsAt != null) verdict = `runs out ${b.exhaustsAt.slice(0, 10)} (${b.runwayDays!.toFixed(1)}d) — covers ${b.firesCovered}/${b.totalFiresInHorizon} fires`;
+    else verdict = `survives the horizon (${b.totalFiresInHorizon} fires)`;
+    const bal = b.balance == null ? "?" : b.balance.toFixed(4);
+    lines.push(`  ${sym} ${scope}: balance ${bal} · ${verdict}`);
+  }
+  if (rw.skipped.length > 0) {
+    lines.push(`  (${rw.skipped.length} primitive(s) skipped — spend sized in the opposite denomination)`);
+  }
+  lines.push("");
+  return lines;
+}
+
 // ── render orchestrator ─────────────────────────────────────
 
 export function renderStrategyReport(report: StrategyReport): string {
@@ -470,6 +498,7 @@ export function renderStrategyReport(report: StrategyReport): string {
   lines.push(...renderRisk(report));
   lines.push(...renderActivity(report));
   lines.push(...renderForward(report));
+  lines.push(...renderRunway(report));
   return lines.join("\n");
 }
 

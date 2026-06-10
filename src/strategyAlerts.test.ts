@@ -25,6 +25,7 @@ const {
   evaluateDrawdownThreshold,
   evaluateTriggerProximity,
   evaluateDriftProximity,
+  evaluateFundingRunway,
   evaluateAllRules,
   reconcileAlertState,
   ruleAppliesToTag,
@@ -1274,5 +1275,96 @@ describe("runAlertTick — circuit breaker", () => {
     expect(r.fired).toBe(1);
     expect(r.breakers).toHaveLength(0);
     expect(listOrders({ status: "paused" })).toHaveLength(0);
+  });
+});
+
+// ── funding_runway evaluator ────────────────────────────────
+
+describe("evaluateFundingRunway", () => {
+  const rule = { type: "funding_runway", thresholdDays: 7 } as never;
+  const NOW2 = new Date("2026-06-10T00:00:00Z");
+
+  function bucket(over: Record<string, unknown> = {}) {
+    return {
+      account: "default", chain: "base", paper: false,
+      token: "0xusdc", symbol: "USDC",
+      balance: 300, oneShotReserved: 0, burn30d: 400,
+      totalFiresInHorizon: 8, firesCovered: 3,
+      exhaustsAt: "2026-06-14T00:00:00.000Z", runwayDays: 4,
+      obligations: [],
+      ...over,
+    };
+  }
+
+  function reportWith(buckets: unknown[], skipped: unknown[] = []) {
+    return {
+      tag: "dca-test", mode: "real", window: "30d", generatedAt: NOW2.toISOString(),
+      runway: { generatedAt: NOW2.toISOString(), horizonDays: 90, buckets, skipped },
+    } as never;
+  }
+
+  it("inapplicable when the runway section is missing", () => {
+    const ev = evaluateFundingRunway({ tag: "t", rule, report: { tag: "t" } as never, now: NOW2 });
+    expect(ev.applicable).toBe(false);
+    expect(ev.message).toMatch(/runway section missing/);
+  });
+
+  it("fires when the shortest runway is within thresholdDays", () => {
+    const ev = evaluateFundingRunway({ tag: "t", rule, report: reportWith([bucket()]), now: NOW2 });
+    expect(ev.applicable).toBe(true);
+    expect(ev.violated).toBe(true);
+    expect(ev.message).toMatch(/USDC runs out in 4.0d/);
+    expect(ev.value.runwayDays).toBe(4);
+    expect(ev.value.firesCovered).toBe(3);
+  });
+
+  it("does not fire when the runway exceeds the threshold", () => {
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWith([bucket({ runwayDays: 30, exhaustsAt: "2026-07-10T00:00:00.000Z" })]),
+      now: NOW2,
+    });
+    expect(ev.applicable).toBe(true);
+    expect(ev.violated).toBe(false);
+    expect(ev.message).toMatch(/shortest runway 30.0d/);
+  });
+
+  it("survives-the-horizon buckets are applicable + ok", () => {
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWith([bucket({ runwayDays: null, exhaustsAt: null })]),
+      now: NOW2,
+    });
+    expect(ev.applicable).toBe(true);
+    expect(ev.violated).toBe(false);
+    expect(ev.message).toMatch(/survive the 90d horizon/);
+  });
+
+  it("unknown-balance buckets are skipped — a dead RPC must not page", () => {
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWith([bucket({ balance: null, runwayDays: 2 })]),
+      now: NOW2,
+    });
+    expect(ev.applicable).toBe(false);
+    expect(ev.message).toMatch(/no recurring spend|balances unknown/);
+  });
+
+  it("picks the SHORTEST runway across buckets", () => {
+    const ev = evaluateFundingRunway({
+      tag: "t", rule,
+      report: reportWith([
+        bucket({ token: "0xa", symbol: "AAA", runwayDays: 20, exhaustsAt: "2026-06-30T00:00:00.000Z" }),
+        bucket({ token: "0xb", symbol: "BBB", runwayDays: 3, exhaustsAt: "2026-06-13T00:00:00.000Z" }),
+      ]),
+      now: NOW2,
+    });
+    expect(ev.violated).toBe(true);
+    expect(ev.value.symbol).toBe("BBB");
+  });
+
+  it("sectionsForRules maps funding_runway → runway section", () => {
+    const needed = sectionsForRules([rule]);
+    expect(needed.has("runway")).toBe(true);
   });
 });

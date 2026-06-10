@@ -834,7 +834,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
         .default("auto")
         .describe("Force paper or real mode; auto inspects primitives + trades to pick."),
       sections: z
-        .array(z.enum(["identity", "composition", "performance", "position", "risk", "activity", "forward", "valuation"]))
+        .array(z.enum(["identity", "composition", "performance", "position", "risk", "activity", "forward", "valuation", "runway"]))
         .optional()
         .describe("Subset of sections to compute. Omit for the full report (valuation stays opt-in via mtm)."),
       includePrices: z

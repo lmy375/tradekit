@@ -583,6 +583,15 @@ async function main() {
         break;
       }
 
+      // Funding-runway forecast: will live automation run out of
+      // money, and when? Walks upcoming schedule fires + reserved
+      // order spends against current balances.
+      case "runway": {
+        const { runwayCommand } = await import("./cli/runway.js");
+        await runwayCommand(flags);
+        break;
+      }
+
       // Prometheus-style metrics snapshot — one-shot stdout for cron /
       // node_exporter textfile-collector integration. Live scraping
       // goes through the web server's /metrics route or the engine's
@@ -720,7 +729,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

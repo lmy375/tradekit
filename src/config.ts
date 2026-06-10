@@ -150,6 +150,17 @@ function strategyAlertRuleSchema() {
         ...common,
       })
       .strict(),
+    z
+      .object({
+        type: z.literal("funding_runway"),
+        thresholdDays: z
+          .number()
+          .positive()
+          .max(365)
+          .describe("Alert when the strategy's spend-token balance is projected to run out within this many days (walking actual upcoming schedule fires + reserved order spends against the current balance — paper book for paper primitives, on-chain for real). 7 = a week of fuel left. Catches insufficient-balance failures BEFORE the first fire_failed."),
+        ...common,
+      })
+      .strict(),
   ]);
 }
 
