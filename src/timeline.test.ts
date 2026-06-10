@@ -21,6 +21,8 @@ const {
   collectAuditEvents,
   collectAlertEvents,
   collectAlertEventsLegacy,
+  collectScheduleJournalEvents,
+  collectRebalanceJournalEvents,
   collectJournalEvents,
   resolveWindow,
   parseSinceDuration,
@@ -35,6 +37,8 @@ const {
   insertOrderCheckEntry,
   upsertStrategyAlertState,
   insertAlertEvent,
+  insertScheduleCheckEntry,
+  insertRebalanceCheckEntry,
 } = await import("./db.js");
 
 beforeAll(() => openDb());
@@ -51,6 +55,8 @@ beforeEach(() => {
   db.exec("DELETE FROM order_check_log");
   db.exec("DELETE FROM strategy_alert_state");
   db.exec("DELETE FROM alert_events");
+  db.exec("DELETE FROM schedule_check_log");
+  db.exec("DELETE FROM rebalance_check_log");
   vi.clearAllMocks();
 });
 
@@ -783,5 +789,140 @@ describe("collectTimeline — end-to-end against seeded DB", () => {
     // Only 1 trade + 1 alert event (no swing-btc).
     expect(evs.every((e) => e.refs.strategy === "dca-eth" || e.kind === "alert.fired")).toBe(true);
     expect(evs.length).toBe(2);
+  });
+});
+
+// ── v29: schedule + rebalance journal sources ────────────────
+
+describe("collectScheduleJournalEvents (v29)", () => {
+  function schedRow(over: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      schedule_id: 7,
+      checked_at: "2026-05-31T12:00:00Z",
+      decision: "fired",
+      run_number: 3,
+      tx_hash: "paper:1:123",
+      error_code: null,
+      notes: null,
+      ...over,
+    } as never;
+  }
+
+  it("maps decisions with run numbers + severity (fire_failed=critical, locked=warn, fired=info)", () => {
+    const evs = collectScheduleJournalEvents({
+      rows: [
+        schedRow({ id: 1, decision: "fired" }),
+        schedRow({ id: 2, decision: "fire_failed", error_code: "INSUFFICIENT_BALANCE" }),
+        schedRow({ id: 3, decision: "skipped_locked", error_code: "ENGINE_LOCKED" }),
+      ],
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(evs).toHaveLength(3);
+    const byDecision = Object.fromEntries(evs.map((e) => [(e.details as { decision: string }).decision, e]));
+    expect(byDecision["fired"].severity).toBe("info");
+    expect(byDecision["fired"].summary).toContain("run #3");
+    expect(byDecision["fire_failed"].severity).toBe("critical");
+    expect(byDecision["fire_failed"].summary).toContain("[INSUFFICIENT_BALANCE]");
+    expect(byDecision["skipped_locked"].severity).toBe("warn");
+    expect(evs[0].kind).toBe("schedule.journal");
+    expect(evs[0].refs).toMatchObject({ type: "schedule", id: 7 });
+  });
+
+  it("respects kinds + window filters", () => {
+    const rows = [schedRow({ checked_at: "2026-05-30T00:00:00Z" }), schedRow({})];
+    const inWindow = collectScheduleJournalEvents({
+      rows,
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(inWindow).toHaveLength(1);
+    const filteredOut = collectScheduleJournalEvents({
+      rows,
+      filter: { kinds: ["trade.fill"] },
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(filteredOut).toHaveLength(0);
+  });
+});
+
+describe("collectRebalanceJournalEvents (v29)", () => {
+  function rebRow(over: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      plan_id: 4,
+      checked_at: "2026-05-31T12:00:00Z",
+      decision: "in_band",
+      max_drift_pct: 3.21,
+      threshold_pct: 5,
+      executed_count: null,
+      skipped_count: 0,
+      error_code: null,
+      notes: null,
+      ...over,
+    } as never;
+  }
+
+  it("in_band rows surface the drift reading at info severity", () => {
+    const evs = collectRebalanceJournalEvents({
+      rows: [rebRow()],
+      filter: {},
+      sinceIso: "2026-05-31T00:00:00Z",
+      untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(evs).toHaveLength(1);
+    expect(evs[0].kind).toBe("rebalance.journal");
+    expect(evs[0].severity).toBe("info");
+    expect(evs[0].summary).toContain("drift 3.21%/5%");
+    expect(evs[0].refs).toMatchObject({ type: "rebalance", id: 4 });
+  });
+
+  it("severity ladder: fired=warn, partial_failure/failed=critical; minSeverity floors apply", () => {
+    const rows = [
+      rebRow({ id: 1, decision: "in_band" }),
+      rebRow({ id: 2, decision: "fired", executed_count: 2 }),
+      rebRow({ id: 3, decision: "partial_failure", error_code: "PARTIAL_FAILURE", executed_count: 1 }),
+    ];
+    const all = collectRebalanceJournalEvents({
+      rows, filter: {}, sinceIso: "2026-05-31T00:00:00Z", untilIso: "2026-05-31T23:59:59Z",
+    });
+    expect(all.map((e) => e.severity).sort()).toEqual(["critical", "info", "warn"]);
+    const warnPlus = collectRebalanceJournalEvents({
+      rows, filter: { minSeverity: "warn" }, sinceIso: "2026-05-31T00:00:00Z", untilIso: "2026-05-31T23:59:59Z",
+    });
+    // The in_band drift reading drops at the warn floor.
+    expect(warnPlus).toHaveLength(2);
+  });
+});
+
+describe("collectTimeline — v29 journal sources end-to-end", () => {
+  it("merges schedule + rebalance journal rows from the DB with the other sources", () => {
+    insertScheduleCheckEntry({
+      scheduleId: 11,
+      checkedAt: "2026-05-31T11:00:00Z",
+      decision: "fired",
+      runNumber: 1,
+      txHash: "paper:9:1",
+    });
+    insertRebalanceCheckEntry({
+      planId: 12,
+      checkedAt: "2026-05-31T11:30:00Z",
+      decision: "in_band",
+      maxDriftPct: 2.5,
+      thresholdPct: 5,
+    });
+    const evs = collectTimeline({
+      sinceIso: "2026-05-31T10:00:00Z",
+      untilIso: "2026-05-31T12:00:00Z",
+      kinds: ["schedule.journal", "rebalance.journal"],
+    });
+    expect(evs).toHaveLength(2);
+    // Newest-first global sort.
+    expect(evs[0].kind).toBe("rebalance.journal");
+    expect(evs[1].kind).toBe("schedule.journal");
   });
 });

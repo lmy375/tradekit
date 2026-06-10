@@ -347,6 +347,7 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
             "trade.fill", "trade.failure", "trade.pending",
             "paper.fill",
             "order.journal", "order.edited",
+            "schedule.journal", "rebalance.journal",
             "audit.tool", "audit.error",
             "alert.fired", "alert.resolved",
           ]),

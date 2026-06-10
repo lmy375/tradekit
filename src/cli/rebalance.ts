@@ -284,6 +284,19 @@ export async function rebalanceShowCommand(flags: Record<string, string>, positi
   if (row.last_error_code) {
     console.log(`  Last error: [${row.last_error_code}] ${row.last_error_message ?? ""}`);
   }
+
+  // v29: recent decision-journal tail — drift history at a glance.
+  const { replayRebalanceEntries } = await import("../db.js");
+  const recent = replayRebalanceEntries(row.id!, 5);
+  if (recent.length > 0) {
+    console.log("");
+    console.log(`  Recent evaluations (rebalance replay ${row.id} for full drift history):`);
+    for (const e of recent) {
+      const drift = e.max_drift_pct != null ? `  drift ${e.max_drift_pct.toFixed(2)}%${e.threshold_pct != null ? `/${e.threshold_pct}%` : ""}` : "";
+      const err = e.error_code ? `  [${e.error_code}]` : "";
+      console.log(`    ${e.checked_at}  ${e.decision}${drift}${err}`);
+    }
+  }
 }
 
 // ── pause / resume / cancel ──────────────────────────────────

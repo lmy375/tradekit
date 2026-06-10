@@ -28,6 +28,8 @@ const VALID_KINDS: EventKind[] = [
   "paper.fill",
   "order.journal",
   "order.edited",
+  "schedule.journal",
+  "rebalance.journal",
   "audit.tool",
   "audit.error",
   "alert.fired",

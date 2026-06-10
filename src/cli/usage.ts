@@ -387,7 +387,7 @@ BULK OPERATIONS (iter37 — scoped halt/resume with preview)
 FORENSIC TIMELINE (iter36 — cross-strategy chronological event view)
   timeline [--since 4h|1d|2026-01-01T00:00:00Z] [--until ISO]
            [--chain X] [--account L] [--strategy TAG]
-           [--kinds trade.fill,trade.failure,paper.fill,order.edited,audit.tool,audit.error,alert.fired,alert.resolved,order.journal,trade.pending]
+           [--kinds trade.fill,trade.failure,paper.fill,order.edited,audit.tool,audit.error,alert.fired,alert.resolved,order.journal,schedule.journal,rebalance.journal,trade.pending]
            [--severity info|warn|critical]
            [--no-paper] [--limit N] [--json]
         Merges events from trades + paper_trades + audit_log + order_check_log + strategy_alert_state

@@ -308,6 +308,22 @@ export async function scheduleShowCommand(flags: Record<string, string>, positio
   if (row.last_error_code) {
     console.log(`  Last error: [${row.last_error_code}] ${row.last_error_message ?? ""}`);
   }
+
+  // v29: recent decision-journal tail. last_run_* only remembers the
+  // LATEST outcome; the journal tail shows the last few decisions
+  // inline so the common "what has this schedule been doing?" case
+  // doesn't need a separate replay invocation.
+  const { replayScheduleEntries } = await import("../db.js");
+  const recent = replayScheduleEntries(row.id!, 5);
+  if (recent.length > 0) {
+    console.log("");
+    console.log(`  Recent decisions (schedule replay ${row.id} for full history):`);
+    for (const e of recent) {
+      const run = e.run_number != null ? `  run #${e.run_number}` : "";
+      const err = e.error_code ? `  [${e.error_code}]` : "";
+      console.log(`    ${e.checked_at}  ${e.decision}${run}${err}`);
+    }
+  }
 }
 
 // ── pause / resume / cancel ──────────────────────────────────

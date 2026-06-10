@@ -47,6 +47,8 @@ import {
   listStrategyAlertStates,
   listAlertEvents,
   type AlertEventRow,
+  type ScheduleCheckLogRow,
+  type RebalanceCheckLogRow,
   listEngineEvents,
   openDb,
   type TradeRow,
@@ -85,6 +87,8 @@ export type EventKind =
   | "paper.fill"               // paper_trades row
   | "order.journal"            // order_check_log entry (engine decision)
   | "order.edited"             // order_check_log "edited_by_operator"
+  | "schedule.journal"         // v29 schedule_check_log entry (fired / failed / retired / hook)
+  | "rebalance.journal"        // v29 rebalance_check_log entry (incl. in_band drift history)
   | "audit.tool"               // audit_log row tagged with a tool action
   | "audit.error"              // audit_log row with error_code set
   | "alert.fired"              // strategy_alert_state row turned active
@@ -105,7 +109,7 @@ export interface EventRefs {
   /** Concrete primitive id when applicable (order id, schedule id,
    *  trade id, audit id, engine_event id). Used by the renderer
    *  for the "drill into this row" link. */
-  type: "trade" | "paper_trade" | "order" | "schedule" | "audit" | "alert" | "engine_event";
+  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event";
   id: number | string;
   /** Chain / account / strategy denormalized so the consumer can
    *  filter without joining. Nullable when irrelevant. */
@@ -160,6 +164,9 @@ export interface TimelineInjections {
    *  the legacy state-row heuristic via alertsFn. */
   alertEventsFn?: typeof listAlertEvents;
   journalFn?: (since: string, until: string, limit: number) => OrderCheckLogRow[];
+  /** v29: schedule/rebalance decision-journal sources. */
+  scheduleJournalFn?: (since: string, until: string, limit: number) => ScheduleCheckLogRow[];
+  rebalanceJournalFn?: (since: string, until: string, limit: number) => RebalanceCheckLogRow[];
   /** Iter39: engine_events table source. */
   engineEventsFn?: typeof listEngineEvents;
 }
@@ -394,6 +401,87 @@ export function collectJournalEvents(args: {
         priceUsd: r.price_usd,
         waterMarkUsd: r.water_mark_usd,
         thresholdUsd: r.threshold_usd,
+        notes: r.notes,
+      },
+    });
+  }
+  return out;
+}
+
+/** v29: schedule decision journal → timeline. Every decision is
+ *  operationally interesting (the engine only writes on fires,
+ *  failures, retirements, lock transitions, hook outcomes) — no
+ *  chattiness filter needed, unlike the order journal. */
+export function collectScheduleJournalEvents(args: {
+  rows: readonly ScheduleCheckLogRow[];
+  filter: Pick<CollectTimelineArgs, "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const r of args.rows) {
+    if (r.checked_at < args.sinceIso || r.checked_at > args.untilIso) continue;
+    if (!kindAllowed("schedule.journal", args.filter.kinds)) continue;
+    const severity: EventSeverity =
+      r.decision === "fire_failed" ? "critical" :
+      r.decision === "hook_failed" || r.decision === "skipped_locked" ? "warn" :
+      "info";
+    if (!severityAllowed(severity, args.filter.minSeverity)) continue;
+    const run = r.run_number != null ? ` (run #${r.run_number})` : "";
+    out.push({
+      at: r.checked_at,
+      kind: "schedule.journal",
+      severity,
+      summary: `SCHEDULE #${r.schedule_id} ${r.decision}${run}${r.error_code ? ` [${r.error_code}]` : ""}${r.notes ? ` — ${r.notes.slice(0, 60)}` : ""}`,
+      refs: { type: "schedule", id: r.schedule_id },
+      details: {
+        decision: r.decision,
+        runNumber: r.run_number,
+        txHash: r.tx_hash,
+        errorCode: r.error_code,
+        notes: r.notes,
+      },
+    });
+  }
+  return out;
+}
+
+/** v29: rebalance decision journal → timeline. in_band rows carry the
+ *  drift reading — surfaced at info severity so a default timeline
+ *  shows the drift history without drowning warn-level views. */
+export function collectRebalanceJournalEvents(args: {
+  rows: readonly RebalanceCheckLogRow[];
+  filter: Pick<CollectTimelineArgs, "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const r of args.rows) {
+    if (r.checked_at < args.sinceIso || r.checked_at > args.untilIso) continue;
+    if (!kindAllowed("rebalance.journal", args.filter.kinds)) continue;
+    const severity: EventSeverity =
+      r.decision === "failed" || r.decision === "partial_failure" ? "critical" :
+      r.decision === "fired" || r.decision === "skipped_locked" ? "warn" :
+      "info";
+    if (!severityAllowed(severity, args.filter.minSeverity)) continue;
+    const drift =
+      r.max_drift_pct != null
+        ? ` drift ${r.max_drift_pct.toFixed(2)}%${r.threshold_pct != null ? `/${r.threshold_pct}%` : ""}`
+        : "";
+    const legs = r.executed_count != null ? ` legs=${r.executed_count}` : "";
+    out.push({
+      at: r.checked_at,
+      kind: "rebalance.journal",
+      severity,
+      summary: `REBALANCE #${r.plan_id} ${r.decision}${drift}${legs}${r.error_code ? ` [${r.error_code}]` : ""}`,
+      refs: { type: "rebalance", id: r.plan_id },
+      details: {
+        decision: r.decision,
+        maxDriftPct: r.max_drift_pct,
+        thresholdPct: r.threshold_pct,
+        executedCount: r.executed_count,
+        skippedCount: r.skipped_count,
+        errorCode: r.error_code,
         notes: r.notes,
       },
     });
@@ -758,6 +846,13 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   const journalRows = (args.injects?.journalFn ?? defaultJournalQuery)(sinceIso, untilIso, sourceLimit);
   const journalEvents = collectJournalEvents({ rows: journalRows, filter, sinceIso, untilIso });
 
+  // v29: schedule + rebalance decision journals — same direct-SQL +
+  // inject-seam pattern as the order journal.
+  const scheduleJournalRows = (args.injects?.scheduleJournalFn ?? defaultScheduleJournalQuery)(sinceIso, untilIso, sourceLimit);
+  const scheduleJournalEvents = collectScheduleJournalEvents({ rows: scheduleJournalRows, filter, sinceIso, untilIso });
+  const rebalanceJournalRows = (args.injects?.rebalanceJournalFn ?? defaultRebalanceJournalQuery)(sinceIso, untilIso, sourceLimit);
+  const rebalanceJournalEvents = collectRebalanceJournalEvents({ rows: rebalanceJournalRows, filter, sinceIso, untilIso });
+
   // Iter39: engine_events source — exact persisted state
   // transitions. Pre-iter39 the timeline derived these via
   // audit_log heuristics (which missed worker.degraded /
@@ -772,7 +867,7 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   const engineEvents = collectEngineEvents({ rows: engineRows, filter, sinceIso, untilIso });
 
   // Merge.
-  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...engineEvents];
+  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents];
 
   // Stable sort: newest first by `at`, then by `kind` for
   // determinism when multiple events share a millisecond.
@@ -785,6 +880,36 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   });
 
   return all.slice(0, limit);
+}
+
+function defaultScheduleJournalQuery(sinceIso: string, untilIso: string, limit: number): ScheduleCheckLogRow[] {
+  try {
+    const db = openDb();
+    return db
+      .prepare(
+        `SELECT * FROM schedule_check_log
+           WHERE checked_at >= ? AND checked_at <= ?
+           ORDER BY checked_at DESC LIMIT ?`,
+      )
+      .all(sinceIso, untilIso, limit) as unknown as ScheduleCheckLogRow[];
+  } catch {
+    return [];
+  }
+}
+
+function defaultRebalanceJournalQuery(sinceIso: string, untilIso: string, limit: number): RebalanceCheckLogRow[] {
+  try {
+    const db = openDb();
+    return db
+      .prepare(
+        `SELECT * FROM rebalance_check_log
+           WHERE checked_at >= ? AND checked_at <= ?
+           ORDER BY checked_at DESC LIMIT ?`,
+      )
+      .all(sinceIso, untilIso, limit) as unknown as RebalanceCheckLogRow[];
+  } catch {
+    return [];
+  }
 }
 
 /** Direct SQL query for order_check_log rows in a window. Kept
