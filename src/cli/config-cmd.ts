@@ -12,6 +12,7 @@ import {
   redactConfigForDisplay,
   getConfigPath,
   type Config,
+  configSchema,
 } from "../config.js";
 import { listChains } from "../chains.js";
 import { toToolError, ToolError } from "../errors.js";
@@ -181,7 +182,7 @@ export async function configCommand(
       const parsed = rawValue === undefined ? undefined : parseConfigValue(rawValue);
       const prev = getConfigPath(config, path);
       const next = setConfigPath(config, path, parsed);
-      saveConfig(next);
+      saveConfig(next, { source: `cli:config set ${path}` });
       autoKickEngine();
       // Iter312: distinguish ADD / UPDATE / REMOVE / NO-OP so the operator sees what
       // actually changed. Pre-iter312 every set printed "Updated: X = Y" regardless of
@@ -226,7 +227,7 @@ export async function configCommand(
       const { config: next, alreadyPresent, length } = pushConfigArray(config, path, parsedNew);
       // Iter363: --json output. Two outcomes: pushed (new) or noop-already-present.
       if (!alreadyPresent) {
-        saveConfig(next);
+        saveConfig(next, { source: `cli:config push` });
         autoKickEngine();
       }
       if (flags["json"] === "true") {
@@ -252,7 +253,7 @@ export async function configCommand(
       const { config: next, removed, length } = dropConfigArray(config, path, parsedDrop);
       // Iter363: --json output. Two outcomes: dropped (removed) or noop-not-found.
       if (removed) {
-        saveConfig(next);
+        saveConfig(next, { source: `cli:config drop` });
         autoKickEngine();
       }
       if (flags["json"] === "true") {
@@ -369,11 +370,115 @@ export async function configCommand(
       }
       break;
     }
+    case "history": {
+      const { listConfigHistory, latestConfigHistory } = await import("../db.js");
+      const rows = listConfigHistory(flags["limit"] ? parseInt(flags["limit"], 10) : 20);
+      if (flags["json"] === "true") {
+        printJson({ ok: true, count: rows.length, history: rows });
+        break;
+      }
+      if (rows.length === 0) {
+        console.log("No config history yet — versions record on every config save (once the DB exists).");
+        break;
+      }
+      const latest = latestConfigHistory();
+      for (const r of rows) {
+        const marker = latest && r.id === latest.id ? " ← current" : "";
+        console.log(`  #${r.id}  ${r.saved_at}  ${r.hash}  ${r.source ?? "(unknown source)"}${marker}`);
+      }
+      console.log(`\nInspect: tradekit config diff-version <id> · Roll back: tradekit config rollback <id> --yes`);
+      break;
+    }
+    case "diff-version": {
+      const idArg = parseInt(positional[2] ?? "", 10);
+      if (!Number.isInteger(idArg) || idArg <= 0) {
+        throw new ToolError("INVALID_PARAMS", "Usage: tradekit config diff-version <history-id>");
+      }
+      const { getConfigHistoryById } = await import("../db.js");
+      const row = getConfigHistoryById(idArg);
+      if (!row) throw new ToolError("INVALID_PARAMS", `No config history #${idArg}.`);
+      const old = JSON.parse(row.content) as Record<string, unknown>;
+      const cur = JSON.parse(JSON.stringify(loadConfig())) as Record<string, unknown>;
+      const diffs = diffFlat(old, cur);
+      if (flags["json"] === "true") {
+        printJson({ ok: true, id: idArg, savedAt: row.saved_at, diffs });
+        break;
+      }
+      if (diffs.length === 0) {
+        console.log(`Version #${idArg} (${row.saved_at}) is identical to the current config.`);
+        break;
+      }
+      console.log(`Current config vs version #${idArg} (${row.saved_at}):`);
+      for (const d of diffs) {
+        console.log(`  ${d.path}`);
+        console.log(`    then: ${JSON.stringify(d.oldValue)}`);
+        console.log(`    now:  ${JSON.stringify(d.newValue)}`);
+      }
+      break;
+    }
+    case "rollback": {
+      const idArg = parseInt(positional[2] ?? "", 10);
+      if (!Number.isInteger(idArg) || idArg <= 0) {
+        throw new ToolError("INVALID_PARAMS", "Usage: tradekit config rollback <history-id> --yes");
+      }
+      const { getConfigHistoryById } = await import("../db.js");
+      const row = getConfigHistoryById(idArg);
+      if (!row) throw new ToolError("INVALID_PARAMS", `No config history #${idArg}.`);
+      // Schema-validate the stored snapshot BEFORE writing — an old
+      // version may predate schema additions; configSchema's defaults
+      // fill forward-compatible gaps, hard validation errors abort.
+      const candidate = configSchema.parse(JSON.parse(row.content));
+      const diffs = diffFlat(JSON.parse(JSON.stringify(loadConfig())) as Record<string, unknown>, JSON.parse(JSON.stringify(candidate)) as Record<string, unknown>);
+      if (flags["yes"] !== "true") {
+        console.log(`Rollback to version #${idArg} (${row.saved_at}, ${row.source ?? "unknown source"}) would change ${diffs.length} field(s):`);
+        for (const d of diffs.slice(0, 12)) {
+          console.log(`  ${d.path}: ${JSON.stringify(d.oldValue)} → ${JSON.stringify(d.newValue)}`);
+        }
+        if (diffs.length > 12) console.log(`  … ${diffs.length - 12} more`);
+        console.log(`\nConfirm with --yes (config controls live safety caps — review first).`);
+        break;
+      }
+      saveConfig(candidate, { source: `rollback:#${idArg}` });
+      autoKickEngine();
+      if (flags["json"] === "true") {
+        printJson({ ok: true, rolledBackTo: idArg, changedFields: diffs.length });
+      } else {
+        console.log(`Rolled back to version #${idArg} — ${diffs.length} field(s) changed. (Recorded as a NEW history version; nothing is lost.)`);
+      }
+      break;
+    }
     default:
       throw subcommandError("config", action, [
         "show", "get", "set", "push", "drop", "path", "validate", "preflight", "reload",
+        "history", "diff-version", "rollback",
       ]);
   }
+}
+
+/** v36: flat dot-path diff between two plain config objects.
+ *  Arrays compare as values (JSON equality) — element-level diffs of
+ *  channel lists read worse than whole-value ones. */
+function diffFlat(
+  oldObj: Record<string, unknown>,
+  newObj: Record<string, unknown>,
+): Array<{ path: string; oldValue: unknown; newValue: unknown }> {
+  const out: Array<{ path: string; oldValue: unknown; newValue: unknown }> = [];
+  const walk = (a: unknown, b: unknown, path: string) => {
+    const aIsObj = a != null && typeof a === "object" && !Array.isArray(a);
+    const bIsObj = b != null && typeof b === "object" && !Array.isArray(b);
+    if (aIsObj && bIsObj) {
+      const keys = new Set([...Object.keys(a as object), ...Object.keys(b as object)]);
+      for (const k of keys) {
+        walk((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], path ? `${path}.${k}` : k);
+      }
+      return;
+    }
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      out.push({ path, oldValue: a, newValue: b });
+    }
+  };
+  walk(oldObj, newObj, "");
+  return out.sort((x, y) => x.path.localeCompare(y.path));
 }
 
 // ── chains / chain ──────────────────────────────────────────

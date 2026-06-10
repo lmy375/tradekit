@@ -2,7 +2,9 @@ import { existsSync, readFileSync } from "fs";
 import { writeFileSecure, ensureDataDir } from "./secureIo.js";
 import { z } from "zod";
 import type { Address } from "viem";
-import { CONFIG_PATH, DATA_DIR } from "./constants.js";
+import { CONFIG_PATH, DATA_DIR, DB_PATH } from "./constants.js";
+import { createHash } from "node:crypto";
+import { latestConfigHistory as dbLatestConfigHistory, insertConfigHistory as dbInsertConfigHistory } from "./db.js";
 import { getBuiltinProfile, listChains, type ChainProfile } from "./chains.js";
 import { ToolError } from "./errors.js";
 import { closestMatch } from "./format.js";
@@ -830,6 +832,8 @@ const dbRetentionSchema = z
     alertEventsDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** v34: quiet-hours notification queue (flushed + ancient rows). */
     notificationQueueDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** v36: config change history. */
+    configHistoryDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep schedule_check_log (v29). NULL = never prune. */
     scheduleCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep rebalance_check_log (v29). NULL = never prune. */
@@ -849,6 +853,7 @@ const dbRetentionSchema = z
     engineEventsDays: null,
     alertEventsDays: null,
     notificationQueueDays: null,
+    configHistoryDays: null,
     scheduleCheckLogDays: null,
     rebalanceCheckLogDays: null,
     failedTradesDays: null,
@@ -898,6 +903,7 @@ const dbSchema = z
       engineEventsDays: null,
       alertEventsDays: null,
       notificationQueueDays: null,
+      configHistoryDays: null,
       scheduleCheckLogDays: null,
       rebalanceCheckLogDays: null,
       failedTradesDays: null,
@@ -1063,11 +1069,47 @@ export function loadConfig(): Config {
   return cfg;
 }
 
-export function saveConfig(config: Config): void {
+export function saveConfig(config: Config, opts?: { source?: string }): void {
   ensureDataDir(DATA_DIR);
   const validated = configSchema.parse(config);
+  const content = JSON.stringify(validated, null, 2) + "\n";
   // Config may hold aggregator API keys — 0600 to keep them off shared-host nosy reads.
-  writeFileSecure(CONFIG_PATH, JSON.stringify(validated, null, 2) + "\n");
+  writeFileSecure(CONFIG_PATH, content);
+  recordConfigHistory(content, opts?.source ?? null);
+}
+
+/** v36: best-effort change-history snapshot. Recorded ONLY when the
+ *  DB file already exists — a pure-config user who never ran a DB
+ *  command must not get a database spawned by `config set`; history
+ *  starts with their first real command. Deduped by content hash so
+ *  idempotent re-saves (tests, presets re-applied) don't pile rows.
+ *  A history failure NEVER fails the save — the file write above is
+ *  the contract. */
+function recordConfigHistory(content: string, source: string | null): void {
+  try {
+    if (!existsSync(DB_PATH)) return;
+    const hash = createHash("sha256").update(content).digest("hex").slice(0, 16);
+    // Lazy require-shape: db.js is a static import-safe module (no
+    // config.js dependency — verified, no cycle), but we keep the
+    // import at call time via the function table to avoid loading
+    // sqlite for config-only CLI paths that never save.
+    const { latestConfigHistory, insertConfigHistory } = dbHistoryFns();
+    const latest = latestConfigHistory();
+    if (latest && latest.hash === hash) return;
+    insertConfigHistory({ savedAt: new Date().toISOString(), hash, source, content });
+  } catch {
+    /* forensic layer only — never block the save */
+  }
+}
+
+// Indirection so the static import below stays tree-shakeable in
+// spirit and trivially stubbable; db.js has no config.js import
+// (checked) so this is cycle-free.
+function dbHistoryFns(): {
+  latestConfigHistory: typeof import("./db.js").latestConfigHistory;
+  insertConfigHistory: typeof import("./db.js").insertConfigHistory;
+} {
+  return { latestConfigHistory: dbLatestConfigHistory, insertConfigHistory: dbInsertConfigHistory };
 }
 
 export function ensureConfigFile(): void {

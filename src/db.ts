@@ -1192,6 +1192,22 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX IF NOT EXISTS idx_signal_events_pending ON signal_events (name, consumed_at);
   `,
+
+  // v36 — config change history. The config file controls real money
+  // (safety caps, slippage, keys, automation cadences) and had ZERO
+  // change tracking: no "what changed and when", no rollback. Every
+  // saveConfig now records a deduped (by content hash) snapshot;
+  // `tradekit config history / rollback` consume it.
+  `
+  CREATE TABLE IF NOT EXISTS config_history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    saved_at  TEXT NOT NULL,
+    hash      TEXT NOT NULL,
+    source    TEXT,
+    content   TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_config_history_at ON config_history (saved_at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3767,6 +3783,51 @@ export function recordScheduleError(
        retry_count = 0
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+}
+
+// ── config history (v36) ────────────────────────────────────
+
+export interface ConfigHistoryRow {
+  id: number;
+  saved_at: string;
+  hash: string;
+  source: string | null;
+  content: string;
+}
+
+export function insertConfigHistory(args: { savedAt: string; hash: string; source: string | null; content: string }): number {
+  const db = openDb();
+  const r = db
+    .prepare(`INSERT INTO config_history (saved_at, hash, source, content) VALUES (?, ?, ?, ?)`)
+    .run(args.savedAt, args.hash, args.source, args.content);
+  return Number(r.lastInsertRowid);
+}
+
+export function latestConfigHistory(): ConfigHistoryRow | null {
+  const db = openDb();
+  const row = db
+    .prepare(`SELECT * FROM config_history ORDER BY id DESC LIMIT 1`)
+    .get() as ConfigHistoryRow | undefined;
+  return row ?? null;
+}
+
+export function listConfigHistory(limit = 20): Omit<ConfigHistoryRow, "content">[] {
+  const db = openDb();
+  return db
+    .prepare(`SELECT id, saved_at, hash, source FROM config_history ORDER BY id DESC LIMIT ?`)
+    .all(limit) as unknown as Omit<ConfigHistoryRow, "content">[];
+}
+
+export function getConfigHistoryById(id: number): ConfigHistoryRow | null {
+  const db = openDb();
+  const row = db.prepare(`SELECT * FROM config_history WHERE id = ?`).get(id) as ConfigHistoryRow | undefined;
+  return row ?? null;
+}
+
+export function pruneConfigHistory(cutoffIso: string): number {
+  const db = openDb();
+  const r = db.prepare(`DELETE FROM config_history WHERE saved_at < ?`).run(cutoffIso);
+  return Number(r.changes);
 }
 
 // ── signal events (v35) ─────────────────────────────────────

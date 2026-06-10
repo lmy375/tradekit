@@ -1721,6 +1721,20 @@ After each weekly DCA fire, a new trailing-stop on EXACTLY the amount just bough
 
 **Orders chain too (v31).** The same hook attaches to conditional orders — `order create … --on-fill '{...}'` (or `onFill` in playbook order entries / MCP `order_create`): a limit buy at \$1,800 that fills auto-creates the trailing stop for exactly the bought amount. One fire per order (`fireNumber` is always 1); `order replay` shows `hook_created` / `hook_failed` alongside the fill; `order edit --on-fill/--unset on-fill` mutates it in place; the playbook backtest simulates order hooks the same way it does schedule hooks.
 
+#### Config history + rollback (v36) — change management for the file that controls real money
+
+Every `saveConfig` now records a deduped, source-tagged snapshot to `config_history` ("`cli:config set safety.maxSlippageBps`", "`rollback:#12`", the init preset, engine hot-reload writes — all attributable):
+
+```bash
+tradekit config history
+#   #14  2026-06-11T03:22:41Z  9f2c01ab…  cli:config set safety.maxSlippageBps ← current
+#   #13  2026-06-10T09:00:12Z  77ab3c90…  cli:config push notifications.channels
+tradekit config diff-version 13        # dot-path diff vs current
+tradekit config rollback 13 --yes      # schema-validated restore + SIGHUP hot-reload
+```
+
+Design points: recording is **best-effort and never blocks the save** (the file write is the contract); it only starts once the DB exists (a pure-config user doesn't get a database spawned by `config set`); identical content dedupes by hash so idempotent re-saves don't pile rows. Rollback **parses the stored snapshot through the current schema first** — old versions forward-fill newer fields with their defaults instead of stripping them, and hard validation errors abort before anything is written. A rollback records a *new* version: history only grows, the mistaken version stays for forensics. Prunable via `db.retention.configHistoryDays`.
+
 #### Realized-gains export (v36) — tax season, one command
 
 ```bash

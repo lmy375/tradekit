@@ -69,6 +69,16 @@ CHAIN & CONFIG
                                        after the write so the change takes effect without restart.
   config push <path> <value> [--json] Append to an array field (--json: action: pushed|noop-already-present)
   config drop <path> <value> [--json] Remove an item from an array field (--json: action: dropped|noop-not-found)
+  config history [--limit N] [--json]
+        v36: every config save records a deduped snapshot (source-tagged:
+        which command changed it). The file that controls live safety caps
+        finally has change tracking.
+  config diff-version <id> [--json]      Current config vs a stored version, dot-path diff
+  config rollback <id> [--yes] [--json]
+        Restore a stored version. Without --yes: previews the field changes.
+        Schema-validated first (old snapshots forward-fill newer fields with
+        defaults); recorded as a NEW version — history only grows, the
+        mistake stays for forensics. Hot-reloads a running engine (SIGHUP).
   config preflight [--file PATH] [--strict] [--json]
         Iter35: dry-run impact analysis. Without --file, validates the currently-saved config; with --file
         PATH, diffs the file against the saved config and shows what would change (per-key) + which active

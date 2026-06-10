@@ -58,6 +58,7 @@ const defaultDb: DbConfig = {
     engineEventsDays: null,
     alertEventsDays: null,
       notificationQueueDays: null,
+      configHistoryDays: null,
     scheduleCheckLogDays: null,
     rebalanceCheckLogDays: null,
     failedTradesDays: null,
