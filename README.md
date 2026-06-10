@@ -561,7 +561,7 @@ tradekit strategy report 1 --window all
 | `position`    | Net `(chain, token)` accumulation across all fills                              |
 | `risk`        | Strategy-budget consumption (lifetime/daily/perFire) + per-strategy drawdown   |
 | `activity`    | Recent fills + failures + order-journal entries, newest-first                  |
-| `forward`     | Next schedule fire + per-active-order distance-to-trigger + `wouldFireNow` flag |
+| `forward`     | Next schedule fire + per-active-order distance-to-trigger + `wouldFireNow` flag + per-plan rebalance drift proximity (persisted telemetry, no oracle call) |
 
 **Paper-aware.** Mode is auto-detected: if every active primitive has `paper=1` (or the only trade history is paper), the report switches to paper mode and pulls performance / position / activity from `paper_trades`. Override with `--mode real` / `--mode paper` for ambiguous cases.
 
@@ -575,7 +575,7 @@ tradekit strategy report 1 --window all
 
 #### Strategy alerts (iter32) — proactive notifications
 
-The strategy report (iter31) gives operators a great PULL surface — but in production they need PUSH. `tradekit strategy alerts` is a rules-driven watcher that emits notifications when a strategy's health crosses operator-defined thresholds. Re-uses the existing notify stack (Slack / Discord / Telegram / generic webhook); 7 rule types cover the operationally important failure modes.
+The strategy report (iter31) gives operators a great PULL surface — but in production they need PUSH. `tradekit strategy alerts` is a rules-driven watcher that emits notifications when a strategy's health crosses operator-defined thresholds. Re-uses the existing notify stack (Slack / Discord / Telegram / generic webhook); 8 rule types cover the operationally important failure modes — including `drift_proximity`, which reads each rebalance plan's persisted last-run drift and fires when it reaches a configurable percentage of the plan's own threshold (the "rebalance is about to trade" heads-up, with no oracle call).
 
 ```bash
 # After enabling safety.strategyAlerts in config:
@@ -610,7 +610,8 @@ tradekit strategy report 1 --mtm
         { "type": "failure_streak",     "alertCount": 3 },
         { "type": "budget_approach",    "warnPct": 0.8 },
         { "type": "drawdown_threshold", "alertPct": 10 },
-        { "type": "trigger_proximity",  "alertDistancePct": 2, "appliesTo": ["playbook:*"] }
+        { "type": "trigger_proximity",  "alertDistancePct": 2, "appliesTo": ["playbook:*"] },
+        { "type": "drift_proximity",    "alertPctOfThreshold": 80 }
       ]
     }
   }

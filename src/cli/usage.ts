@@ -298,7 +298,8 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
           position     — net (chain, token) accumulation across all fills
           risk         — strategy-budget consumption + per-strategy drawdown
           activity     — recent fills + failures + order journal entries
-          forward      — next schedule fire + per-active-order distance-to-trigger
+          forward      — next schedule fire + per-order distance-to-trigger +
+                         per-plan rebalance drift proximity (persisted, no oracle)
         --mtm adds an eighth, opt-in VALUATION section: cost-basis positions (same
         weighted-average core as \`paper pnl --mtm\` — numbers match across surfaces)
         marked at live oracle prices, realized/unrealized/total + per-position detail.
@@ -334,6 +335,7 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
   Configuration (in config.json under safety.strategyAlerts):
     enabled: true
     rules:  [{type: "staleness", thresholdSeconds: 172800},
+             {type: "drift_proximity", alertPctOfThreshold: 80},  // rebalance about to trade
              {type: "slippage_trend", baselineBps: 50, alertMultiplier: 1.5},
              {type: "success_rate_drop", minRate: 0.8, minSampleSize: 10},
              {type: "failure_streak", alertCount: 3},

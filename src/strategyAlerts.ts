@@ -450,6 +450,55 @@ export const evaluateTriggerProximity: EvaluateFn<
 // call site. The `as never` casts are safe given the discriminated-
 // union guarantee that `rule.type` matches the evaluator's expected
 // rule shape.
+/** v29 follow-up: rebalance drift proximity. Reads the forward
+ *  section's persisted drift telemetry (no oracle call — the engine
+ *  measured the drift on its last evaluation). Violated when ANY
+ *  owned live plan's last drift reaches ≥ alertPctOfThreshold percent
+ *  OF ITS OWN THRESHOLD; ≥100 means the next evaluation would fire.
+ *  Gives operators the "rebalance is about to trade" heads-up the
+ *  trigger_proximity rule gives for orders. */
+export const evaluateDriftProximity: EvaluateFn<
+  Extract<StrategyAlertRule, { type: "drift_proximity" }>
+> = ({ tag, rule, report }) => {
+  const evaluation = (over: Partial<AlertEvaluation>): AlertEvaluation => ({
+    tag,
+    ruleType: rule.type,
+    rule,
+    applicable: false,
+    violated: false,
+    message: "",
+    value: {},
+    ...over,
+  });
+  const forward = report.forward;
+  if (!forward) return evaluation({ message: "forward section missing" });
+  if (forward.rebalanceDrift.length === 0) {
+    return evaluation({ message: "no live rebalance plans" });
+  }
+  let hottest: { planId: number; pct: number; drift: number; threshold: number } | null = null;
+  for (const d of forward.rebalanceDrift) {
+    if (d.pctOfThreshold == null || d.lastDriftPct == null) continue;
+    if (!hottest || d.pctOfThreshold > hottest.pct) {
+      hottest = { planId: d.planId, pct: d.pctOfThreshold, drift: d.lastDriftPct, threshold: d.thresholdPct };
+    }
+  }
+  if (!hottest) return evaluation({ message: "no plan has been evaluated yet" });
+  const violated = hottest.pct >= rule.alertPctOfThreshold;
+  return evaluation({
+    applicable: true,
+    violated,
+    message: violated
+      ? `Plan #${hottest.planId} drift ${hottest.drift.toFixed(2)}% is at ${hottest.pct.toFixed(0)}% of its ${hottest.threshold}% threshold`
+      : `hottest plan #${hottest.planId} at ${hottest.pct.toFixed(0)}% of threshold (< ${rule.alertPctOfThreshold}%)`,
+    value: {
+      planId: hottest.planId,
+      lastDriftPct: hottest.drift,
+      thresholdPct: hottest.threshold,
+      pctOfThreshold: hottest.pct,
+    },
+  });
+};
+
 const EVALUATORS = {
   staleness: evaluateStaleness,
   slippage_trend: evaluateSlippageTrend,
@@ -458,6 +507,7 @@ const EVALUATORS = {
   budget_approach: evaluateBudgetApproach,
   drawdown_threshold: evaluateDrawdownThreshold,
   trigger_proximity: evaluateTriggerProximity,
+  drift_proximity: evaluateDriftProximity,
 } as const;
 
 /** Evaluate every applicable rule against a single strategy's
@@ -584,6 +634,7 @@ const SEVERITY_BY_RULE: Record<StrategyAlertRule["type"], NotificationEvent["sev
   budget_approach: "warn",
   drawdown_threshold: "critical",
   trigger_proximity: "info",
+  drift_proximity: "info",
 };
 
 // ── runner ──────────────────────────────────────────────────
@@ -845,6 +896,7 @@ export function sectionsForRules(rules: StrategyAlertRule[]) {
         needed.add("risk");
         break;
       case "trigger_proximity":
+      case "drift_proximity":
         needed.add("forward");
         break;
     }

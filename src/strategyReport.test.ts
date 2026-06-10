@@ -631,6 +631,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [],
       orders: [makeOrder({ id: 1, target_price_usd: 1900 })],
+      rebalances: [],
       livePriceFn: async () => 2000,
     });
     expect(f.pendingTriggers).toHaveLength(1);
@@ -644,6 +645,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [],
       orders: [makeOrder({ id: 1, target_price_usd: 2100 })],
+      rebalances: [],
       livePriceFn: async () => 2000, // 2000 ≤ 2100 → price_below fires
     });
     expect(f.pendingTriggers[0].wouldFireNow).toBe(true);
@@ -658,6 +660,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [],
       orders,
+      rebalances: [],
       livePriceFn: async () => 2000,
     });
     expect(f.pendingTriggers.map((t) => t.orderId)).toEqual([2, 1, 3]);
@@ -674,6 +677,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [],
       orders: [o],
+      rebalances: [],
       livePriceFn: async () => 2050,
     });
     const e = f.pendingTriggers[0];
@@ -687,6 +691,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [{ status: "paused", next_run_at: "2026-05-01T00:00:00Z" } as never],
       orders: [],
+      rebalances: [],
       livePriceFn: undefined,
     });
     expect(f.nextScheduleAt).toBeNull();
@@ -699,6 +704,7 @@ describe("buildForward", () => {
         { id: 2, status: "active", next_run_at: "2026-05-25T00:00:00Z" } as never,
       ],
       orders: [],
+      rebalances: [],
       livePriceFn: undefined,
     });
     expect(f.nextScheduleAt).toBe("2026-05-25T00:00:00Z");
@@ -709,6 +715,7 @@ describe("buildForward", () => {
     const f = await _buildForward({
       schedules: [],
       orders: [makeOrder({ id: 1 })],
+      rebalances: [],
       livePriceFn: async () => {
         throw new Error("boom");
       },
@@ -1117,5 +1124,79 @@ describe("buildStrategyReport — valuation section", () => {
     expect(v.realizedQuote).toBe(0);
     expect(v.unrealizedQuote).toBe(0); // nothing open
     expect(v.totalQuote).toBe(0);
+  });
+});
+
+// ── forward: rebalance drift proximity ───────────────────────
+
+describe("buildForward — rebalance drift", () => {
+  function planRow(over: Record<string, unknown> = {}) {
+    return {
+      id: 1,
+      created_at: "x",
+      updated_at: "x",
+      status: "active",
+      name: "folio",
+      account: "default",
+      chain: "base",
+      quote_token: "0xq",
+      quote_symbol: "USDC",
+      targets_json: "[]",
+      drift_threshold_pct: 5,
+      min_trade_usd: 10,
+      cron_expr: "0 */6 * * *",
+      next_run_at: "2026-06-11T06:00:00.000Z",
+      start_at: null,
+      end_at: null,
+      max_runs: null,
+      slippage_bps: null,
+      auto_slippage: 0,
+      strategy: "t",
+      note: null,
+      run_count: 3,
+      last_run_at: "2026-06-11T00:00:00.000Z",
+      last_run_status: "skipped",
+      last_run_executed_count: 0,
+      last_run_skipped_count: 0,
+      last_run_max_drift_pct: 4.2,
+      last_error_code: null,
+      last_error_message: null,
+      paper: 0,
+      ...over,
+    } as never;
+  }
+
+  it("surfaces persisted drift telemetry with pct-of-threshold, sorted hottest-first", async () => {
+    const f = await _buildForward({
+      schedules: [],
+      orders: [],
+      rebalances: [
+        planRow({ id: 1, last_run_max_drift_pct: 1.0 }),
+        planRow({ id: 2, last_run_max_drift_pct: 4.2 }),
+        planRow({ id: 3, last_run_max_drift_pct: null, last_run_at: null }),
+      ],
+      livePriceFn: undefined,
+    });
+    expect(f.rebalanceDrift).toHaveLength(3);
+    expect(f.rebalanceDrift[0].planId).toBe(2); // 84% of threshold — hottest first
+    expect(f.rebalanceDrift[0].pctOfThreshold).toBeCloseTo(84, 6);
+    expect(f.rebalanceDrift[1].planId).toBe(1); // 20%
+    expect(f.rebalanceDrift[2].planId).toBe(3); // never evaluated → null trails
+    expect(f.rebalanceDrift[2].lastDriftPct).toBeNull();
+    expect(f.rebalanceDrift[2].pctOfThreshold).toBeNull();
+  });
+
+  it("excludes terminal plans; includes paused; flags paper", async () => {
+    const f = await _buildForward({
+      schedules: [],
+      orders: [],
+      rebalances: [
+        planRow({ id: 1, status: "cancelled" }),
+        planRow({ id: 2, status: "paused", paper: 1 }),
+      ],
+      livePriceFn: undefined,
+    });
+    expect(f.rebalanceDrift).toHaveLength(1);
+    expect(f.rebalanceDrift[0]).toMatchObject({ planId: 2, status: "paused", paper: true });
   });
 });

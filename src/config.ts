@@ -133,6 +133,17 @@ function strategyAlertRuleSchema() {
         ...common,
       })
       .strict(),
+    z
+      .object({
+        type: z.literal("drift_proximity"),
+        alertPctOfThreshold: z
+          .number()
+          .positive()
+          .max(1000)
+          .describe("Alert when any owned rebalance plan's last-measured drift reaches ≥ this percentage OF ITS THRESHOLD (80 = drift at 80% of the trigger). Uses persisted last-run telemetry — no oracle call. ≥100 means the next evaluation would fire."),
+        ...common,
+      })
+      .strict(),
   ]);
 }
 

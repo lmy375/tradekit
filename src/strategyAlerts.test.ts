@@ -24,6 +24,7 @@ const {
   evaluateBudgetApproach,
   evaluateDrawdownThreshold,
   evaluateTriggerProximity,
+  evaluateDriftProximity,
   evaluateAllRules,
   reconcileAlertState,
   ruleAppliesToTag,
@@ -1054,3 +1055,111 @@ function baseConfig(over: { enabled: boolean; rules: unknown[] }) {
     mev: {},
   };
 }
+
+// ── drift_proximity rule ─────────────────────────────────────
+
+describe("evaluateDriftProximity", () => {
+  const evalDrift = evaluateDriftProximity;
+  const rule = { type: "drift_proximity", alertPctOfThreshold: 80 } as never;
+
+  function reportWithDrift(entries: Array<Record<string, unknown>>): never {
+    return {
+      tag: "t",
+      mode: "real",
+      window: "30d",
+      generatedAt: "x",
+      forward: { nextScheduleAt: null, nextScheduleId: null, pendingTriggers: [], rebalanceDrift: entries },
+    } as never;
+  }
+
+  it("violates when the hottest plan reaches the pct-of-threshold gate", () => {
+    const r = evalDrift({
+      tag: "t",
+      rule,
+      report: reportWithDrift([
+        { planId: 1, lastDriftPct: 1, thresholdPct: 5, pctOfThreshold: 20 },
+        { planId: 2, lastDriftPct: 4.2, thresholdPct: 5, pctOfThreshold: 84 },
+      ]),
+      now: new Date(),
+    });
+    expect(r.applicable).toBe(true);
+    expect(r.violated).toBe(true);
+    expect(r.message).toContain("Plan #2");
+    expect(r.value.pctOfThreshold).toBe(84);
+  });
+
+  it("stays OK below the gate (reports the hottest plan)", () => {
+    const r = evalDrift({
+      tag: "t",
+      rule,
+      report: reportWithDrift([{ planId: 1, lastDriftPct: 2, thresholdPct: 5, pctOfThreshold: 40 }]),
+      now: new Date(),
+    });
+    expect(r.applicable).toBe(true);
+    expect(r.violated).toBe(false);
+    expect(r.message).toContain("40% of threshold");
+  });
+
+  it("inapplicable: no plans / never-evaluated plans / missing section", () => {
+    expect(evalDrift({ tag: "t", rule, report: reportWithDrift([]), now: new Date() }).applicable).toBe(false);
+    expect(
+      evalDrift({
+        tag: "t",
+        rule,
+        report: reportWithDrift([{ planId: 1, lastDriftPct: null, thresholdPct: 5, pctOfThreshold: null }]),
+        now: new Date(),
+      }).applicable,
+    ).toBe(false);
+    expect(
+      evalDrift({ tag: "t", rule, report: { tag: "t", mode: "real", window: "30d", generatedAt: "x" } as never, now: new Date() }).applicable,
+    ).toBe(false);
+  });
+});
+
+describe("runAlertTick — drift_proximity end-to-end", () => {
+  it("fires when a seeded plan's persisted drift crosses the gate", async () => {
+    const { insertRebalancePlan } = await import("./db.js");
+    const planId = insertRebalancePlan({
+      name: "hot-folio",
+      account: "default",
+      chain: "base",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      quote_symbol: "USDC",
+      targets: [
+        { token: "ETH", targetPct: 60 },
+        { token: "USDC", targetPct: 40 },
+      ],
+      drift_threshold_pct: 5,
+      min_trade_usd: 10,
+      cron_expr: "0 */6 * * *",
+      next_run_at: new Date(Date.now() + 3_600_000).toISOString(),
+      start_at: null,
+      end_at: null,
+      max_runs: null,
+      slippage_bps: null,
+      auto_slippage: false,
+      strategy: "drift-test",
+      note: null,
+    });
+    openDb()
+      .prepare(`UPDATE rebalance_plans SET last_run_max_drift_pct = 4.5, last_run_at = ? WHERE id = ?`)
+      .run(new Date().toISOString(), planId);
+
+    const config = baseConfig({
+      enabled: true,
+      rules: [{ type: "drift_proximity", alertPctOfThreshold: 80 } as never],
+    });
+    const notifyFn = vi.fn();
+    const r = await runAlertTick({
+      config: config as never,
+      logger: silentLogger(),
+      notifyFn,
+      onlyTags: ["drift-test"],
+    });
+    expect(r.fired).toBe(1);
+    expect(notifyFn).toHaveBeenCalledTimes(1);
+    const call = notifyFn.mock.calls[0][0];
+    expect(call.event).toBe("strategy.alert.drift_proximity");
+    expect(call.title).toContain("90% of its 5% threshold");
+  });
+});

@@ -326,6 +326,28 @@ export interface ForwardSection {
   nextScheduleId: number | null;
   /** Per-active-order projection. */
   pendingTriggers: PendingTriggerEntry[];
+  /** Per-plan drift proximity from PERSISTED last-run telemetry
+   *  (deterministic — no oracle call; the engine measured the drift
+   *  on its last evaluation). Empty when the strategy owns no live
+   *  plans. Plans that never evaluated have lastDriftPct=null. */
+  rebalanceDrift: RebalanceDriftEntry[];
+}
+
+export interface RebalanceDriftEntry {
+  planId: number;
+  name: string | null;
+  /** Max per-target drift the engine measured on its LAST evaluation
+   *  (last_run_max_drift_pct). null until the first evaluation. */
+  lastDriftPct: number | null;
+  thresholdPct: number;
+  /** lastDriftPct / thresholdPct × 100 — "how close to firing" as a
+   *  percentage of the trigger. ≥100 means the next evaluation fires
+   *  (barring price movement). null when lastDriftPct is null. */
+  pctOfThreshold: number | null;
+  lastEvaluatedAt: string | null;
+  nextRunAt: string;
+  status: string;
+  paper: boolean;
 }
 
 export interface PendingTriggerEntry {
@@ -839,8 +861,30 @@ function journalSummary(row: OrderCheckLogRow): string {
 async function buildForward(args: {
   schedules: ScheduleRow[];
   orders: OrderRow[];
+  rebalances: RebalanceRow[];
   livePriceFn?: (tokenAddress: string) => Promise<number | null>;
 }): Promise<ForwardSection> {
+  // Rebalance drift proximity — persisted telemetry, no IO.
+  const rebalanceDrift: RebalanceDriftEntry[] = [];
+  for (const r of args.rebalances) {
+    if (r.status !== "active" && r.status !== "paused") continue;
+    if (r.id == null) continue;
+    const last = r.last_run_max_drift_pct;
+    rebalanceDrift.push({
+      planId: r.id,
+      name: r.name,
+      lastDriftPct: last,
+      thresholdPct: r.drift_threshold_pct,
+      pctOfThreshold:
+        last != null && r.drift_threshold_pct > 0 ? (last / r.drift_threshold_pct) * 100 : null,
+      lastEvaluatedAt: r.last_run_at,
+      nextRunAt: r.next_run_at,
+      status: r.status,
+      paper: (r.paper ?? 0) === 1,
+    });
+  }
+  // Closest-to-firing first.
+  rebalanceDrift.sort((x, y) => (y.pctOfThreshold ?? -1) - (x.pctOfThreshold ?? -1));
   // Pick the next-firing schedule across the strategy.
   let nextScheduleAt: string | null = null;
   let nextScheduleId: number | null = null;
@@ -922,7 +966,7 @@ async function buildForward(args: {
     return aDist - bDist;
   });
 
-  return { nextScheduleAt, nextScheduleId, pendingTriggers };
+  return { nextScheduleAt, nextScheduleId, pendingTriggers, rebalanceDrift };
 }
 
 // ── valuation (mark-to-market) ──────────────────────────────
@@ -1127,6 +1171,7 @@ export async function buildStrategyReport(
     report.forward = await buildForward({
       schedules,
       orders,
+      rebalances,
       livePriceFn: args.livePriceFn,
     });
   }

@@ -355,6 +355,18 @@ function renderForward(report: StrategyReport): string[] {
       lines.push(`    ${formatPendingRow(t)}`);
     }
   }
+  if (f.rebalanceDrift.length > 0) {
+    lines.push(`  Rebalance drift (last evaluation):`);
+    for (const d of f.rebalanceDrift) {
+      const reading =
+        d.lastDriftPct == null
+          ? "not yet evaluated"
+          : `${d.lastDriftPct.toFixed(2)}% / ${d.thresholdPct}% threshold  (${d.pctOfThreshold!.toFixed(0)}% of trigger)`;
+      const hot = d.pctOfThreshold != null && d.pctOfThreshold >= 80 ? "  ⚠ APPROACHING" : "";
+      const fireNow = d.pctOfThreshold != null && d.pctOfThreshold >= 100 ? "  ⚠ WOULD FIRE NEXT EVAL" : "";
+      lines.push(`    #${String(d.planId).padEnd(5)}${d.paper ? "📝 " : ""}${(d.name ?? "").padEnd(16)} ${reading}${fireNow || hot}  next ${d.nextRunAt}`);
+    }
+  }
   lines.push("");
   return lines;
 }
