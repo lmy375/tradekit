@@ -8,7 +8,8 @@
 //                      so paper buys have something to spend.
 //   - paper balances — list virtual balances for review.
 //   - paper trades   — page through the paper_trades journal.
-//   - paper pnl      — per-strategy realized P&L summary.
+//   - paper pnl      — per-strategy realized P&L summary; --mtm adds
+//                      cost-basis positions marked at current prices.
 //   - paper reset    — wipe paper state (per-scope or globally).
 //
 // Design notes:
@@ -35,7 +36,8 @@ import { loadConfig, resolveProfile } from "../config.js";
 import { resolveToken, makeTransport } from "../chains.js";
 import { getToken } from "../tokens.js";
 import { setPaperBalance, adjustPaperBalance, summarizePaperPnl } from "../paperTrade.js";
-import { printJson, prompt, subcommandError } from "./helpers.js";
+import { computePaperPnlMtm, defaultPaperPriceFetcher, type PaperPnlMtmSummary } from "../paperPnl.js";
+import { printJson, prompt, subcommandError, makeCliLogger } from "./helpers.js";
 
 // ── shared helpers ──────────────────────────────────────────
 
@@ -225,13 +227,15 @@ export async function paperDepositCommand(flags: Record<string, string>) {
 
 // ── pnl ─────────────────────────────────────────────────────
 //
-// Realized P&L per strategy: walk the paper_trades journal, sum
-// the quote_amount across buys and sells per strategy, derive net
-// quote spent / received + net base accumulated. Note: this is
-// REALIZED P&L only — open positions aren't marked-to-market
-// here because doing so would require an oracle call per token,
-// which makes the command non-deterministic. Operators wanting
-// MTM should pair `paper balances` with `tradekit price`.
+// Default: realized P&L per strategy — a pure, deterministic function
+// of the fill journal (scripted consumers can diff it across runs).
+//
+// --mtm opts into mark-to-market: cost-basis positions are rebuilt
+// from the journal (weighted-average model, same as the real-trade
+// pnl report) and open positions are marked at the current oracle
+// price. One oracle call per distinct held token (memoized), so the
+// command stays cheap; the trade-off is non-determinism, which is
+// why MTM is a flag and not the default.
 
 export async function paperPnlCommand(flags: Record<string, string>) {
   const config = loadConfig();
@@ -240,6 +244,26 @@ export async function paperPnlCommand(flags: Record<string, string>) {
   if (flags["chain"]) filter.chain = flags["chain"];
   if (flags["strategy"]) filter.strategy = flags["strategy"];
   const rows = listPaperTrades(filter);
+
+  if (flags["mtm"] === "true") {
+    const logger = makeCliLogger(flags);
+    const report = await computePaperPnlMtm(rows, defaultPaperPriceFetcher(config, logger));
+
+    if (flags["json"] === "true") {
+      printJson({ ok: true, mtm: true, timestamp: report.timestamp, count: report.summaries.length, summaries: report.summaries });
+      return;
+    }
+    if (report.summaries.length === 0) {
+      console.log("No paper trades to compute P&L from.");
+      return;
+    }
+    console.log("Paper P&L (mark-to-market, quote-denominated, per strategy):");
+    console.log("");
+    for (const s of report.summaries) renderMtmSummary(s);
+    console.log("Realized uses weighted-average cost basis; deposits are capital, not P&L —");
+    console.log("base sold without a tracked buy realizes nothing (see untracked figures above).");
+    return;
+  }
 
   // Iter: aggregation lives in the shared summarizePaperPnl() core so
   // the CLI and the MCP `paper_pnl` tool report identical numbers.
@@ -265,7 +289,39 @@ export async function paperPnlCommand(flags: Record<string, string>) {
     }
     console.log("");
   }
-  console.log("Note: Realized only. Open positions are NOT marked-to-market — pair with `tradekit paper balances` + spot prices to see total P&L.");
+  console.log("Note: Realized only. Open positions are NOT marked-to-market — re-run with --mtm for total P&L including unrealized.");
+}
+
+function fmtSigned(n: number): string {
+  return `${n >= 0 ? "+" : ""}${fmtUsd(n)}`;
+}
+
+function renderMtmSummary(s: PaperPnlMtmSummary): void {
+  console.log(`  ${s.strategy.padEnd(24)}  fills=${s.fills}  buy=${s.buys}  sell=${s.sells}`);
+  const unreal = s.unrealizedQuote == null ? "— (unpriced)" : fmtSigned(s.unrealizedQuote);
+  console.log(`    realized ${fmtSigned(s.realizedQuote)}  unrealized ${unreal}  total ${fmtSigned(s.totalQuote)}  open value ${fmtUsd(s.openValueQuote)}`);
+  for (const p of s.positions) {
+    if (p.amount <= 0 && p.realizedQuote === 0 && p.untrackedSellBase === 0) continue;
+    const sym = p.symbol ?? p.token.slice(0, 10);
+    if (p.amount > 0) {
+      const mark = p.currentPriceQuote == null
+        ? "price unavailable"
+        : `@ ${fmtUsd(p.currentPriceQuote)} (avg cost ${fmtUsd(p.avgCostQuote)}) unrealized ${p.unrealizedQuote == null ? "—" : fmtSigned(p.unrealizedQuote)}`;
+      console.log(`      ${sym.padEnd(10)} ${p.amount.toFixed(6)} held ${mark}`);
+    } else {
+      console.log(`      ${sym.padEnd(10)} flat  realized ${fmtSigned(p.realizedQuote)}`);
+    }
+    if (p.untrackedSellBase > 0) {
+      console.log(`        ⚠ ${p.untrackedSellBase.toFixed(6)} ${sym} sold without tracked cost basis (deposit-seeded) — ${fmtUsd(p.untrackedSellQuote)} proceeds excluded from realized`);
+    }
+  }
+  if (s.unpricedPositionCount > 0) {
+    console.log(`    ⚠ ${s.unpricedPositionCount} open position(s) unpriced — unrealized/total are partial`);
+  }
+  if (s.skippedNonStableQuote > 0) {
+    console.log(`    ⚠ ${s.skippedNonStableQuote} fill(s) with non-stablecoin quote excluded from cost basis`);
+  }
+  console.log("");
 }
 
 // ── reset ───────────────────────────────────────────────────

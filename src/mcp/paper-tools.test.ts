@@ -14,13 +14,22 @@
  * keeping the test offline + deterministic.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-mcp-paper-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
+
+// paper_pnl mtm:true routes through defaultPaperPriceFetcher → price.js.
+// Pin the oracle so the MTM tests stay offline + deterministic. The
+// native sentinel is priced via the chain's WETH (Base: 0x4200…0006).
+vi.mock("../price.js", () => ({
+  getCurrentPrice: vi.fn(async (token: string) =>
+    token.toLowerCase() === "0x4200000000000000000000000000000000000006" ? 2500 : null,
+  ),
+}));
 
 const { registerPaperTools } = await import("./paper-tools.js");
 const { openDb, closeDb, recordPaperTrade } = await import("../db.js");
@@ -226,6 +235,69 @@ describe("paper_pnl", () => {
     const r = await registered.get("paper_pnl")!.handler({});
     const p = parseResult(r) as { summaries: { strategy: string }[] };
     expect(p.summaries[0].strategy).toBe("(unattributed)");
+  });
+
+  it("default (no mtm) output carries NO mtm fields — backward-compatible shape", async () => {
+    seedTrade({});
+    const { server, registered } = makeMockServer();
+    registerPaperTools(server as never, makeRuntime() as never);
+    const p = parseResult(await registered.get("paper_pnl")!.handler({})) as Record<string, unknown> & {
+      summaries: Record<string, unknown>[];
+    };
+    expect(p["mtm"]).toBeUndefined();
+    expect(p["timestamp"]).toBeUndefined();
+    expect(p.summaries[0]["positions"]).toBeUndefined();
+    expect(p.summaries[0]["unrealizedQuote"]).toBeUndefined();
+  });
+
+  it("mtm:true marks the open position at the oracle price (native via WETH)", async () => {
+    // Buy 1 ETH @ 2000 USDC; mocked oracle says WETH = 2500.
+    seedTrade({ direction: "buy", base_amount: "1", quote_amount: "2000", strategy: "dca" });
+    const { server, registered } = makeMockServer();
+    registerPaperTools(server as never, makeRuntime() as never);
+    const r = await registered.get("paper_pnl")!.handler({ mtm: true });
+    const p = parseResult(r) as {
+      ok: boolean;
+      mtm: boolean;
+      timestamp: string;
+      summaries: {
+        strategy: string;
+        netQuote: number;
+        realizedQuote: number;
+        unrealizedQuote: number | null;
+        totalQuote: number;
+        unpricedPositionCount: number;
+        positions: { symbol: string | null; amount: number; avgCostQuote: number; currentPriceQuote: number | null; unrealizedQuote: number | null }[];
+      }[];
+    };
+    expect(p.ok).toBe(true);
+    expect(p.mtm).toBe(true);
+    expect(typeof p.timestamp).toBe("string");
+    const s = p.summaries[0];
+    expect(s.strategy).toBe("dca");
+    // Legacy field keeps cash-flow semantics (buy → negative).
+    expect(s.netQuote).toBeCloseTo(-2000, 6);
+    expect(s.realizedQuote).toBe(0);
+    expect(s.unrealizedQuote).toBeCloseTo(500, 6);
+    expect(s.totalQuote).toBeCloseTo(500, 6);
+    expect(s.unpricedPositionCount).toBe(0);
+    expect(s.positions).toHaveLength(1);
+    expect(s.positions[0].amount).toBeCloseTo(1, 9);
+    expect(s.positions[0].avgCostQuote).toBeCloseTo(2000, 6);
+    expect(s.positions[0].currentPriceQuote).toBe(2500);
+  });
+
+  it("mtm:true realizes cost-basis P&L on a round-trip and reports flat", async () => {
+    seedTrade({ direction: "buy", base_amount: "1", quote_amount: "2000", strategy: "dca", timestamp: "2026-06-01T00:00:00.000Z" });
+    seedTrade({ direction: "sell", base_amount: "1", quote_amount: "2300", strategy: "dca", timestamp: "2026-06-02T00:00:00.000Z" });
+    const { server, registered } = makeMockServer();
+    registerPaperTools(server as never, makeRuntime() as never);
+    const p = parseResult(await registered.get("paper_pnl")!.handler({ mtm: true })) as {
+      summaries: { realizedQuote: number; unrealizedQuote: number | null; totalQuote: number }[];
+    };
+    expect(p.summaries[0].realizedQuote).toBeCloseTo(300, 6);
+    expect(p.summaries[0].unrealizedQuote).toBe(0); // flat — nothing open
+    expect(p.summaries[0].totalQuote).toBeCloseTo(300, 6);
   });
 });
 

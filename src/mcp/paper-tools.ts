@@ -41,6 +41,7 @@ import {
   adjustPaperBalance,
   summarizePaperPnl,
 } from "../paperTrade.js";
+import { computePaperPnlMtm, defaultPaperPriceFetcher } from "../paperPnl.js";
 import {
   listPaperTrades,
   listPaperBalances,
@@ -116,11 +117,12 @@ export const registerPaperTools: RegisterFn = (server, rt) => {
   // ── paper_pnl ────────────────────────────────────────────────
   server.tool(
     "paper_pnl",
-    "Realized, quote-denominated P&L for paper trades, grouped by strategy. Returns { ok, count, summaries: [{ strategy, fills, buys, sells, quoteSpent, quoteReceived, netQuote, firstFillAt, lastFillAt }], elapsedMs }, sorted by fill count desc. `netQuote = quoteReceived - quoteSpent` (positive = net quote inflow). Fills with no strategy tag fold into the '(unattributed)' bucket. IMPORTANT: this is REALIZED P&L only — open positions are NOT marked-to-market (that needs a live oracle call per token and would make the result non-deterministic). For total P&L including unrealized, pair this with paper_balances + the price tool. Filters: `account`, `chain`, `strategy` (all optional). Computed by the same summarizePaperPnl() core the CLI `paper pnl` uses, so numbers match exactly across surfaces.",
+    "Quote-denominated P&L for paper trades, grouped by strategy. DEFAULT (deterministic, journal-only): returns { ok, count, summaries: [{ strategy, fills, buys, sells, quoteSpent, quoteReceived, netQuote, firstFillAt, lastFillAt }], elapsedMs }, sorted by fill count desc — REALIZED cash flow only (`netQuote = quoteReceived - quoteSpent`). Pass `mtm: true` for mark-to-market: each summary becomes a SUPERSET adding { realizedQuote (weighted-average cost-basis realized), unrealizedQuote (open positions marked at current oracle prices; null when every open position is unpriced), totalQuote, openValueQuote, positions: [{ chain, token, symbol, amount, avgCostQuote, realizedQuote, currentPriceQuote, unrealizedQuote, valueQuote, trades, lastTradeAt, untrackedSellBase, untrackedSellQuote }], unpricedPositionCount, skippedNonStableQuote }, plus a top-level `mtm: true` and `timestamp` (when the price marks were fetched). MTM notes: deposits are capital not P&L — base sold without a tracked paper-buy realizes nothing and is reported via untrackedSell*; fills with a non-stablecoin quote are excluded from cost basis (skippedNonStableQuote); one memoized oracle call per distinct held token. mtm results are NOT deterministic (live prices) — omit `mtm` when diffing across runs. Fills with no strategy tag fold into the '(unattributed)' bucket. Filters: `account`, `chain`, `strategy` (all optional). Same cores (summarizePaperPnl / computePaperPnlMtm) as the CLI `paper pnl [--mtm]`, so numbers match exactly across surfaces.",
     {
       account: z.string().optional(),
       chain: z.string().optional(),
       strategy: z.string().optional(),
+      mtm: z.boolean().optional().describe("Mark open positions to market via live oracle prices. Adds cost-basis realized/unrealized/total + per-position detail. Non-deterministic — omit for stable, journal-only output."),
     },
     async (input) => {
       try {
@@ -135,6 +137,10 @@ export const registerPaperTools: RegisterFn = (server, rt) => {
             if (input.chain) filter.chain = input.chain;
             if (input.strategy) filter.strategy = input.strategy;
             const rows = listPaperTrades(filter);
+            if (input.mtm === true) {
+              const report = await computePaperPnlMtm(rows, defaultPaperPriceFetcher(rt.getConfig(), rt.opts.logger));
+              return { mtm: true, timestamp: report.timestamp, count: report.summaries.length, summaries: report.summaries, elapsedMs: Date.now() - t0 };
+            }
             const summaries = summarizePaperPnl(rows);
             return { count: summaries.length, summaries, elapsedMs: Date.now() - t0 };
           }),

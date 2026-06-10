@@ -556,7 +556,7 @@ tradekit strategy report 1 --window all
 **MCP tool.** `strategy_report` exposes the same surface to agents — one call replaces 7+ pre-iter31 calls. Agents wanting a near-real-time tick check pass `sections: ["identity", "forward"]` to skip the heavier aggregation paths.
 
 **v1 limitations.**
-- Open positions are NOT marked-to-market. The performance section reports REALIZED P&L only. Pair `strategy report` + `paper balances` (or `holdings`) + `tradekit price` for total P&L.
+- Open positions are NOT marked-to-market in the report itself. The performance section reports REALIZED P&L only. For paper strategies, `tradekit paper pnl --mtm` gives the full cost-basis + unrealized view; for real trades use `tradekit pnl`.
 - Drawdown is shown for the per-strategy scope (`strategy:<tag>`) only; the `global` portfolio breaker has its own surface via `safety drawdown`.
 
 #### Strategy alerts (iter32) — proactive notifications
@@ -1230,7 +1230,8 @@ tradekit engine run --once
 # 4. Inspect paper fills + P&L
 tradekit paper trades
 tradekit paper balances
-tradekit paper pnl
+tradekit paper pnl          # realized only (deterministic)
+tradekit paper pnl --mtm    # + open positions marked at current prices
 
 # 5. If the strategy looks good, destroy + redeploy without --paper for real
 tradekit playbook destroy 1
@@ -1256,7 +1257,11 @@ tradekit playbook deploy ./eth-strategy.json
 
 **Rebalance plans are paper-aware too (v27).** `rebalance create --paper true` registers a plan whose drift is evaluated against the VIRTUAL book — `paper balances` IS the portfolio, not the on-chain wallet. Corrective legs fire through `executePaperTrade` and fill back into the same virtual book, which is what makes the plan converge: after a correction lands, the next tick re-reads the (now-corrected) book and sees drift back inside the threshold. `playbook deploy --paper` with a rebalance entry in the spec cascades the flag the same way it does for orders/schedules — the pre-v27 fail-fast INVALID_PARAMS is gone. Seed the book with `paper deposit` first; an empty virtual book is an empty-portfolio skip, not an error. Paper plans use the read-only wallet path (no keystore decryption) and their fills land in `paper_trades` with `source_type='rebalance'`.
 
-**Open positions are NOT marked-to-market.** `paper pnl` reports REALIZED P&L only (sum of quote received - quote spent). Adding MTM would require an oracle call per held token, which makes the command non-deterministic. To see total P&L, pair `paper balances` with `tradekit price`.
+**Mark-to-market is opt-in (`--mtm`).** By default `paper pnl` reports REALIZED P&L only (sum of quote received − quote spent) — a deterministic, pure function of the fill journal that scripted consumers can diff across runs. `paper pnl --mtm` (or `mtm: true` on the MCP `paper_pnl` tool) adds the full mark-to-market view: positions are rebuilt from the journal with the SAME weighted-average cost-basis model the real-trade `pnl` report uses, then open positions are marked at current oracle prices — realized, unrealized, total, open value, and per-position detail. One memoized oracle call per distinct held token; the native sentinel prices via the chain's WETH (same convention as paper rebalance drift).
+
+Two accounting rules worth knowing:
+- **Deposits are capital, not P&L.** `paper deposit` writes a balance with no journal row, so deposit-seeded inventory has no cost basis. Selling it realizes *nothing* — the proceeds are reported separately per position (`untrackedSellBase` / `untrackedSellQuote`) instead of inflating realized P&L. Same stance a brokerage statement takes.
+- **Only stablecoin-quoted fills enter cost basis.** A volatile-quote fill (e.g. PEPE/WETH) has no USD anchor at trade time; such fills still count in the cash-flow fields but are excluded from cost basis and surfaced via `skippedNonStableQuote` — exactly the rule the real-trade pnl report applies.
 
 #### Templating (iter21)
 
@@ -2193,7 +2198,7 @@ Tools exposed via the `tradekit mcp` server, grouped by domain:
 **Paper trading (virtual book):** `paper_balances` `paper_trades` `paper_pnl` `paper_deposit` `paper_reset`
 - Manage the synthetic book that `paper: true` orders / schedules / playbooks fire against — the full dry-run loop over MCP, no real funds, no CLI fallback
 - `paper_deposit` seeds/adjusts a virtual balance (mode `credit` adds, mode `set` overwrites; decimals come from the same on-chain getToken lookup the trade flow uses)
-- `paper_pnl` is realized, quote-denominated P&L per strategy via the same `summarizePaperPnl()` core the CLI uses (numbers match across surfaces); open positions are NOT marked-to-market — pair with `paper_balances` + `price` for total P&L
+- `paper_pnl` is quote-denominated P&L per strategy via the same cores the CLI uses (numbers match across surfaces); default output is realized-only and deterministic, `mtm: true` adds cost-basis positions marked at current oracle prices (realized / unrealized / total / per-position detail)
 - `paper_reset` is destructive (wipes balances + fill journal for a scope) and requires `confirm: true`; omitting both `account` and `chain` wipes the whole book
 
 **Iter26 — strategy lifecycle (playbooks + backtests):**

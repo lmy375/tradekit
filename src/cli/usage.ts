@@ -381,9 +381,13 @@ PAPER TRADING (virtual book, no on-chain submission)
         be evaluated identically in paper + real.
   paper balances [--account L] [--chain X] [--json]
         Virtual balances per (account, chain, token). Empty until 'paper deposit' has run.
-  paper pnl [--account L] [--chain X] [--strategy TAG] [--json]
-        Realized P&L per strategy (quote-denominated). Open positions are NOT marked-to-market;
-        pair with 'paper balances' + a spot-price tool for total P&L.
+  paper pnl [--account L] [--chain X] [--strategy TAG] [--mtm] [--json]
+        Realized P&L per strategy (quote-denominated). Default output is deterministic
+        (pure function of the fill journal). --mtm adds mark-to-market: cost-basis
+        positions (weighted-average, same model as the real-trade pnl report) marked
+        at current oracle prices — realized + unrealized + total + per-position detail.
+        Deposits are capital, not P&L: base sold without a tracked paper-buy realizes
+        nothing and is reported separately (untracked figures).
   paper reset [--account L] [--chain X] [--yes] [--json]
         WIPE paper state. Without --account/--chain, wipes EVERY account on every chain.
         Interactive confirmation required unless --yes.
