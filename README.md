@@ -2491,6 +2491,14 @@ Every real (non-simulate) `buy`/`sell` should carry an `idempotencyKey` (8–128
 
 CLI parity: `tradekit buy/sell --idempotency-key K`. Keys expire via `db.retention.idempotencyKeysDays` (replay protection is an operational window, not an archive).
 
+### Trade approval gate (v47) — agent proposes, human decides
+
+Static safety caps answer "what may an agent *ever* do"; they can't express **"below $500 the agent trades autonomously, above it I want to look first."** `safety.tradeApproval { enabled, thresholdUsd, expiresMinutes }` is that middle band:
+
+- An MCP `buy`/`sell` at/above `thresholdUsd` (`null` = every agent trade) is **not executed**. The request is priced via a full `simulate` pass (entire safety stack + live quote — exactly what the reviewer needs), lands as a **pending intent**, and the agent gets a `pending_approval` *success* result (not an error — agent loops must not blind-retry) with the intent id and a do-not-resubmit note. The gate **fails closed**: an unpriceable trade gates too. A notification pages the operator. Composes with idempotency keys: a transport retry replays the *same* intent instead of filing duplicates.
+- The operator reviews with `tradekit intents show <id>` (request + preview + the agent's `approvalReason`) and decides. **`approve` re-executes behind the wallet password with drift protection built in** — the preview's received-amount replays as `expectedAmountOut` (default 100bps tolerance), so an hour-old quote can't silently execute into a moved market. Outcomes (`executed`/`failed` with the result, `rejected` with a note) are recorded on the intent; pending intents **expire** after `expiresMinutes` (default 60).
+- **Approve/reject is CLI-only by design** — the same security boundary as backup/panic: a prompt-injected agent must never approve its own spending. Agents get read-only `intents_list` to poll decisions. The CLI trade path itself is not gated: it already sits behind the wallet password, i.e. the human.
+
 ### Error shape
 
 Every MCP tool returns either a JSON success body or, on failure, a `ToolError`:

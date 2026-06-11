@@ -385,6 +385,29 @@ const safetySchema = z
       .optional(),
 
     /**
+     * v47: human-in-the-loop approval gate for AGENT-proposed trades.
+     * When enabled, MCP buy/sell at or above thresholdUsd is NOT
+     * executed — it lands as a pending trade intent (with its
+     * simulate-preview as review context) and the operator approves
+     * or rejects via `tradekit intents` (CLI-ONLY — same security
+     * boundary as backup/panic; a prompt-injected agent must never
+     * approve its own spending). The CLI trade path is NOT gated:
+     * it already has the wallet-password gate, i.e. the human.
+     */
+    tradeApproval: z
+      .object({
+        enabled: z.boolean().default(false),
+        /** USD threshold at/above which agent trades need approval.
+         *  null = EVERY agent trade needs approval. */
+        thresholdUsd: z.number().positive().nullable().default(null),
+        /** Pending intents expire after this many minutes — a stale
+         *  quote should never execute days later. */
+        expiresMinutes: z.number().int().min(1).max(1440).default(60),
+      })
+      .strict()
+      .default({ enabled: false, thresholdUsd: null, expiresMinutes: 60 }),
+
+    /**
      * Iter20: portfolio drawdown circuit breaker. Tracks the operator's
      * portfolio peak USD value across trades and refuses new trades
      * when current value falls below peak × (1 - maxDrawdownPct/100).

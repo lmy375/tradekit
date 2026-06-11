@@ -310,6 +310,31 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+TRADE APPROVAL (v47 — human-in-the-loop for agent trades)
+  intents list [--status pending|executed|failed|rejected|expired] [--limit N] [--json]
+        Agent-proposed trades awaiting (or past) your decision. Created when
+        safety.tradeApproval gates an MCP buy/sell: enabled=true +
+        thresholdUsd (null = every agent trade). The agent gets a
+        pending_approval result (NOT an error) and polls intents_list;
+        a notification pages you with the intent id.
+  intents show <id> [--json]
+        Full review context: the resolved request, the simulate PREVIEW the
+        agent's trade was priced against (full safety stack ran), the agent's
+        stated reason, expiry, and (after decision) the outcome.
+  intents approve <id> [--max-deviation-bps N] [--force] [--note "..."] [--json]
+        Re-executes the recorded request behind YOUR wallet password. The
+        preview's received-amount is replayed as expectedAmountOut (default
+        100bps tolerance) so an hour-old quote can't silently execute into a
+        moved market — QUOTE_DEVIATION_EXCEEDED names the live numbers;
+        --force skips the check. Outcome (executed/failed) is recorded on
+        the intent. Approve/reject is CLI-ONLY by design — same security
+        boundary as backup/panic: a prompt-injected agent must never approve
+        its own spending.
+  intents reject <id> [--note "..."] [--json]
+        Terminal. Pending intents auto-expire after
+        safety.tradeApproval.expiresMinutes (default 60) — a stale quote
+        should never execute days later.
+
 EXECUTION QUALITY (v44)
   execution [--since 30d|12h|ISO] [--chain X] [--account L] [--json]
         Execution analytics over REAL fills: signed realized slippage

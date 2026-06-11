@@ -1266,6 +1266,35 @@ const MIGRATIONS: string[] = [
     completed_at  TEXT
   );
   `,
+
+  // v41 — trade intents (v47 feature): the human-in-the-loop approval
+  // gate for agent-proposed trades. When safety.tradeApproval is on
+  // and an MCP buy/sell crosses the USD threshold, the trade is NOT
+  // executed — the resolved request plus its simulate-preview (full
+  // safety check + quote, the reviewer's context) lands here as a
+  // pending intent. Approval/rejection is CLI-ONLY (same security
+  // boundary as backup/panic: a prompt-injected agent must not be
+  // able to approve its own spending).
+  `
+  CREATE TABLE trade_intents (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    tool          TEXT NOT NULL,
+    chain         TEXT NOT NULL,
+    account       TEXT,
+    request_json  TEXT NOT NULL,
+    preview_json  TEXT,
+    est_usd       REAL,
+    reason        TEXT,
+    expires_at    TEXT NOT NULL,
+    decided_at    TEXT,
+    decided_note  TEXT,
+    executed_at   TEXT,
+    result_json   TEXT
+  );
+  CREATE INDEX idx_trade_intents_status ON trade_intents(status, created_at);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4064,6 +4093,129 @@ export function findScheduleFireEvidence(args: {
  *  another simulation would be circular. Absolute value: signed
  *  slippage averages toward zero while every fill still pays the
  *  spread. */
+// ── trade intents (v41 schema / v47 feature) ─────────────────
+
+export type TradeIntentStatus = "pending" | "executed" | "failed" | "rejected" | "expired";
+
+export interface TradeIntentRow {
+  id: number;
+  created_at: string;
+  status: TradeIntentStatus;
+  tool: "buy" | "sell";
+  chain: string;
+  account: string | null;
+  request_json: string;
+  preview_json: string | null;
+  est_usd: number | null;
+  reason: string | null;
+  expires_at: string;
+  decided_at: string | null;
+  decided_note: string | null;
+  executed_at: string | null;
+  result_json: string | null;
+}
+
+export function insertTradeIntent(args: {
+  createdAt: string;
+  tool: "buy" | "sell";
+  chain: string;
+  account: string | null;
+  requestJson: string;
+  previewJson: string | null;
+  estUsd: number | null;
+  reason: string | null;
+  expiresAt: string;
+}): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO trade_intents
+        (created_at, status, tool, chain, account, request_json, preview_json,
+         est_usd, reason, expires_at)
+       VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      args.createdAt,
+      args.tool,
+      args.chain,
+      args.account,
+      args.requestJson,
+      args.previewJson,
+      args.estUsd,
+      args.reason,
+      args.expiresAt,
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export function getTradeIntentById(id: number): TradeIntentRow | null {
+  const db = openDb();
+  const row = db.prepare(`SELECT * FROM trade_intents WHERE id = ?`).get(id) as
+    | TradeIntentRow
+    | undefined;
+  return row ?? null;
+}
+
+export function listTradeIntents(filter: { status?: TradeIntentStatus; limit?: number } = {}): TradeIntentRow[] {
+  const db = openDb();
+  const where: string[] = [];
+  const params: (string | number)[] = [];
+  if (filter.status) {
+    where.push("status = ?");
+    params.push(filter.status);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+  params.push(filter.limit ?? 50);
+  return db
+    .prepare(`SELECT * FROM trade_intents ${whereSql} ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(...params) as unknown as TradeIntentRow[];
+}
+
+/** Status transition with an expected-from guard — the WHERE clause
+ *  makes concurrent decisions race-safe (second writer changes 0 rows). */
+export function transitionTradeIntent(args: {
+  id: number;
+  from: TradeIntentStatus;
+  to: TradeIntentStatus;
+  decidedAt?: string;
+  decidedNote?: string | null;
+  executedAt?: string;
+  resultJson?: string | null;
+}): boolean {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `UPDATE trade_intents
+          SET status = ?,
+              decided_at = COALESCE(?, decided_at),
+              decided_note = COALESCE(?, decided_note),
+              executed_at = COALESCE(?, executed_at),
+              result_json = COALESCE(?, result_json)
+        WHERE id = ? AND status = ?`,
+    )
+    .run(
+      args.to,
+      args.decidedAt ?? null,
+      args.decidedNote ?? null,
+      args.executedAt ?? null,
+      args.resultJson ?? null,
+      args.id,
+      args.from,
+    );
+  return Number(r.changes) === 1;
+}
+
+/** Lazy expiry sweep: pending intents past their deadline flip to
+ *  expired. Called from list/show/approve paths — no worker needed. */
+export function sweepExpiredTradeIntents(nowIso: string): number {
+  const db = openDb();
+  return Number(
+    db
+      .prepare(`UPDATE trade_intents SET status = 'expired' WHERE status = 'pending' AND expires_at < ?`)
+      .run(nowIso).changes,
+  );
+}
+
 // ── idempotency keys (v40 schema / v45 feature) ──────────────
 
 export interface IdempotencyKeyRow {

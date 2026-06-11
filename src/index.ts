@@ -601,6 +601,13 @@ async function main() {
         break;
       }
 
+      // v47: human-in-the-loop approval queue for agent trades.
+      case "intents": {
+        const { intentsCommand } = await import("./cli/intents.js");
+        await intentsCommand(action, flags, positional);
+        break;
+      }
+
       // v44: execution quality — slippage by aggregator/pair/size,
       // trend vs prior window, threshold-gated recommendations.
       case "execution": {
@@ -801,7 +808,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note", "incident", "execution",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note", "incident", "execution", "intents",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

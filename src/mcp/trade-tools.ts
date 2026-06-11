@@ -131,6 +131,13 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
           .describe(
             "Iter648: structured strategy tag stored on the trade row (e.g. 'dca-eth', 'rebal-q1'). Indexed for cross-cut queries — `recent_trades` + `pnl` both accept a strategy filter. Distinct from `note` which is free-text.",
           ),
+        approvalReason: z
+          .string()
+          .max(500)
+          .optional()
+          .describe(
+            "v47: when safety.tradeApproval gates this trade, your stated reason is shown to the human reviewer alongside the quote preview — one sentence on WHY this trade, e.g. 'TV breakout signal + funding reset'. Ignored when no approval is needed.",
+          ),
         idempotencyKey: z
           .string()
           .optional()
@@ -165,6 +172,14 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 autoSlippage: input.autoSlippage,
                 strategy: input.strategy,
               };
+              const ctx = {
+                publicClient: wallet.publicClient,
+                walletClient: wallet.walletClient,
+                profile,
+                config,
+                logger: rt.opts.logger,
+                accountLabel: wallet.label,
+              };
               const { withIdempotency } = await import("../idempotency.js");
               const { result, replayed } = await withIdempotency({
                 key: input.idempotencyKey,
@@ -173,15 +188,56 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 // — the same key with changed amounts must CONFLICT,
                 // not silently replay the old trade.
                 requestArgs: { ...input, idempotencyKey: undefined },
-                exec: () =>
-                  executeTrade(req, {
-                    publicClient: wallet.publicClient,
-                    walletClient: wallet.walletClient,
-                    profile,
-                    config,
-                    logger: rt.opts.logger,
-                    accountLabel: wallet.label,
-                  }),
+                exec: async () => {
+                  // v47: human-in-the-loop approval gate (agent surface
+                  // only — the CLI path sits behind the wallet password,
+                  // i.e. the human). The pending result is a SUCCESS
+                  // shape so agent loops don't blind-retry, and it's
+                  // recorded under the idempotency key so a transport
+                  // retry replays the SAME intent instead of filing
+                  // duplicates.
+                  const { approvalGateConfig, needsApproval, createTradeIntent, notifyIntentCreated } =
+                    await import("../tradeIntents.js");
+                  const gate = approvalGateConfig(config);
+                  if (gate && !(input.simulate ?? false)) {
+                    // Price + safety-check the request WITHOUT sending:
+                    // the simulate preview is the reviewer's context.
+                    const preview = await executeTrade({ ...req, simulate: true }, ctx);
+                    const estUsd = preview.estimatedUsd ?? (Number.isFinite(parseFloat(preview.quoteAmount)) ? parseFloat(preview.quoteAmount) : null);
+                    if (needsApproval(gate, estUsd)) {
+                      const intent = createTradeIntent({
+                        tool: direction,
+                        chain: wallet.chain,
+                        account: wallet.label ?? null,
+                        request: { ...req, chain: wallet.chain, account: wallet.label },
+                        preview: preview as unknown as Record<string, unknown>,
+                        estUsd,
+                        reason: input.approvalReason ?? null,
+                        expiresMinutes: gate.expiresMinutes,
+                      });
+                      await notifyIntentCreated({
+                        intent,
+                        tool: direction,
+                        pairLabel: `${preview.baseSymbol ?? input.base ?? "?"}/${preview.quoteSymbol ?? input.quote ?? "?"}`,
+                        reason: input.approvalReason ?? null,
+                        config,
+                        logger: rt.opts.logger,
+                      });
+                      return {
+                        ok: true,
+                        ...intent,
+                        preview: {
+                          price: preview.price,
+                          baseAmount: preview.baseAmount,
+                          quoteAmount: preview.quoteAmount,
+                          aggregator: preview.aggregator,
+                        },
+                        note: "Trade NOT executed — safety.tradeApproval gated it. A human must run `tradekit intents approve` (CLI-only by design). Poll intents_list for the decision; do NOT re-submit this trade.",
+                      };
+                    }
+                  }
+                  return await executeTrade(req, ctx);
+                },
               });
               return replayed ? { ...result, replayed: true } : result;
             }),
@@ -192,6 +248,45 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       },
     );
   }
+
+  // ── v47: trade intents (read-only — approve/reject is CLI-only) ──
+  server.tool(
+    "intents_list",
+    "v47: list agent-proposed trade intents awaiting (or past) human approval. Agents use this to POLL the decision on a pending_approval result from buy/sell — status flips to executed/failed (with result detail via the CLI) or rejected/expired. Approve/reject is deliberately NOT exposed over MCP (same security boundary as backup/panic: a prompt-injected agent must never approve its own spending) — a human runs `tradekit intents approve <id>`.",
+    {
+      status: z.enum(["pending", "executed", "failed", "rejected", "expired"]).optional().describe("Filter by status. Default: all."),
+      limit: z.number().int().min(1).max(200).default(50),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("intents_list", rt.opts, input, undefined, async () => {
+            const { listIntents } = await import("../tradeIntents.js");
+            const rows = listIntents({ status: input.status, limit: input.limit });
+            return {
+              ok: true,
+              count: rows.length,
+              intents: rows.map((r) => ({
+                id: r.id,
+                status: r.status,
+                tool: r.tool,
+                chain: r.chain,
+                account: r.account,
+                est_usd: r.est_usd,
+                reason: r.reason,
+                created_at: r.created_at,
+                expires_at: r.expires_at,
+                decided_at: r.decided_at,
+                decided_note: r.decided_note,
+              })),
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
 
   // ── sweep_balances (iter610) ──────────────────────────────
   // Multi-source balance consolidation. Plan + (optionally) execute transfers
