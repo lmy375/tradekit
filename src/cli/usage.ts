@@ -699,21 +699,32 @@ BACKTESTING (historical strategy simulation)
                  (--baseAmount A | --quoteAmount A)
                  --balance '{"ETH":1.5,"USDC":3000}'
                  --since 30d|4w|6m|<N-days> [--chain X] [--json]
+                 [--slippage-bps N] [--gas-usd X] [--costs-from-history]
         Replay a single order against a CoinGecko price series. Reuses the SAME trigger
         predicates the live engine uses (isOrderTriggered, evaluateTrailingTrigger), so
         the simulator fires when production would have fired. CoinGecko resolution:
         ≤1 day = 5min; ≤90 days = hourly; >90 days = daily.
+        COST-AWARE MODE (v40, all backtest commands): the default sim is friction-free,
+        which flatters active strategies vs hold. --slippage-bps degrades the received
+        side of every fill; --gas-usd charges a flat USD per fill against final equity;
+        --costs-from-history calibrates missing knobs from YOUR recorded real trades
+        (avg |realized slippage| + avg gas × current native price). Explicit flags win
+        over history. The HOLD counterfactual stays frictionless on purpose.
   backtest schedule --side buy|sell (--cron "<5-field>" | --every 1h|6h|1d|7d)
                     --base ETH|<addr> --quote USDC|<addr>
                     (--baseAmount A | --quoteAmount A) [--max-runs N]
                     --balance '{"USDC":3000}'
                     --since 30d [--chain X] [--json]
+                    [--slippage-bps N] [--gas-usd X] [--costs-from-history]
         Replay a recurring schedule (DCA / time-based fires) against the price series.
         Each datapoint where the cron matches AND balance suffices simulates one fill.
+        Cost-aware mode matters MOST here: 30 fires/month × slippage + gas is exactly
+        the friction a zero-cost sim hides.
   backtest playbook <file>
                     --balance '{"ETH":1,"USDC":3000}'
                     --since 30d [--chain X] [--base ETH] [--quote USDC] [--json]
                     [--var NAME=VALUE ...] [--vars-file FILE] [--signals-from-history]
+                    [--slippage-bps N] [--gas-usd X] [--costs-from-history]
         Replay a FULL playbook spec (multiple orders + schedules) against one shared price
         series with a shared simulated balance. OCO cascade fires during simulation —
         when a peer fills, the rest of the group transitions to cancelled. Schedule
@@ -750,6 +761,7 @@ BACKTESTING (historical strategy simulation)
   backtest compare <scenarios.json>
                     --balance '{"ETH":1,"USDC":3000}'
                     --since 60d [--chain X] [--json]
+                    [--slippage-bps N] [--gas-usd X] [--costs-from-history]
         Multi-scenario backtest: replay N scenarios (each a {name, file, vars} triple) against
         ONE shared price series + a fresh balance copy per scenario. Same-pair invariant enforced
         — every scenario must reference the same base/quote (comparison is across strategies,

@@ -56,6 +56,8 @@ import { parsePlaybookSpec, type PlaybookSpec, type StrategySpec, type OrderSpec
 import {
   fetchPriceSeries,
   simulatePlaybook,
+  normalizeSimCosts,
+  type SimCosts,
   parseSinceDuration,
   type SymbolBalance,
   type PriceSeries,
@@ -182,6 +184,9 @@ export interface ScenarioResult {
   perStrategy: PlaybookBacktestResult["perStrategy"];
   /** True iff at least one strategy in the scenario fired a real fill. */
   hadAnyFill: boolean;
+  /** v40: total USD friction paid (slippage + gas); 0 when the
+   *  comparison ran cost-free. */
+  frictionUsd: number;
 }
 
 export interface ComparisonOutcome {
@@ -219,6 +224,9 @@ export interface RunComparisonArgs {
   /** Series fetched by the caller — lets `backtest compare` reuse a
    *  test injection seam + run with mocked data. */
   series: PriceSeries;
+  /** v40: friction model applied IDENTICALLY to every scenario —
+   *  fair comparison requires shared costs. */
+  costs?: Partial<SimCosts> | null;
 }
 
 /**
@@ -323,6 +331,7 @@ export function prepareScenarios(args: {
  */
 export function runComparison(args: RunComparisonArgs): ComparisonOutcome {
   const { scenariosFile, scenariosFileDir, initialBalance, series, baseSymbol, quoteSymbol, chain } = args;
+  const costs = normalizeSimCosts(args.costs);
   const { specs } = prepareScenarios({ scenariosFile, scenariosFileDir });
 
   const results: ScenarioResult[] = [];
@@ -339,6 +348,7 @@ export function runComparison(args: RunComparisonArgs): ComparisonOutcome {
       quoteSymbol,
       initialBalance: balanceForScenario,
       series,
+      costs,
     });
 
     // Persist as a regular backtest_runs row so `backtest show <id>`
@@ -379,6 +389,7 @@ export function runComparison(args: RunComparisonArgs): ComparisonOutcome {
       initialUsd: simResult.initialUsd,
       perStrategy: simResult.perStrategy,
       hadAnyFill: fills.length > 0,
+      frictionUsd: simResult.costs?.totalUsd ?? 0,
     });
   });
 
@@ -465,6 +476,15 @@ export function renderComparison(outcome: ComparisonOutcome): string {
       `  ${"HOLD (no trades)".padEnd(nameW)} ${fmtSignedUsd(firstScenario.holdPnlUsd).padStart(12)}  ${"—".padStart(11)}  ${"0".padStart(5)}  ${fmtUsd(firstScenario.initialUsd + firstScenario.holdPnlUsd).padStart(11)}  ${"—".padStart(4)}`,
     );
   }
+  // v40: friction footnote — PnL above is NET of these costs; the
+  // HOLD row pays none (that asymmetry is the comparison's point).
+  if (outcome.scenarios.some((s) => s.frictionUsd > 0)) {
+    lines.push(``);
+    lines.push(`  Friction paid (already deducted from PnL):`);
+    for (const s of outcome.scenarios) {
+      lines.push(`    ${s.scenarioName.padEnd(nameW)} ${fmtUsd(s.frictionUsd).padStart(12)}`);
+    }
+  }
   lines.push(``);
   if (outcome.winnerIdx !== null) {
     const winner = outcome.scenarios[outcome.winnerIdx];
@@ -491,6 +511,7 @@ export async function runCompareFromFile(args: {
   chain: string;
   baseAddress: `0x${string}`;
   priceFetcher?: (addr: string, days: number) => Promise<PriceSeries | null>;
+  costs?: Partial<SimCosts> | null;
 }): Promise<ComparisonOutcome> {
   const absPath = resolvePath(args.scenariosPath);
   let text: string;
@@ -542,6 +563,7 @@ export async function runCompareFromFile(args: {
     quoteSymbol,
     chain: args.chain,
     series,
+    costs: args.costs,
   });
 }
 

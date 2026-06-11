@@ -355,6 +355,59 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── v40: cost-aware backtests (shared knobs) ───────────────
+  // Friction model — see SimCosts in backtest.ts. Explicit knobs win
+  // over history-derived values; omitting everything keeps the
+  // cost-free pre-v40 behavior.
+  const costShapes = {
+    slippage_bps: z.number().min(0).max(10_000).optional()
+      .describe("v40: per-fill slippage in basis points. Degrades the received side of every simulated fill (flows through the balance)."),
+    gas_usd_per_fire: z.number().min(0).optional()
+      .describe("v40: flat USD gas per fill, charged against final equity (the sim doesn't track the native balance)."),
+    costs_from_history: z.boolean().default(false)
+      .describe("v40: calibrate missing knobs from YOUR recorded real trades — slippage = avg |realized slippage| (last 50 fills on the chain), gas = avg gas_cost_native × current native USD price. The hold counterfactual stays frictionless on purpose."),
+  };
+  async function resolveMcpCosts(args: {
+    slippage_bps?: number;
+    gas_usd_per_fire?: number;
+    costs_from_history: boolean;
+    profile: { name: string; weth?: `0x${string}` };
+  }): Promise<{ costs: { slippageBps: number; gasUsdPerFire: number } | null; provenance: string[] }> {
+    let slippageBps = args.slippage_bps;
+    let gasUsdPerFire = args.gas_usd_per_fire;
+    const provenance: string[] = [];
+    if (args.costs_from_history) {
+      const { recentSlippageStats, recentGasStats } = await import("../db.js");
+      if (slippageBps == null) {
+        const slip = recentSlippageStats(args.profile.name);
+        if (slip) {
+          slippageBps = Math.round(slip.avgAbsSlippageBps * 10) / 10;
+          provenance.push(`slippage ${slippageBps}bps = avg |realized slippage| over last ${slip.samples} real fill(s) on ${args.profile.name}`);
+        } else {
+          provenance.push(`costs_from_history: no recorded slippage on ${args.profile.name} — slippage not modeled`);
+        }
+      }
+      if (gasUsdPerFire == null) {
+        const gas = recentGasStats(args.profile.name, null);
+        if (gas && args.profile.weth) {
+          const { getCurrentPrice } = await import("../price.js");
+          const { createLogger } = await import("../logger.js");
+          const nativeUsd = await getCurrentPrice(args.profile.weth, createLogger({ stderrLevel: "silent" })).catch(() => null);
+          if (nativeUsd != null && nativeUsd > 0) {
+            gasUsdPerFire = Math.round(gas.avgGasNative * nativeUsd * 10_000) / 10_000;
+            provenance.push(`gas $${gasUsdPerFire}/fire = avg ${gas.avgGasNative.toPrecision(3)} native over last ${gas.samples} real fill(s) × native price $${nativeUsd.toFixed(2)}`);
+          } else {
+            provenance.push(`costs_from_history: native USD price unavailable — gas not modeled`);
+          }
+        } else {
+          provenance.push(`costs_from_history: no recorded gas costs on ${args.profile.name} — gas not modeled`);
+        }
+      }
+    }
+    if (slippageBps == null && gasUsdPerFire == null) return { costs: null, provenance };
+    return { costs: { slippageBps: slippageBps ?? 0, gasUsdPerFire: gasUsdPerFire ?? 0 }, provenance };
+  }
+
   // ── backtest_order ─────────────────────────────────────────
   server.tool(
     "backtest_order",
@@ -371,11 +424,12 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
       balance: z.record(z.string(), z.number().nonnegative()).describe("Starting balance as { SYMBOL: amount } (e.g. { ETH: 1.0, USDC: 3000 })."),
       since: z.string().default("30d").describe("Window — '30d', '7d', '6m', or a bare integer (days). Max 3650 days."),
       chain: z.string().optional().describe("Chain (default: active chain)."),
+      ...costShapes,
     },
-    async ({ side, trigger, price, trail_pct, base, quote, base_amount, quote_amount, balance, since, chain }) => {
+    async ({ side, trigger, price, trail_pct, base, quote, base_amount, quote_amount, balance, since, chain, slippage_bps, gas_usd_per_fire, costs_from_history }) => {
       try {
         return ok(
-          await runTool("backtest_order", rt.opts, { side, trigger, price, trail_pct, base, quote, base_amount, quote_amount, balance, since, chain }, chain, async () => {
+          await runTool("backtest_order", rt.opts, { side, trigger, price, trail_pct, base, quote, base_amount, quote_amount, balance, since, chain, slippage_bps, gas_usd_per_fire, costs_from_history }, chain, async () => {
             const config = rt.getConfig();
             const chainName = chain ?? config.activeChain;
             const profile = resolveProfile(chainName, config);
@@ -394,6 +448,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
             const initialBalance: SymbolBalance = Object.fromEntries(
               Object.entries(balance).map(([k, v]) => [k.toUpperCase(), v]),
             );
+            const simCosts = await resolveMcpCosts({ slippage_bps, gas_usd_per_fire, costs_from_history, profile });
             const result = simulateOrder({
               spec: {
                 side, trigger,
@@ -403,7 +458,9 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
                 quoteAmount: quote_amount,
               },
               baseSymbol, quoteSymbol, initialBalance, series,
+              costs: simCosts.costs,
             });
+            result.notes.push(...simCosts.provenance);
             const rowId = insertBacktestRun({
               strategyType: "order",
               chain: profile.name,
@@ -429,6 +486,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               initial_usd: result.initialUsd, final_usd: result.finalUsd,
               pnl_usd: result.pnlUsd, hold_pnl_usd: result.holdPnlUsd,
               fires: result.fires, notes: result.notes,
+              costs: result.costs,
             };
           }),
         );
@@ -663,11 +721,12 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
         .boolean()
         .default(false)
         .describe("v39.5: replay the v35 signal_events inbox — \"with the alerts I actually received, how would this have done?\". Pulls every recorded signal inside the price window."),
+      ...costShapes,
     },
-    async ({ spec, vars, balance, since, chain, base, quote, signals, signals_from_history }) => {
+    async ({ spec, vars, balance, since, chain, base, quote, signals, signals_from_history, slippage_bps, gas_usd_per_fire, costs_from_history }) => {
       try {
         return ok(
-          await runTool("backtest_playbook", rt.opts, { spec, vars, balance, since, chain, base, quote, signals, signals_from_history }, chain, async () => {
+          await runTool("backtest_playbook", rt.opts, { spec, vars, balance, since, chain, base, quote, signals, signals_from_history, slippage_bps, gas_usd_per_fire, costs_from_history }, chain, async () => {
             const parsed = renderAndParse(spec, vars as Record<string, VarValue> | undefined);
             const config = rt.getConfig();
             const chainName = chain ?? parsed.chain ?? config.activeChain;
@@ -703,7 +762,9 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               }));
               simSignals = [...(simSignals ?? []), ...recorded];
             }
-            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series, signals: simSignals });
+            const simCosts = await resolveMcpCosts({ slippage_bps, gas_usd_per_fire, costs_from_history, profile });
+            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series, signals: simSignals, costs: simCosts.costs });
+            result.notes.push(...simCosts.provenance);
             const rowId = insertBacktestRun({
               strategyType: "playbook",
               chain: profile.name,
@@ -732,6 +793,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               fires: result.fires,
               per_strategy: result.perStrategy,
               notes: result.notes,
+              costs: result.costs,
             };
           }),
         );
@@ -762,11 +824,12 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
       base: z.string().optional().describe("Override base symbol."),
       quote: z.string().optional().describe("Override quote symbol."),
       name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).optional().describe("Comparison label (default: auto-generated)."),
+      ...costShapes,
     },
-    async ({ scenarios, balance, since, chain, base, quote, name }) => {
+    async ({ scenarios, balance, since, chain, base, quote, name, slippage_bps, gas_usd_per_fire, costs_from_history }) => {
       try {
         return ok(
-          await runTool("backtest_compare", rt.opts, { scenarios, balance, since, chain, base, quote, name }, chain, async () => {
+          await runTool("backtest_compare", rt.opts, { scenarios, balance, since, chain, base, quote, name, slippage_bps, gas_usd_per_fire, costs_from_history }, chain, async () => {
             // For MCP, the operator passes inline scenarios (with vars
             // resolved inline). We materialize a temporary scenarios
             // file in-memory by writing renderered specs to a temp dir;
@@ -815,12 +878,14 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               const initialBalance: SymbolBalance = Object.fromEntries(
                 Object.entries(balance).map(([k, v]) => [k.toUpperCase(), v]),
               );
+              const simCosts = await resolveMcpCosts({ slippage_bps, gas_usd_per_fire, costs_from_history, profile });
               const outcome = await runCompareFromFile({
                 scenariosPath,
                 initialBalance,
                 since,
                 chain: profile.name,
                 baseAddress: baseAddrForPrice,
+                costs: simCosts.costs,
               });
               return {
                 ok: true,

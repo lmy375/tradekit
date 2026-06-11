@@ -442,9 +442,9 @@ describe("renderComparison", () => {
       winnerIdx: 1,
       scenarios: [
         { scenarioName: "loser", runId: 1, pnlUsd: 100, holdPnlUsd: 50, vsHoldUsd: 50,
-          fireCount: 1, cascadeCount: 0, finalUsd: 2100, initialUsd: 2000, perStrategy: [], hadAnyFill: true },
+          fireCount: 1, cascadeCount: 0, finalUsd: 2100, initialUsd: 2000, perStrategy: [], hadAnyFill: true, frictionUsd: 0 },
         { scenarioName: "winner", runId: 2, pnlUsd: 300, holdPnlUsd: 50, vsHoldUsd: 250,
-          fireCount: 1, cascadeCount: 0, finalUsd: 2300, initialUsd: 2000, perStrategy: [], hadAnyFill: true },
+          fireCount: 1, cascadeCount: 0, finalUsd: 2300, initialUsd: 2000, perStrategy: [], hadAnyFill: true, frictionUsd: 0 },
       ],
     };
     const rendered = renderComparison(outcome);
@@ -470,9 +470,9 @@ describe("renderComparison", () => {
       winnerIdx: null,
       scenarios: [
         { scenarioName: "a", runId: 1, pnlUsd: 0, holdPnlUsd: 50, vsHoldUsd: -50,
-          fireCount: 0, cascadeCount: 0, finalUsd: 2000, initialUsd: 2000, perStrategy: [], hadAnyFill: false },
+          fireCount: 0, cascadeCount: 0, finalUsd: 2000, initialUsd: 2000, perStrategy: [], hadAnyFill: false, frictionUsd: 0 },
         { scenarioName: "b", runId: 2, pnlUsd: 0, holdPnlUsd: 50, vsHoldUsd: -50,
-          fireCount: 0, cascadeCount: 0, finalUsd: 2000, initialUsd: 2000, perStrategy: [], hadAnyFill: false },
+          fireCount: 0, cascadeCount: 0, finalUsd: 2000, initialUsd: 2000, perStrategy: [], hadAnyFill: false, frictionUsd: 0 },
       ],
     };
     const rendered = renderComparison(outcome);

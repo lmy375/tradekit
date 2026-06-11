@@ -1513,7 +1513,19 @@ tradekit backtest show 7                 # full detail with fire timeline
 
 **Resolution.** Tied to CoinGecko's free-tier `market_chart` endpoint: ≤1 day → 5-minute samples, ≤90 days → hourly samples, >90 days → daily samples. A trailing-stop with sub-hourly retracements isn't accurately testable beyond 90 days; daily-cadence strategies (DCA, weekly rebalance) work cleanly over multi-year windows.
 
-**What's NOT simulated.** Gas cost, slippage, MEV impact, safety guardrails. The data resolution doesn't support pool-impact modeling, and operators want to know "would the trigger have fired" — guardrails would mask that signal. The strategy spec is what you validate; the live engine adds the production behaviors on top.
+**Cost-aware mode (v40).** The default sim is friction-free — which systematically flatters ACTIVE strategies in the vs-hold comparison (a daily DCA fires ~30×/month and every production fire pays slippage + gas; buy-and-hold pays nothing). Every backtest command takes three knobs:
+
+```bash
+# explicit friction
+tradekit backtest schedule --side buy --every 1d --quoteAmount 100   --base ETH --quote USDC --balance '{"USDC":3000}' --since 30d   --slippage-bps 25 --gas-usd 0.40
+
+# or calibrate from YOUR recorded real trades
+tradekit backtest playbook ./strategy.json --balance '{"USDC":3000}'   --costs-from-history
+```
+
+`--slippage-bps` degrades the side you *receive* on every fill (buy: less base, or more quote spent in fixed-base mode; sell: less quote) and flows through the balance, so compounding effects are real — and it participates in affordability (a buy that can't cover price+slippage halts). `--gas-usd` charges a flat USD per fill against final equity at valuation time (the sim tracks base+quote only; gas is actually paid from the native balance it doesn't model — charging equity avoids fake insufficient-balance halts while keeping PnL honest). `--costs-from-history` fills in whichever knob you didn't pass explicitly from the trades table: slippage = avg |`realized_slippage_bps`| over your last 50 successful **real** fills on the chain (paper fills carry *simulated* slippage — calibrating a simulation from another simulation would be circular), gas = avg `gas_cost_native` × the current native USD price. Provenance lands in the result notes so `backtest show` keeps the context. The **hold counterfactual stays frictionless on purpose** — exposing that asymmetry is the whole point. Results carry a `costs` summary (`fills`, `slippageUsd`, `gasUsd`, `totalUsd`); the text output adds a `Friction:` line and `backtest compare` a per-scenario friction footnote. Omit all three knobs and behavior is bit-for-bit the pre-v40 zero-cost sim.
+
+**What's NOT simulated.** Pool-impact/MEV (the data resolution doesn't support depth modeling — v40 costs are a flat per-fill model, not price-impact curves), safety guardrails (operators want to know "would the trigger have fired"; guardrails would mask that signal). The strategy spec is what you validate; the live engine adds the production behaviors on top.
 
 **Persisted to `backtest_runs`.** Every run gets an id (visible via `backtest list`). The strategy spec, balances, fire timeline, window, and counterfactual all persist so `backtest show <id>` re-renders without re-fetching CoinGecko data.
 

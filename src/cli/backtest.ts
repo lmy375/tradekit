@@ -43,6 +43,7 @@ import {
   type BacktestResult,
   type PlaybookBacktestResult,
   type PriceSeries,
+  type SimCosts,
 } from "../backtest.js";
 import { parsePlaybookSpec, type PlaybookSpec } from "../playbooks.js";
 import {
@@ -53,7 +54,8 @@ import {
   type BacktestStrategyType,
 } from "../db.js";
 import { durationToCron } from "../cron.js";
-import { printJson, parseIntFlag, parseFloatFlag, subcommandError } from "./helpers.js";
+import { printJson, parseIntFlag, parseFloatFlag, subcommandError, makeCliLogger } from "./helpers.js";
+import type { ChainProfile } from "../chains.js";
 
 // ── shared helpers ───────────────────────────────────────────
 
@@ -81,6 +83,63 @@ function parseBalance(raw: string | undefined): SymbolBalance {
     out[k.toUpperCase()] = v;
   }
   return out;
+}
+
+/**
+ * v40: resolve the friction model for cost-aware backtests.
+ *
+ *   --slippage-bps N        explicit per-fill slippage
+ *   --gas-usd X             explicit flat USD gas per fill
+ *   --costs-from-history    calibrate missing knobs from YOUR recorded
+ *                           real trades: slippage = avg |realized
+ *                           slippage| (last 50 successful fills on the
+ *                           chain), gas = avg gas_cost_native × the
+ *                           CURRENT native USD price.
+ *
+ * Explicit flags always win over history. Returns null costs when
+ * nothing is requested (cost-free sim — pre-v40 behavior, unchanged).
+ * Provenance strings explain where each number came from; they're
+ * appended to the result notes so `backtest show` keeps the context.
+ */
+async function resolveSimCosts(
+  flags: Record<string, string>,
+  profile: ChainProfile,
+): Promise<{ costs: Partial<SimCosts> | null; provenance: string[] }> {
+  let slippageBps = parseFloatFlag(flags["slippage-bps"], "--slippage-bps", { min: 0, max: 10_000 });
+  let gasUsdPerFire = parseFloatFlag(flags["gas-usd"], "--gas-usd", { min: 0 });
+  const provenance: string[] = [];
+
+  if (flags["costs-from-history"] === "true") {
+    const { recentSlippageStats, recentGasStats } = await import("../db.js");
+    if (slippageBps == null) {
+      const slip = recentSlippageStats(profile.name);
+      if (slip) {
+        slippageBps = Math.round(slip.avgAbsSlippageBps * 10) / 10;
+        provenance.push(`slippage ${slippageBps}bps = avg |realized slippage| over your last ${slip.samples} successful real fill(s) on ${profile.name}`);
+      } else {
+        provenance.push(`costs-from-history: no recorded slippage on ${profile.name} (real fills with realized_slippage_bps) — slippage not modeled; pass --slippage-bps explicitly`);
+      }
+    }
+    if (gasUsdPerFire == null) {
+      const gas = recentGasStats(profile.name, null);
+      const nativeAddr = profile.weth;
+      if (gas && nativeAddr) {
+        const { getCurrentPrice } = await import("../price.js");
+        const nativeUsd = await getCurrentPrice(nativeAddr, makeCliLogger(flags)).catch(() => null);
+        if (nativeUsd != null && nativeUsd > 0) {
+          gasUsdPerFire = Math.round(gas.avgGasNative * nativeUsd * 10_000) / 10_000;
+          provenance.push(`gas $${gasUsdPerFire}/fire = avg ${gas.avgGasNative.toPrecision(3)} native over your last ${gas.samples} real fill(s) × current native price $${nativeUsd.toFixed(2)}`);
+        } else {
+          provenance.push(`costs-from-history: native USD price unavailable — gas not modeled; pass --gas-usd explicitly`);
+        }
+      } else {
+        provenance.push(`costs-from-history: no recorded gas costs on ${profile.name} — gas not modeled; pass --gas-usd explicitly`);
+      }
+    }
+  }
+
+  if (slippageBps == null && gasUsdPerFire == null) return { costs: null, provenance };
+  return { costs: { slippageBps: slippageBps ?? 0, gasUsdPerFire: gasUsdPerFire ?? 0 }, provenance };
 }
 
 function parseNumberList(raw: string | undefined, flagName: string): number[] | undefined {
@@ -130,6 +189,9 @@ function renderResultText(args: {
   const diff = result.pnlUsd - result.holdPnlUsd;
   const verb = diff >= 0 ? "outperformed" : "underperformed";
   lines.push(`  Vs hold:       ${verb} by ${fmtSignedUsd(diff)}`);
+  if (result.costs) {
+    lines.push(`  Friction:      $${result.costs.totalUsd.toFixed(2)} (slippage $${result.costs.slippageUsd.toFixed(2)} + gas $${result.costs.gasUsd.toFixed(2)} over ${result.costs.fills} fill(s)) — hold pays none`);
+  }
   lines.push("");
   lines.push(`  Final balance:`);
   for (const [sym, amt] of Object.entries(result.finalBalance)) {
@@ -189,6 +251,7 @@ function buildJsonResult(args: {
     hold_final_usd: result.holdFinalUsd,
     fires: result.fires,
     notes: result.notes,
+    costs: result.costs,
   };
 }
 
@@ -259,13 +322,16 @@ export async function backtestOrderCommand(flags: Record<string, string>) {
   const baseSymbol = baseInput.toUpperCase() === "ETH" ? "ETH" : baseInput.toUpperCase();
   const quoteSymbol = quoteInput.toUpperCase();
 
+  const simCosts = await resolveSimCosts(flags, profile);
   const result = simulateOrder({
     spec,
     baseSymbol,
     quoteSymbol,
     initialBalance,
     series,
+    costs: simCosts.costs,
   });
+  result.notes.push(...simCosts.provenance);
 
   const rowId = insertBacktestRun({
     strategyType: "order",
@@ -360,13 +426,16 @@ export async function backtestScheduleCommand(flags: Record<string, string>) {
   const baseSymbol = baseInput.toUpperCase() === "ETH" ? "ETH" : baseInput.toUpperCase();
   const quoteSymbol = quoteInput.toUpperCase();
 
+  const simCosts = await resolveSimCosts(flags, profile);
   const result = simulateSchedule({
     spec,
     baseSymbol,
     quoteSymbol,
     initialBalance,
     series,
+    costs: simCosts.costs,
   });
+  result.notes.push(...simCosts.provenance);
 
   const rowId = insertBacktestRun({
     strategyType: "schedule",
@@ -623,6 +692,7 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
     }
   }
 
+  const simCosts = await resolveSimCosts(flags, profile);
   const result = simulatePlaybook({
     spec,
     baseSymbol,
@@ -630,7 +700,9 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
     initialBalance,
     series,
     signals,
+    costs: simCosts.costs,
   });
+  result.notes.push(...simCosts.provenance);
 
   // Persist into backtest_runs as strategy_type='playbook'.
   const rowId = insertBacktestRun({
@@ -674,6 +746,7 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
       fires: result.fires,
       per_strategy: result.perStrategy,
       notes: result.notes,
+      costs: result.costs,
     });
     return;
   }
@@ -716,6 +789,9 @@ function renderPlaybookResult(args: {
   const diff = result.pnlUsd - result.holdPnlUsd;
   const verb = diff >= 0 ? "outperformed" : "underperformed";
   lines.push(`  Vs hold:       ${verb} by ${fmtSignedUsd(diff)}`);
+  if (result.costs) {
+    lines.push(`  Friction:      $${result.costs.totalUsd.toFixed(2)} (slippage $${result.costs.slippageUsd.toFixed(2)} + gas $${result.costs.gasUsd.toFixed(2)} over ${result.costs.fills} fill(s)) — hold pays none`);
+  }
   lines.push(``);
   lines.push(`  Final balance:`);
   for (const [sym, amt] of Object.entries(result.finalBalance)) {
@@ -832,13 +908,18 @@ async function backtestCompareRunCommand(flags: Record<string, string>, scenario
   const initialBalance = parseBalance(flags["balance"]);
   const since = flags["since"] ?? "30d";
 
+  const simCosts = await resolveSimCosts(flags, profile);
   const outcome = await runCompareFromFile({
     scenariosPath: absScenarios,
     initialBalance,
     since,
     chain: profile.name,
     baseAddress: baseAddrForPrice,
+    costs: simCosts.costs,
   });
+  if (simCosts.provenance.length > 0 && flags["json"] == null) {
+    for (const line of simCosts.provenance) console.log(`ℹ ${line}`);
+  }
 
   if (flags["json"] != null) {
     printJson({
@@ -1088,6 +1169,9 @@ export async function backtestRebalanceCommand(flags: Record<string, string>) {
         initialUsd: v.result.initialUsd,
         perStrategy: [],
         hadAnyFill: v.result.fires.length > 0,
+        // Rebalance sweeps model slippage inside the rebalance sim
+        // itself (slippage_bps on the plan), not via v40 SimCosts.
+        frictionUsd: 0,
       };
     });
 

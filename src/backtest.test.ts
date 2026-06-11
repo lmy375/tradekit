@@ -1477,3 +1477,183 @@ describe("simulatePlaybook — signal replay", () => {
     expect(r.perStrategy[0].finalStatus).toBe("cancelled");
   });
 });
+
+// ── v40: cost-aware simulation ───────────────────────────────
+
+describe("cost-aware backtests (SimCosts)", () => {
+  // 100bps = 1% — chosen so the expected numbers stay readable.
+  const COSTS = { slippageBps: 100, gasUsdPerFire: 2 };
+
+  it("buy fixed-quote: slippage reduces the base RECEIVED", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2200, 2000, 2000]);
+    const r = simulateOrder({
+      spec: { side: "buy", trigger: "price_below", targetPriceUsd: 2100, quoteAmount: 1000 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series, costs: COSTS,
+    });
+    // 1000/2000 × 0.99 = 0.495 ETH; full 1000 USDC spent.
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0.495, 12);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0, 12);
+    expect(r.fires[0].slippageCostUsd).toBeCloseTo(10, 9); // 1% of 1000
+    expect(r.fires[0].gasCostUsd).toBe(2);
+    expect(r.costs).not.toBeNull();
+    expect(r.costs!.slippageUsd).toBeCloseTo(10, 9);
+    expect(r.costs!.gasUsd).toBe(2);
+    expect(r.costs!.totalUsd).toBeCloseTo(12, 9);
+    // Final equity: 0.495×2000 + 0 − $2 gas = $988 → PnL −$12 = total friction.
+    expect(r.finalUsd).toBeCloseTo(988, 9);
+    expect(r.pnlUsd).toBeCloseTo(-12, 9);
+  });
+
+  it("buy fixed-base: slippage shows up as MORE quote spent (and gates affordability)", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2200, 2000]);
+    const r = simulateOrder({
+      spec: { side: "buy", trigger: "price_below", targetPriceUsd: 2100, baseAmount: 0.5 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1010 },
+      series, costs: COSTS,
+    });
+    // Cost = 0.5×2000×1.01 = 1010 — exactly affordable.
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0.5, 12);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0, 9);
+    expect(r.fires[0].slippageCostUsd).toBeCloseTo(10, 9);
+
+    // One dollar less and the SAME order halts: slippage participates
+    // in the affordability check.
+    const halt = simulateOrder({
+      spec: { side: "buy", trigger: "price_below", targetPriceUsd: 2100, baseAmount: 0.5 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1009 },
+      series: hourlySeries("2026-04-01T00:00:00Z", [2200, 2000]), costs: COSTS,
+    });
+    expect(halt.fires[0].action).toBe("halt");
+  });
+
+  it("sell: slippage reduces the quote RECEIVED", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2600, 2600]);
+    const r = simulateOrder({
+      spec: { side: "sell", trigger: "price_above", targetPriceUsd: 2500, baseAmount: 1 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 1, USDC: 0 },
+      series, costs: COSTS,
+    });
+    // 1×2600×0.99 = 2574.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(2574, 9);
+    expect(r.fires[0].slippageCostUsd).toBeCloseTo(26, 9);
+  });
+
+  it("gas accumulates per fill and charges EQUITY, never the trading balance; hold stays frictionless", () => {
+    // Daily DCA, 3 fires at flat $2000, gas only (no slippage).
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2000, 2000]);
+    const r = simulateSchedule({
+      spec: { side: "buy", cron: "0 0 * * *", quoteAmount: 100 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series, costs: { slippageBps: 0, gasUsdPerFire: 2 },
+    });
+    expect(r.costs!.fills).toBe(3);
+    expect(r.costs!.gasUsd).toBeCloseTo(6, 9);
+    expect(r.costs!.slippageUsd).toBe(0);
+    // Balances untouched by gas: 700 USDC + 0.15 ETH.
+    expect(r.finalBalance["USDC"]).toBeCloseTo(700, 9);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0.15, 12);
+    // Equity: 0.15×2000 + 700 − 6 = 994 → PnL −6, hold PnL 0.
+    expect(r.finalUsd).toBeCloseTo(994, 9);
+    expect(r.pnlUsd).toBeCloseTo(-6, 9);
+    expect(r.holdPnlUsd).toBeCloseTo(0, 9);
+    expect(r.notes.some((n) => /total friction/.test(n))).toBe(true);
+  });
+
+  it("omitted costs and zero costs are IDENTICAL to each other (and costs:null in both)", () => {
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2100, 1900, 2050]);
+    const spec = { side: "buy" as const, cron: "0 0 * * *", quoteAmount: 100 };
+    const base = { baseSymbol: "ETH", quoteSymbol: "USDC", initialBalance: { ETH: 0, USDC: 1000 } };
+    const without = simulateSchedule({ spec, ...base, series });
+    const withZero = simulateSchedule({ spec, ...base, series, costs: { slippageBps: 0, gasUsdPerFire: 0 } });
+    expect(without.costs).toBeNull();
+    expect(withZero.costs).toBeNull();
+    expect(withZero.pnlUsd).toBe(without.pnlUsd);
+    expect(withZero.finalBalance).toEqual(without.finalBalance);
+  });
+
+  it("validation: out-of-range knobs are rejected", () => {
+    const series = hourlySeries("2026-04-01T00:00:00Z", [2000, 2000]);
+    const run = (costs: { slippageBps?: number; gasUsdPerFire?: number }) => () =>
+      simulateOrder({
+        spec: { side: "buy", trigger: "price_below", targetPriceUsd: 2100, quoteAmount: 100 },
+        baseSymbol: "ETH", quoteSymbol: "USDC",
+        initialBalance: { USDC: 100 }, series, costs,
+      });
+    expect(run({ slippageBps: -1 })).toThrow(/slippageBps/);
+    expect(run({ slippageBps: 10_001 })).toThrow(/slippageBps/);
+    expect(run({ gasUsdPerFire: -0.5 })).toThrow(/gasUsdPerFire/);
+  });
+
+  it("playbook: costs flow through dynamic sizing + hooks; OCO cascade rows never count as fills", () => {
+    // DCA buys once (on_fill spawns TP/SL bracket), TP fires → cascade
+    // cancels SL. 2 real fills total; the cascade row must not pay gas.
+    const spec = parsePlaybookSpec({
+      name: "dca-bracket-costs",
+      strategies: [
+        {
+          id: "dca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 1000,
+          base: "ETH", quote: "USDC", maxRuns: 1,
+          onFill: {
+            type: "createOrders",
+            specs: [
+              { side: "sell", trigger: "price_above", price: 2600, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+              { side: "sell", trigger: "price_below", price: 1500, base: "ETH", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+            ],
+          },
+        },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2700, 2700]);
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      costs: { slippageBps: 100, gasUsdPerFire: 1 },
+    });
+    expect(r.costs!.fills).toBe(2); // DCA buy + TP sell — cascade excluded
+    expect(r.costs!.gasUsd).toBeCloseTo(2, 9);
+    // Buy: 1000/2000×0.99 = 0.495 ETH (slip $10). Hook sized to the
+    // ACTUAL fill (0.495). TP sell: 0.495×2700×0.99 (slip $13.365).
+    expect(r.costs!.slippageUsd).toBeCloseTo(10 + 0.495 * 2700 * 0.01, 9);
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0, 12);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0.495 * 2700 * 0.99, 9);
+  });
+
+  it("the motivating scenario: a churny strategy that beats hold GROSS loses to friction NET", () => {
+    // Price round-trips 2000→2100→2000…: sell-high/buy-low captures
+    // small gross alpha per cycle; realistic friction erases it.
+    const prices = [2000, 2100, 2000, 2100, 2000, 2100, 2000];
+    const gross = simulatePlaybook({
+      spec: parsePlaybookSpec({
+        name: "churn",
+        strategies: [
+          { id: "s1", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: "max", base: "ETH", quote: "USDC" },
+        ],
+      }),
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series: dailySeries("2026-04-01T00:00:00Z", prices),
+    });
+    const net = simulatePlaybook({
+      spec: parsePlaybookSpec({
+        name: "churn",
+        strategies: [
+          { id: "s1", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: "max", base: "ETH", quote: "USDC" },
+        ],
+      }),
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 },
+      series: dailySeries("2026-04-01T00:00:00Z", prices),
+      costs: { slippageBps: 50, gasUsdPerFire: 1 },
+    });
+    // Identical strategy, identical series — the ONLY difference is friction.
+    expect(net.pnlUsd).toBeLessThan(gross.pnlUsd);
+    expect(net.holdPnlUsd).toBeCloseTo(gross.holdPnlUsd, 9); // hold never pays
+    expect(gross.pnlUsd - net.pnlUsd).toBeCloseTo(net.costs!.totalUsd, 6);
+  });
+});

@@ -4028,17 +4028,41 @@ export function findScheduleFireEvidence(args: {
  *  most recent `limit` rows on the (chain, account). Returns null
  *  when no priced samples exist — the caller reports "no estimate"
  *  instead of guessing. */
-export function recentGasStats(chain: string, account: string, limit = 50): { avgGasNative: number; samples: number } | null {
+/** v40: average |realized slippage| over the last N successful REAL
+ *  trades on a chain — the data-driven default for cost-aware
+ *  backtests (`--costs-from-history`). Real trades only: paper fills
+ *  carry SIMULATED slippage, and calibrating a simulation from
+ *  another simulation would be circular. Absolute value: signed
+ *  slippage averages toward zero while every fill still pays the
+ *  spread. */
+export function recentSlippageStats(chain: string, limit = 50): { avgAbsSlippageBps: number; samples: number } | null {
   const db = openDb();
+  const row = db
+    .prepare(
+      `SELECT AVG(ABS(realized_slippage_bps)) AS avg_bps, COUNT(*) AS n FROM (
+         SELECT realized_slippage_bps FROM trades
+          WHERE chain = ? AND status = 'success' AND realized_slippage_bps IS NOT NULL
+          ORDER BY timestamp DESC LIMIT ?
+       )`,
+    )
+    .get(chain, limit) as { avg_bps: number | null; n: number };
+  if (row.avg_bps == null || row.n === 0 || !Number.isFinite(row.avg_bps)) return null;
+  return { avgAbsSlippageBps: row.avg_bps, samples: row.n };
+}
+
+export function recentGasStats(chain: string, account: string | null, limit = 50): { avgGasNative: number; samples: number } | null {
+  const db = openDb();
+  // v40: account=null aggregates across accounts (cost-aware backtests
+  // calibrate per-chain; runway keeps the per-account scoping).
   const row = db
     .prepare(
       `SELECT AVG(CAST(gas_cost_native AS REAL)) AS avg_gas, COUNT(*) AS n FROM (
          SELECT gas_cost_native FROM trades
-          WHERE chain = ? AND account = ? AND status = 'success' AND gas_cost_native IS NOT NULL
+          WHERE chain = ? AND (? IS NULL OR account = ?) AND status = 'success' AND gas_cost_native IS NOT NULL
           ORDER BY timestamp DESC LIMIT ?
        )`,
     )
-    .get(chain, account, limit) as { avg_gas: number | null; n: number };
+    .get(chain, account, account, limit) as { avg_gas: number | null; n: number };
   if (row.avg_gas == null || row.n === 0 || !Number.isFinite(row.avg_gas)) return null;
   return { avgGasNative: row.avg_gas, samples: row.n };
 }

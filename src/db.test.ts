@@ -2055,3 +2055,52 @@ describe("sync_bookmarks (iter737)", () => {
     expect(arbs.map((b) => b.account)).toEqual(["iter737-list-a", "iter737-list-b"]);
   });
 });
+
+// ── recentSlippageStats (v40 cost-aware backtests) ───────────
+
+describe("recentSlippageStats", () => {
+  const SLIP_CHAIN = "v40-slip-chain"; // unique chain isolates from other suites
+  it("averages |realized_slippage_bps| over recent SUCCESSFUL trades only", async () => {
+    insertTrade(trade({ chain: SLIP_CHAIN, status: "success", realized_slippage_bps: 20 }));
+    insertTrade(trade({ chain: SLIP_CHAIN, status: "success", realized_slippage_bps: -40 })); // abs() → 40
+    insertTrade(trade({ chain: SLIP_CHAIN, status: "failed", realized_slippage_bps: 900 })); // excluded
+    insertTrade(trade({ chain: SLIP_CHAIN, status: "success", realized_slippage_bps: null })); // excluded
+    const { recentSlippageStats } = await import("./db.js");
+    const stats = recentSlippageStats(SLIP_CHAIN)!;
+    expect(stats.samples).toBe(2);
+    expect(stats.avgAbsSlippageBps).toBeCloseTo(30, 9); // (20+40)/2
+  });
+
+  it("returns null when the chain has no slippage-stamped history", async () => {
+    const { recentSlippageStats } = await import("./db.js");
+    expect(recentSlippageStats("v40-empty-chain")).toBeNull();
+  });
+
+  it("respects the recency limit", async () => {
+    const CH = "v40-slip-limit";
+    for (let i = 0; i < 4; i++) {
+      insertTrade(trade({
+        chain: CH, status: "success", realized_slippage_bps: i < 2 ? 100 : 10,
+        timestamp: new Date(Date.now() - (4 - i) * 60_000).toISOString(), // oldest first
+      }));
+    }
+    const { recentSlippageStats } = await import("./db.js");
+    // limit=2 → only the two NEWEST (10bps) rows.
+    expect(recentSlippageStats(CH, 2)!.avgAbsSlippageBps).toBeCloseTo(10, 9);
+  });
+});
+
+describe("recentGasStats — account=null aggregates across accounts (v40)", () => {
+  it("null account sees every account's gas history on the chain", async () => {
+    const CH = "v40-gas-chain";
+    insertTrade(trade({ chain: CH, account: "a1", status: "success", gas_cost_native: "0.001" }));
+    insertTrade(trade({ chain: CH, account: "a2", status: "success", gas_cost_native: "0.003" }));
+    const { recentGasStats } = await import("./db.js");
+    const scoped = recentGasStats(CH, "a1")!;
+    expect(scoped.samples).toBe(1);
+    expect(scoped.avgGasNative).toBeCloseTo(0.001, 12);
+    const all = recentGasStats(CH, null)!;
+    expect(all.samples).toBe(2);
+    expect(all.avgGasNative).toBeCloseTo(0.002, 12);
+  });
+});

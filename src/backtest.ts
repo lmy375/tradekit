@@ -12,9 +12,12 @@
  *     schedule at a time. Multi-strategy interactions (e.g. one
  *     schedule's fill firing another order's trigger) need explicit
  *     ordering rules + shared-state coordination that's deferred.
- *   - Not a gas/slippage simulator. The data resolution (hourly at
- *     best, daily for long windows) doesn't support modeling pool
- *     impact. Fill prices are taken directly from the series.
+ *   - Not a pool-impact simulator. The data resolution (hourly at
+ *     best, daily for long windows) doesn't support modeling depth.
+ *     Fill prices are taken from the series; v40 layers a FLAT
+ *     friction model on top (SimCosts: slippage bps + USD gas per
+ *     fire, calibratable from YOUR recorded trade history) so the
+ *     vs-hold comparison stops flattering active strategies.
  *   - Not a safety-guardrail simulator. Operators want to know "would
  *     the trigger have fired"; safety would mask that signal. Manual
  *     audit of the strategy spec is the right place for guardrail
@@ -131,6 +134,61 @@ async function defaultFetchJson(url: string): Promise<unknown> {
 
 export type SymbolBalance = Record<string, number>;
 
+/**
+ * v40: trading friction model. The zero-cost simulator systematically
+ * flatters ACTIVE strategies in the vs-hold comparison — a daily DCA
+ * fires ~30×/month and every fire pays slippage + gas in production,
+ * while buy-and-hold pays nothing. Costs make the comparison honest.
+ *
+ * Model, precisely:
+ *   - Slippage degrades the side you RECEIVE on every fill (buy: less
+ *     base, or more quote spent in fixed-base mode; sell: less quote).
+ *     It flows through the BALANCE, so compounding effects are real.
+ *   - Gas is a flat USD charge per fill, accumulated in a side counter
+ *     and deducted from final equity at valuation time — the simulator
+ *     tracks base+quote only; gas is actually paid from the native
+ *     balance it doesn't model. Charging equity (not the trading
+ *     balance) avoids fake insufficient-balance halts while keeping
+ *     the PnL honest.
+ *   - The HOLD counterfactual stays frictionless on purpose — exposing
+ *     that asymmetry is the whole point.
+ */
+export interface SimCosts {
+  /** Per-fill slippage in basis points (0–10000). */
+  slippageBps: number;
+  /** Flat USD gas cost per fill. */
+  gasUsdPerFire: number;
+}
+
+/** Validate + normalize a costs spec. Returns null when no costs are
+ *  in play (both zero / undefined) so callers can branch cheaply. */
+export function normalizeSimCosts(costs?: Partial<SimCosts> | null): SimCosts | null {
+  if (costs == null) return null;
+  const slippageBps = costs.slippageBps ?? 0;
+  const gasUsdPerFire = costs.gasUsdPerFire ?? 0;
+  if (!Number.isFinite(slippageBps) || slippageBps < 0 || slippageBps > 10_000) {
+    throw new ToolError("INVALID_PARAMS", `slippageBps must be in [0, 10000] (got ${costs.slippageBps}).`);
+  }
+  if (!Number.isFinite(gasUsdPerFire) || gasUsdPerFire < 0) {
+    throw new ToolError("INVALID_PARAMS", `gasUsdPerFire must be a non-negative number (got ${costs.gasUsdPerFire}).`);
+  }
+  if (slippageBps === 0 && gasUsdPerFire === 0) return null;
+  return { slippageBps, gasUsdPerFire };
+}
+
+/** Aggregate friction actually paid during a simulation. */
+export interface SimCostSummary {
+  slippageBps: number;
+  gasUsdPerFire: number;
+  /** Fills that paid costs. */
+  fills: number;
+  /** Total USD lost to slippage across all fills. */
+  slippageUsd: number;
+  /** Total USD charged for gas (fills × gasUsdPerFire). */
+  gasUsd: number;
+  totalUsd: number;
+}
+
 export interface BacktestFire {
   ts: string;
   /** What the simulator decided to do at this datapoint. "fill" =
@@ -147,6 +205,10 @@ export interface BacktestFire {
   /** Human-readable note. "trigger fired", "insufficient quote balance",
    *  etc. Surfaced via `backtest show`. */
   note?: string;
+  /** v40: USD lost to slippage on this fill (present when costs are on). */
+  slippageCostUsd?: number;
+  /** v40: USD charged for gas on this fill (present when costs are on). */
+  gasCostUsd?: number;
 }
 
 export interface BacktestResult {
@@ -171,6 +233,8 @@ export interface BacktestResult {
    *  window_start / window_end columns. */
   windowStart: string;
   windowEnd: string;
+  /** v40: friction summary — null when the sim ran cost-free. */
+  costs: SimCostSummary | null;
 }
 
 // ── order simulation ─────────────────────────────────────────
@@ -217,8 +281,11 @@ export function simulateOrder(args: {
   quoteSymbol: string;
   initialBalance: SymbolBalance;
   series: PriceSeries;
+  /** v40: friction model (slippage + gas). Omit for a cost-free sim. */
+  costs?: Partial<SimCosts> | null;
 }): BacktestResult {
   const { spec, baseSymbol, quoteSymbol, initialBalance, series } = args;
+  const costs = normalizeSimCosts(args.costs);
   validateOrderSpec(spec);
   const balance: SymbolBalance = normalizeBalance(initialBalance);
   const fires: BacktestFire[] = [];
@@ -243,7 +310,7 @@ export function simulateOrder(args: {
         trailWaterMark = evalRes.nextWaterMark;
       }
       if (evalRes.triggered) {
-        const fillResult = simulateFillAt({ spec, pt, balance, baseSymbol, quoteSymbol });
+        const fillResult = simulateFillAt({ spec, pt, balance, baseSymbol, quoteSymbol, costs });
         fires.push(fillResult);
         if (fillResult.action === "halt") notes.push(fillResult.note ?? "halted");
         fired = true;
@@ -254,7 +321,7 @@ export function simulateOrder(args: {
         pt.priceUsd,
       );
       if (triggered) {
-        const fillResult = simulateFillAt({ spec, pt, balance, baseSymbol, quoteSymbol });
+        const fillResult = simulateFillAt({ spec, pt, balance, baseSymbol, quoteSymbol, costs });
         fires.push(fillResult);
         if (fillResult.action === "halt") notes.push(fillResult.note ?? "halted");
         fired = true;
@@ -264,7 +331,7 @@ export function simulateOrder(args: {
 
   if (!fired) notes.push(`order never triggered over the ${series.points.length} datapoints in window`);
 
-  return buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol });
+  return buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol, costs });
 }
 
 function validateOrderSpec(spec: OrderBacktestSpec): void {
@@ -338,8 +405,11 @@ export function simulateSchedule(args: {
   quoteSymbol: string;
   initialBalance: SymbolBalance;
   series: PriceSeries;
+  /** v40: friction model (slippage + gas). Omit for a cost-free sim. */
+  costs?: Partial<SimCosts> | null;
 }): BacktestResult {
   const { spec, baseSymbol, quoteSymbol, initialBalance, series } = args;
+  const costs = normalizeSimCosts(args.costs);
   validateScheduleSpec(spec);
   const parsed = parseCron(spec.cron);
   const balance: SymbolBalance = normalizeBalance(initialBalance);
@@ -366,6 +436,7 @@ export function simulateSchedule(args: {
       balance,
       baseSymbol,
       quoteSymbol,
+      costs,
     });
     fires.push(fillResult);
     if (fillResult.action === "halt") {
@@ -380,7 +451,7 @@ export function simulateSchedule(args: {
     notes.push(`schedule never matched a datapoint — check the cron cadence vs the data resolution (${series.points.length} datapoints)`);
   }
 
-  return buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol });
+  return buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol, costs });
 }
 
 function validateScheduleSpec(spec: ScheduleBacktestSpec): void {
@@ -431,11 +502,22 @@ function simulateFillAt(args: {
   balance: SymbolBalance;
   baseSymbol: string;
   quoteSymbol: string;
+  /** v40: friction. Slippage degrades the received side (through the
+   *  balance); gas is reported on the fire and charged to equity by
+   *  the result builder. */
+  costs?: SimCosts | null;
 }): BacktestFire {
-  const { spec, pt, balance, baseSymbol, quoteSymbol } = args;
+  const { spec, pt, balance, baseSymbol, quoteSymbol, costs } = args;
+  const slipFrac = (costs?.slippageBps ?? 0) / 10_000;
+  const gasUsd = costs?.gasUsdPerFire ?? 0;
+  const costFields = (slippageCostUsd: number): Pick<BacktestFire, "slippageCostUsd" | "gasCostUsd"> =>
+    costs ? { slippageCostUsd, gasCostUsd: gasUsd } : {};
   if (spec.side === "buy") {
     if (spec.baseAmount != null) {
-      const cost = spec.baseAmount * pt.priceUsd;
+      // Fixed-base buy: you demand exactly baseAmount, so slippage
+      // shows up as MORE quote spent.
+      const cost = spec.baseAmount * pt.priceUsd * (1 + slipFrac);
+      const slipUsd = spec.baseAmount * pt.priceUsd * slipFrac;
       const available = balance[quoteSymbol] ?? 0;
       if (available < cost) {
         return {
@@ -456,9 +538,12 @@ function simulateFillAt(args: {
         baseDelta: spec.baseAmount,
         quoteDelta: -cost,
         note: `bought ${formatNum(spec.baseAmount)} ${baseSymbol} @ $${formatNum(pt.priceUsd)}`,
+        ...costFields(slipUsd),
       };
     }
     if (spec.quoteAmount != null) {
+      // Fixed-quote buy: you spend exactly quoteAmount, so slippage
+      // shows up as LESS base received.
       const available = balance[quoteSymbol] ?? 0;
       if (available < spec.quoteAmount) {
         return {
@@ -470,7 +555,8 @@ function simulateFillAt(args: {
           note: `insufficient ${quoteSymbol} (need ${formatNum(spec.quoteAmount)}, have ${formatNum(available)})`,
         };
       }
-      const acquired = spec.quoteAmount / pt.priceUsd;
+      const acquired = (spec.quoteAmount / pt.priceUsd) * (1 - slipFrac);
+      const slipUsd = spec.quoteAmount * slipFrac;
       balance[quoteSymbol] = available - spec.quoteAmount;
       balance[baseSymbol] = (balance[baseSymbol] ?? 0) + acquired;
       return {
@@ -480,10 +566,11 @@ function simulateFillAt(args: {
         baseDelta: acquired,
         quoteDelta: -spec.quoteAmount,
         note: `bought ${formatNum(acquired)} ${baseSymbol} for ${formatNum(spec.quoteAmount)} ${quoteSymbol}`,
+        ...costFields(slipUsd),
       };
     }
   }
-  // sell — baseAmount only (validated upstream).
+  // sell — baseAmount only (validated upstream). Slippage: LESS quote received.
   const baseAvail = balance[baseSymbol] ?? 0;
   const baseAmount = spec.baseAmount ?? 0;
   if (baseAvail < baseAmount) {
@@ -496,7 +583,8 @@ function simulateFillAt(args: {
       note: `insufficient ${baseSymbol} (need ${formatNum(baseAmount)}, have ${formatNum(baseAvail)})`,
     };
   }
-  const proceeds = baseAmount * pt.priceUsd;
+  const proceeds = baseAmount * pt.priceUsd * (1 - slipFrac);
+  const slipUsd = baseAmount * pt.priceUsd * slipFrac;
   balance[baseSymbol] = baseAvail - baseAmount;
   balance[quoteSymbol] = (balance[quoteSymbol] ?? 0) + proceeds;
   return {
@@ -506,6 +594,7 @@ function simulateFillAt(args: {
     baseDelta: -baseAmount,
     quoteDelta: proceeds,
     note: `sold ${formatNum(baseAmount)} ${baseSymbol} @ $${formatNum(pt.priceUsd)}`,
+    ...costFields(slipUsd),
   };
 }
 
@@ -519,8 +608,9 @@ function buildResult(args: {
   series: PriceSeries;
   baseSymbol: string;
   quoteSymbol: string;
+  costs?: SimCosts | null;
 }): BacktestResult {
-  const { initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol } = args;
+  const { initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol, costs } = args;
   const first = series.points[0];
   const last = series.points[series.points.length - 1];
   const startPrice = first.priceUsd;
@@ -536,11 +626,21 @@ function buildResult(args: {
   // how an operator thinks about PnL: "I started with these tokens at
   // this point in time; here's what they're worth now".
   const initialUsd = initialBase * startPrice + initialQuote;
-  const finalUsd = finalBase * endPrice + finalQuote;
+  // v40: slippage already flowed through the balance; gas accumulates
+  // here and is charged against final equity (see SimCosts doc).
+  const costSummary = summarizeCosts(costs ?? null, fires);
+  const finalUsd = finalBase * endPrice + finalQuote - (costSummary?.gasUsd ?? 0);
   const pnlUsd = finalUsd - initialUsd;
-  // Counterfactual: same initial balance at end prices, no trades.
+  // Counterfactual: same initial balance at end prices, no trades —
+  // and deliberately NO costs (hold pays no friction).
   const holdFinalUsd = initialBase * endPrice + initialQuote;
   const holdPnlUsd = holdFinalUsd - initialUsd;
+
+  if (costSummary && costSummary.fills > 0) {
+    notes.push(
+      `costs: ${costSummary.slippageBps}bps slippage + $${formatNum(costSummary.gasUsdPerFire)}/fire gas × ${costSummary.fills} fill(s) = $${formatNum(costSummary.totalUsd)} total friction`,
+    );
+  }
 
   return {
     fires,
@@ -553,6 +653,31 @@ function buildResult(args: {
     notes,
     windowStart: first.ts,
     windowEnd: last.ts,
+    costs: costSummary,
+  };
+}
+
+function summarizeCosts(costs: SimCosts | null, fires: BacktestFire[]): SimCostSummary | null {
+  if (costs == null) return null;
+  let fills = 0;
+  let slippageUsd = 0;
+  let gasUsd = 0;
+  for (const f of fires) {
+    if (f.action !== "fill") continue;
+    // Playbook OCO-cascade rows reuse action:"fill" with zero deltas
+    // and never carry cost fields — gasCostUsd presence marks a REAL fill.
+    if (f.gasCostUsd == null && f.slippageCostUsd == null) continue;
+    fills += 1;
+    slippageUsd += f.slippageCostUsd ?? 0;
+    gasUsd += f.gasCostUsd ?? 0;
+  }
+  return {
+    slippageBps: costs.slippageBps,
+    gasUsdPerFire: costs.gasUsdPerFire,
+    fills,
+    slippageUsd,
+    gasUsd,
+    totalUsd: slippageUsd + gasUsd,
   };
 }
 
@@ -684,6 +809,8 @@ export interface PlaybookBacktestResult {
   windowEnd: string;
   /** Per-strategy stats, keyed by local strategy id. */
   perStrategy: PlaybookStrategyStat[];
+  /** v40: friction summary — null when the sim ran cost-free. */
+  costs: SimCostSummary | null;
 }
 
 /** Walks a single price series, evaluating every order + schedule
@@ -713,8 +840,11 @@ export function simulatePlaybook(args: {
    *  signal-triggered entries — without it they stay rejected (no
    *  history to replay is not a simulation, it's a guess). */
   signals?: SimSignal[];
+  /** v40: friction model (slippage + gas). Omit for a cost-free sim. */
+  costs?: Partial<SimCosts> | null;
 }): PlaybookBacktestResult {
   const { spec, baseSymbol, quoteSymbol, initialBalance, series } = args;
+  const costs = normalizeSimCosts(args.costs);
   // Replay mode engages when a history is PROVIDED, even if empty —
   // "no alerts arrived, the entry never fires" is a legitimate
   // simulation answer, not a validation error.
@@ -754,13 +884,13 @@ export function simulatePlaybook(args: {
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
       if (st.type === "order") {
-        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes, signals: simSignals });
+        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes, signals: simSignals, costs });
       }
     }
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
       if (st.type === "schedule") {
-        evaluateScheduleTick({ state: st, pt, balance, baseSymbol, quoteSymbol, fires, states, notes });
+        evaluateScheduleTick({ state: st, pt, balance, baseSymbol, quoteSymbol, fires, states, notes, costs });
       }
     }
   }
@@ -791,7 +921,9 @@ export function simulatePlaybook(args: {
     }
   }
 
-  const built = buildResult({ initialBalance, balance, fires: [], notes, series, baseSymbol, quoteSymbol });
+  // v40: pass the REAL fires (not []) so summarizeCosts sees the
+  // per-fill cost fields; buildResult ignores fires otherwise.
+  const built = buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol, costs });
   return {
     fires,
     finalBalance: balance,
@@ -804,6 +936,7 @@ export function simulatePlaybook(args: {
     windowStart: built.windowStart,
     windowEnd: built.windowEnd,
     perStrategy,
+    costs: built.costs,
   };
 }
 
@@ -889,6 +1022,7 @@ function evaluateOrderTick(args: {
   fires: PlaybookBacktestFire[];
   notes: string[];
   signals?: SimSignal[];
+  costs?: SimCosts | null;
 }): void {
   const { state, pt, balance, baseSymbol, quoteSymbol, states, fires, notes } = args;
   // Optional expires_at — drop the order without firing if past.
@@ -929,7 +1063,7 @@ function evaluateOrderTick(args: {
   }
   if (!triggered) return;
 
-  const fill = simulateFillForState({ state, pt, balance, baseSymbol, quoteSymbol });
+  const fill = simulateFillForState({ state, pt, balance, baseSymbol, quoteSymbol, costs: args.costs });
   fires.push(fill);
   if (fill.multiAction === "fill") {
     state.finalStatus = "filled";
@@ -958,6 +1092,7 @@ function evaluateScheduleTick(args: {
    *  engine (the hook creates the order after the fill lands). */
   states: StrategyState[];
   notes: string[];
+  costs?: SimCosts | null;
 }): void {
   const { state, pt, balance, baseSymbol, quoteSymbol, fires, states, notes } = args;
   if (state.fireCount >= state.maxRuns) {
@@ -969,7 +1104,7 @@ function evaluateScheduleTick(args: {
   if (minuteBucket === state.lastFireMinute) return;
   if (!matchesAt(state.parsedCron, t)) return;
 
-  const fill = simulateFillForState({ state, pt, balance, baseSymbol, quoteSymbol });
+  const fill = simulateFillForState({ state, pt, balance, baseSymbol, quoteSymbol, costs: args.costs });
   fires.push(fill);
   if (fill.multiAction === "fill") {
     state.fireCount++;
@@ -1060,6 +1195,7 @@ function simulateFillForState(args: {
   balance: SymbolBalance;
   baseSymbol: string;
   quoteSymbol: string;
+  costs?: SimCosts | null;
 }): PlaybookBacktestFire {
   const { state, pt, balance, baseSymbol, quoteSymbol } = args;
   // v35/v35.5: dynamic sizing ("max" / "N%") resolves against the SIM
@@ -1085,6 +1221,7 @@ function simulateFillForState(args: {
     balance,
     baseSymbol,
     quoteSymbol,
+    costs: args.costs,
   });
   return {
     ...single,
