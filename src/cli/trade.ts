@@ -105,17 +105,30 @@ async function tradeOrQuote(direction: "buy" | "sell", flags: Record<string, str
       strategy: resolveStrategy(flags["strategy"], process.env.TRADEKIT_STRATEGY),
     };
 
-    const result = await executeTrade(req, {
-      publicClient: wallet.publicClient,
-      walletClient: wallet.walletClient,
-      profile,
-      config,
-      logger,
-      accountLabel: wallet.label,
+    // v45: --idempotency-key fences transport-retry double trades.
+    // The fingerprint is the resolved request (pair + amounts +
+    // direction) so the same key with changed amounts CONFLICTS.
+    const { withIdempotency } = await import("../idempotency.js");
+    const { result, replayed } = await withIdempotency({
+      key: flags["idempotency-key"],
+      tool: direction,
+      requestArgs: { ...req, chain: chainName, account: flags["account"] },
+      exec: () =>
+        executeTrade(req, {
+          publicClient: wallet.publicClient,
+          walletClient: wallet.walletClient,
+          profile,
+          config,
+          logger,
+          accountLabel: wallet.label,
+        }),
     });
+    if (replayed && flags["json"] !== "true") {
+      console.log(`⚠ replayed: this key already completed — showing the RECORDED outcome; nothing was executed now.`);
+    }
 
     if (flags["json"] === "true") {
-      printJson(result);
+      printJson(replayed ? { ...result, replayed: true } : result);
     } else {
       console.log(`${result.direction.toUpperCase()} ${result.simulated ? "(SIMULATION)" : (result.status?.toUpperCase() ?? "SENT")}`);
       // Iter684/iter687: predictive failure pattern at the TOP of the output.

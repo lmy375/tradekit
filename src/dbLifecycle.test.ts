@@ -62,6 +62,7 @@ const defaultDb: DbConfig = {
     scheduleCheckLogDays: null,
     rebalanceCheckLogDays: null,
     failedTradesDays: null,
+        idempotencyKeysDays: null,
   },
   backup: { enabled: false, intervalHours: 24, destDir: "backups", retainCount: 7 },
   integrityCheck: { enabled: false, intervalHours: 24 },

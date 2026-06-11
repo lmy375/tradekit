@@ -873,6 +873,10 @@ const dbRetentionSchema = z
     scheduleCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep rebalance_check_log (v29). NULL = never prune. */
     rebalanceCheckLogDays: z.number().int().min(1).max(3650).nullable().default(null),
+    /** v45: days to keep idempotency keys. Replay protection is an
+     *  operational window, not an archive — old keys only block key
+     *  reuse. NULL = never prune. */
+    idempotencyKeysDays: z.number().int().min(1).max(3650).nullable().default(null),
     /** Days to keep TERMINAL FAILED trades. NULL = never prune.
      *  Successful trades are NEVER auto-pruned — they're tax-relevant
      *  for most operators. To prune successes, use direct SQL or

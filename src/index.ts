@@ -222,7 +222,25 @@ async function main() {
           }
           const { tradePreflightCommand } = await import("./cli/trade.js");
           await tradePreflightCommand(dir, flags);
-        } else throw subcommandError("trade", action, ["buy", "sell", "import", "preview", "preflight"]);
+        }
+        // v45: unfence an in-flight idempotency key after the operator
+        // verified nothing was sent (process died mid-execution).
+        else if (action === "release-key") {
+          const key = positional[2];
+          if (!key) {
+            throw new (await import("./errors.js")).ToolError("INVALID_PARAMS", "Usage: tradekit trade release-key <key>");
+          }
+          const { releaseIdempotencyKey } = await import("./idempotency.js");
+          const released = releaseIdempotencyKey(key);
+          if (flags["json"] === "true") {
+            const { printJson } = await import("./cli/helpers.js");
+            printJson({ ok: true, key, released });
+          } else {
+            console.log(released
+              ? `Key "${key}" released — a retry with this key will execute fresh. Only do this after confirming no tx was sent (tradekit trades --limit 5).`
+              : `Key "${key}" not found — nothing to release.`);
+          }
+        } else throw subcommandError("trade", action, ["buy", "sell", "import", "preview", "preflight", "release-key"]);
         break;
 
       case "trades":

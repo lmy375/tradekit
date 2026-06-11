@@ -112,6 +112,18 @@ TRADING
         --strict exits 1 when verdict=no_go (iter772 — pipeline gate before actual swap).
         [--base ETH|<addr>] [--quote USDC|<addr>] [--baseAmount|--quoteAmount <n|max>]
         [--slippage <bps>] [--simulate] [--note "..."] [--account <label>] [--chain X]
+        [--idempotency-key K]
+        v45: --idempotency-key (8–128 chars [A-Za-z0-9_-], e.g. a UUID) fences
+        transport-retry double trades: a retry with the same key REPLAYS the
+        recorded outcome (marked replayed) instead of re-executing. Same key +
+        different request → IDEMPOTENCY_CONFLICT. Key still executing →
+        REQUEST_IN_FLIGHT (never assume the original died — the tx may be in
+        the mempool; check 'tradekit trades' first). Recorded failures replay
+        as failures: fixed-and-retrying is a new request → new key. Keys expire
+        via db.retention.idempotencyKeysDays.
+  trade release-key <key> [--json]
+        v45: unfence an in-flight key after a process died mid-execution AND
+        you verified nothing was sent. Terminal keys are never releasable.
   trade import <tx-hash> [--chain X] [--account L]    Backfill external swap into PnL
   transfer <token|ETH> <to> <amount|max> [--chain X] [--simulate] [--note "..."] [--account L] [--burn]
   sweep [--to <label>] [--from <a,b,c>] [--chain X] [--min-usd N] [--exclude tok,tok] [--exclude-unpriced] [--simulate] [--yes] [--json]

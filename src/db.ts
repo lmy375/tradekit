@@ -1246,6 +1246,26 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE backtest_runs ADD COLUMN metrics_json TEXT;
   `,
+
+  // v40 — idempotency keys (v45 feature). Replay protection for the
+  // HUMAN/AGENT trade paths: an MCP buy/sell whose transport times
+  // out after the tx was sent gets retried by every sane agent loop,
+  // and without a key that retry is a DOUBLE TRADE. (The engine's
+  // own fires are already protected by the v33 crash-window guard —
+  // this closes the same hole for manual paths.) One row per key:
+  // in_flight rows fence concurrent duplicates; terminal rows replay
+  // the recorded outcome verbatim.
+  `
+  CREATE TABLE idempotency_keys (
+    key           TEXT PRIMARY KEY,
+    tool          TEXT NOT NULL,
+    args_hash     TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    result_json   TEXT,
+    created_at    TEXT NOT NULL,
+    completed_at  TEXT
+  );
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4044,6 +4064,74 @@ export function findScheduleFireEvidence(args: {
  *  another simulation would be circular. Absolute value: signed
  *  slippage averages toward zero while every fill still pays the
  *  spread. */
+// ── idempotency keys (v40 schema / v45 feature) ──────────────
+
+export interface IdempotencyKeyRow {
+  key: string;
+  tool: string;
+  args_hash: string;
+  status: "in_flight" | "done" | "failed";
+  result_json: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export function getIdempotencyKey(key: string): IdempotencyKeyRow | null {
+  const db = openDb();
+  const row = db.prepare(`SELECT * FROM idempotency_keys WHERE key = ?`).get(key) as
+    | IdempotencyKeyRow
+    | undefined;
+  return row ?? null;
+}
+
+/** Atomically claim a key. Returns true when THIS caller inserted the
+ *  in_flight row; false when the key already exists (read it back and
+ *  branch). The PRIMARY KEY constraint is the race arbiter — two
+ *  concurrent claims can't both win. */
+export function claimIdempotencyKey(args: { key: string; tool: string; argsHash: string; now?: string }): boolean {
+  const db = openDb();
+  try {
+    db.prepare(
+      `INSERT INTO idempotency_keys (key, tool, args_hash, status, result_json, created_at, completed_at)
+       VALUES (?, ?, ?, 'in_flight', NULL, ?, NULL)`,
+    ).run(args.key, args.tool, args.argsHash, args.now ?? new Date().toISOString());
+    return true;
+  } catch (e) {
+    if (String((e as Error).message).includes("UNIQUE") || String((e as Error).message).includes("PRIMARY KEY")) {
+      return false;
+    }
+    throw e;
+  }
+}
+
+export function completeIdempotencyKey(args: {
+  key: string;
+  status: "done" | "failed";
+  resultJson: string;
+  now?: string;
+}): void {
+  const db = openDb();
+  db.prepare(
+    `UPDATE idempotency_keys SET status = ?, result_json = ?, completed_at = ? WHERE key = ?`,
+  ).run(args.status, args.resultJson, args.now ?? new Date().toISOString(), args.key);
+}
+
+/** Crash hygiene: an in_flight row whose process died would fence its
+ *  key forever — the caller decides staleness policy (idempotency.ts);
+ *  this just deletes so a NEW key isn't required after the operator
+ *  verified nothing was sent. */
+export function deleteIdempotencyKey(key: string): number {
+  const db = openDb();
+  return Number(db.prepare(`DELETE FROM idempotency_keys WHERE key = ?`).run(key).changes);
+}
+
+export function pruneIdempotencyKeys(beforeIso: string): number {
+  const db = openDb();
+  return Number(
+    db.prepare(`DELETE FROM idempotency_keys WHERE created_at < ?`).run(beforeIso).changes,
+  );
+}
+
 export function recentSlippageStats(chain: string, limit = 50): { avgAbsSlippageBps: number; samples: number } | null {
   const db = openDb();
   const row = db

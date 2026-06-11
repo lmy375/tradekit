@@ -97,6 +97,17 @@ export type ErrorCode =
   | "PRICE_UNAVAILABLE"
   | "PAPER_INSUFFICIENT_BALANCE"
 
+  // v45: idempotency-key protocol for manual/agent trade paths.
+  //   IDEMPOTENCY_CONFLICT — the key exists but was recorded for a
+  //     DIFFERENT request (args hash or tool mismatch). Keys bind to
+  //     one logical request; changed your mind → new key.
+  //   REQUEST_IN_FLIGHT — the key's original invocation is (or may
+  //     still be) executing. NEVER auto-retry past this: the tx may
+  //     already be on its way. Check recent trades / the tx hash
+  //     first; release the key explicitly if nothing was sent.
+  | "IDEMPOTENCY_CONFLICT"
+  | "REQUEST_IN_FLIGHT"
+
   // external API
   | "API_ERROR"
 
@@ -410,6 +421,8 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "UNKNOWN_RECIPIENT":
       return 404;
     case "WALLET_EXISTS":
+    case "IDEMPOTENCY_CONFLICT":
+    case "REQUEST_IN_FLIGHT":
       return 409;
     case "RPC_RATE_LIMITED":
       return 503;

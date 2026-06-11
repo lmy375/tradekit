@@ -2476,6 +2476,19 @@ Defensive defaults: destructive MCP operations (e.g. `audit { action: "prune" }`
 
 ## Agent integration
 
+### Idempotency keys (v45) — retry without double-trading
+
+The engine's own fires have had replay protection since v33 (the crash-window guard). The **agent path had none**: an MCP `buy` whose transport times out *after the tx was sent* gets retried by every sane agent loop — and that retry is a double trade, the single worst failure mode an agent-facing trading tool can have.
+
+Every real (non-simulate) `buy`/`sell` should carry an `idempotencyKey` (8–128 chars `[A-Za-z0-9_-]` — generate a UUID per *logical* trade, reuse it on retries):
+
+- **Retry, same request** → the recorded outcome replays verbatim with `replayed: true`. Nothing re-executes — recorded *failures* replay too ("fixed it, retrying" is a new logical trade → new key).
+- **Same key, different request** (args fingerprint is canonical — key order doesn't matter, `undefined` ≡ absent) → `IDEMPOTENCY_CONFLICT` (409).
+- **Key still executing** → `REQUEST_IN_FLIGHT` (409). Never assume the original died: the tx may be in the mempool. Check `recent_trades` first; stale rows (>10 min) say so in `details.stale` and still stay fenced. After verifying nothing was sent, `tradekit trade release-key <key>` unfences — terminal keys are never releasable (releasing a *done* key would re-arm a completed trade).
+- A **non-ToolError crash** mid-execution deliberately leaves the key in-flight: the outcome is unknown, which is exactly when retries must be fenced.
+
+CLI parity: `tradekit buy/sell --idempotency-key K`. Keys expire via `db.retention.idempotencyKeysDays` (replay protection is an operational window, not an archive).
+
 ### Error shape
 
 Every MCP tool returns either a JSON success body or, on failure, a `ToolError`:

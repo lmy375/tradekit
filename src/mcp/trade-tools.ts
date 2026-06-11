@@ -131,6 +131,12 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
           .describe(
             "Iter648: structured strategy tag stored on the trade row (e.g. 'dca-eth', 'rebal-q1'). Indexed for cross-cut queries — `recent_trades` + `pnl` both accept a strategy filter. Distinct from `note` which is free-text.",
           ),
+        idempotencyKey: z
+          .string()
+          .optional()
+          .describe(
+            "v45: replay protection — STRONGLY recommended for every real (non-simulate) trade an agent sends. 8–128 chars [A-Za-z0-9_-]; generate a UUID per logical trade and REUSE it on transport-timeout retries: the retry replays the recorded outcome (marked replayed:true) instead of double-trading. Same key + different request → IDEMPOTENCY_CONFLICT. Key still executing → REQUEST_IN_FLIGHT (do NOT assume the original died; the tx may be in the mempool — check recent_trades first). A recorded failure replays as that failure: fixing the problem and retrying is a NEW logical trade → new key.",
+          ),
       },
       async (input) => {
         try {
@@ -159,15 +165,25 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 autoSlippage: input.autoSlippage,
                 strategy: input.strategy,
               };
-              const result = await executeTrade(req, {
-                publicClient: wallet.publicClient,
-                walletClient: wallet.walletClient,
-                profile,
-                config,
-                logger: rt.opts.logger,
-                accountLabel: wallet.label,
+              const { withIdempotency } = await import("../idempotency.js");
+              const { result, replayed } = await withIdempotency({
+                key: input.idempotencyKey,
+                tool: direction,
+                // Fingerprint the caller's request minus the key itself
+                // — the same key with changed amounts must CONFLICT,
+                // not silently replay the old trade.
+                requestArgs: { ...input, idempotencyKey: undefined },
+                exec: () =>
+                  executeTrade(req, {
+                    publicClient: wallet.publicClient,
+                    walletClient: wallet.walletClient,
+                    profile,
+                    config,
+                    logger: rt.opts.logger,
+                    accountLabel: wallet.label,
+                  }),
               });
-              return result;
+              return replayed ? { ...result, replayed: true } : result;
             }),
           );
         } catch (e) {

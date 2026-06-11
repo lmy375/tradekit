@@ -50,6 +50,7 @@ import {
   pruneOldAuditBefore,
   pruneOldPaperTradesBefore,
   pruneTerminalTradesBefore,
+  pruneIdempotencyKeys,
   pruneOrderCheckLog,
   pruneEngineEvents,
   pruneAlertEvents,
@@ -144,6 +145,7 @@ const RETENTION_TABLES: Array<{
   { table: "schedule_check_log", daysField: "scheduleCheckLogDays", pruneFn: pruneScheduleCheckLog },
   { table: "rebalance_check_log", daysField: "rebalanceCheckLogDays", pruneFn: pruneRebalanceCheckLog },
   { table: "trades", daysField: "failedTradesDays", pruneFn: pruneTerminalTradesBefore },
+  { table: "idempotency_keys", daysField: "idempotencyKeysDays", pruneFn: pruneIdempotencyKeys },
 ];
 
 /** Run the retention policy against the live DB. Each enabled
