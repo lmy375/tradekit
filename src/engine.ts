@@ -306,9 +306,13 @@ export function buildBuiltinWorkers(config: Config): Worker[] {
       intervalMs: cfg.snapshot.intervalMs,
       async tick(ctx) {
         try {
-          const { runSnapshotTick } = await import("./snapshotWorker.js");
+          const { runSnapshotTick, runPaperSnapshotTick } = await import("./snapshotWorker.js");
           const report = await runSnapshotTick({ config: ctx.config, logger: ctx.logger });
-          return { ok: true, data: report };
+          // v48: the paper book rides the same worker with its OWN
+          // cadence gate (different note tag) — real-feed freshness
+          // never starves the paper feed or vice versa.
+          const paper = await runPaperSnapshotTick({ config: ctx.config, logger: ctx.logger });
+          return { ok: true, data: { ...report, paper } };
         } catch (e) {
           return { ok: false, error: (e as Error).message ?? String(e) };
         }

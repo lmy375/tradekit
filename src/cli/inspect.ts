@@ -347,6 +347,27 @@ export async function portfolioCommand(flags: Record<string, string>) {
 export async function portfolioSnapshotCommand(flags: Record<string, string>) {
   const config = loadConfig();
   const logger = makeCliLogger(flags);
+  // v48: --paper snapshots the VIRTUAL book instead (live-priced,
+  // written under the "paper:<account>" equity scope). Manual
+  // invocation bypasses the worker's cadence gate — an operator
+  // asking for a datapoint should get one.
+  if (flags["paper"] === "true") {
+    const { runPaperSnapshotTick } = await import("../snapshotWorker.js");
+    const report = await runPaperSnapshotTick({ config, logger, force: true });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...report });
+      return;
+    }
+    if (report.skipped) {
+      console.log(`Paper snapshot skipped: ${report.skipped}`);
+      return;
+    }
+    for (const r of report.recorded) {
+      console.log(`Paper snapshot #${r.id}: $${r.totalUsd.toFixed(2)} (scope ${r.accountsKey} × ${r.chainsKey})${r.unpricedCount > 0 ? `  ⚠ ${r.unpricedCount} unpriceable token(s) excluded` : ""}`);
+    }
+    console.log(`Curve: tradekit equity --accounts-key "${report.recorded[0]?.accountsKey ?? "paper:default"}"`);
+    return;
+  }
   try {
     const { resolveAccountsForPortfolio, aggregatePortfolio } = await import("../portfolio.js");
     const { listAccounts, unknownAccountError } = await import("../accounts.js");

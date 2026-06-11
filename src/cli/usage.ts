@@ -878,6 +878,11 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
         Multi-account aggregate: per-token roll-up sorted by USD + concentration (top1/3/5 %).
         --strict exits 1 when any per-(account, chain) scan failed (iter796 — cron completeness gate).
   portfolio snapshot [--accounts ...] [--chains ...] [--note "..."] [--json]
+        v48: --paper snapshots the VIRTUAL book instead — live-priced, written
+        under the "paper:<account>" equity scope (bypasses the worker cadence).
+        Curve + risk: tradekit equity --accounts-key "paper:default". The engine
+        snapshot worker records both feeds (engine.snapshotIncludePaper, default
+        true; no-op when the paper book is empty).
         Save current portfolio to DB for later diff. PnL only tracks realized trades; this captures full position state at a point in time
   portfolio history [--limit N] [--json]
         List saved snapshots (most recent first)

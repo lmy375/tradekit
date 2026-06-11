@@ -210,3 +210,107 @@ describe("buildEquityCurve — risk metrics", () => {
     expect(c.risk!.maxDrawdownPct).toBe(0);
   });
 });
+
+// ── v48: paper-book snapshots ────────────────────────────────
+
+const { valuePaperBook, runPaperSnapshotTick, PAPER_AUTO_SNAPSHOT_NOTE } = await import("./snapshotWorker.js");
+const { setPaperBalance } = await import("./paperTrade.js");
+
+describe("valuePaperBook / runPaperSnapshotTick", () => {
+  const db = openDb;
+
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+  const JUNK = "0x00000000000000000000000000000000000dead0";
+
+  const PRICES: Record<string, number | null> = { [WETH]: 2000, [USDC]: 1, [JUNK]: null };
+  const fetchPrice = async (_chain: string, token: string) => PRICES[token] ?? null;
+
+  function clearPaper() {
+    db().exec("DELETE FROM paper_balances; DELETE FROM portfolio_snapshots");
+  }
+
+  it("values the book at live prices; unpriceable tokens are EXCLUDED, never guessed", async () => {
+    const v = await valuePaperBook({
+      rows: [
+        { chain: "base", token: WETH, balance: "0.5" },
+        { chain: "base", token: USDC, balance: "300" },
+        { chain: "base", token: JUNK, balance: "1000000" },
+        { chain: "base", token: WETH, balance: "0" }, // zero rows skipped
+      ],
+      fetchPrice,
+    });
+    expect(v.totalUsd).toBeCloseTo(0.5 * 2000 + 300, 9);
+    expect(v.pricedCount).toBe(2);
+    expect(v.unpricedCount).toBe(1);
+    expect(v.tokenCount).toBe(3);
+    expect(v.breakdown.find((b) => b.token === JUNK)!.valueUsd).toBeNull();
+  });
+
+  it("tick writes ONE scoped row per paper account under paper:<account>", async () => {
+    clearPaper();
+    setPaperBalance({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "1" });
+    setPaperBalance({ account: "default", chain: "arbitrum", token: USDC, decimals: 6, amount: "500" });
+    setPaperBalance({ account: "alt", chain: "base", token: USDC, decimals: 6, amount: "100" });
+    const report = await runPaperSnapshotTick({ config: loadConfig(), logger: stubLogger, fetchPrice });
+    expect(report.recorded).toHaveLength(2);
+    const main = report.recorded.find((r) => r.account === "default")!;
+    expect(main.accountsKey).toBe("paper:default");
+    expect(main.totalUsd).toBeCloseTo(2500, 9);
+    const rows = listPortfolioSnapshots({ accountsKey: "paper:default" });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].note).toBe(PAPER_AUTO_SNAPSHOT_NOTE);
+    expect(rows[0].chains_key).toContain("arbitrum");
+    expect(listPortfolioSnapshots({ accountsKey: "paper:alt" })[0].total_usd).toBeCloseTo(100, 9);
+  });
+
+  it("cadence gates are INDEPENDENT: a fresh real snapshot never starves the paper feed", async () => {
+    clearPaper();
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100" });
+    // Fresh REAL auto-snapshot...
+    seedSnap(new Date().toISOString(), 5000, { note: AUTO_SNAPSHOT_NOTE });
+    // ...paper still records:
+    const first = await runPaperSnapshotTick({ config: loadConfig(), logger: stubLogger, fetchPrice });
+    expect(first.recorded).toHaveLength(1);
+    // ...and the paper gate now blocks the SECOND paper tick:
+    const second = await runPaperSnapshotTick({ config: loadConfig(), logger: stubLogger, fetchPrice });
+    expect(second.skipped).toMatch(/fresh paper auto-snapshot/);
+    // force (manual CLI) bypasses:
+    const forced = await runPaperSnapshotTick({ config: loadConfig(), logger: stubLogger, fetchPrice, force: true });
+    expect(forced.recorded).toHaveLength(1);
+  });
+
+  it("empty book and disabled flag both no-op", async () => {
+    clearPaper();
+    const empty = await runPaperSnapshotTick({ config: loadConfig(), logger: stubLogger, fetchPrice });
+    expect(empty.skipped).toMatch(/paper book is empty/);
+
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "1" });
+    const cfg = loadConfig();
+    const off = await runPaperSnapshotTick({
+      config: { ...cfg, engine: { ...cfg.engine, snapshotIncludePaper: false } },
+      logger: stubLogger,
+      fetchPrice,
+    });
+    expect(off.skipped).toMatch(/snapshotIncludePaper/);
+  });
+
+  it("the FULL equity stack works on the paper scope — curve + risk, zero extra wiring", async () => {
+    clearPaper();
+    // Three paper snapshots by hand (the curve doesn't care who wrote them).
+    [1000, 1200, 1080].forEach((v, i) =>
+      insertPortfolioSnapshot({
+        timestamp: `2026-06-0${i + 1}T00:00:00Z`, total_usd: v,
+        accounts_key: "paper:default", chains_key: "base",
+        token_count: 2, note: PAPER_AUTO_SNAPSHOT_NOTE, data: "{}",
+      }),
+    );
+    const c = buildEquityCurve({ accountsKey: "paper:default", chainsKey: "base" });
+    expect(c.points).toHaveLength(3);
+    expect(c.changeAbs).toBeCloseTo(80, 9);
+    expect(c.risk!.maxDrawdownPct).toBeCloseTo(10, 6); // 1200 → 1080
+    expect(c.risk!.maxDrawdownUsd).toBeCloseTo(120, 6);
+    // And the scope shows up in the picker every surface reads.
+    expect(c.availableScopes.some((s) => s.accountsKey === "paper:default")).toBe(true);
+  });
+});

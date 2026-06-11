@@ -183,6 +183,7 @@ describe("auditAllowanceList (iter606)", () => {
       rebalanceJournal: { enabled: false },
       fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
       snapshotEveryHours: 24,
+      snapshotIncludePaper: true,
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {
@@ -343,6 +344,7 @@ describe("approval freshness signal (iter617)", () => {
       rebalanceJournal: { enabled: false },
       fireRetry: { enabled: true, maxAttempts: 3, backoffMinutes: 5 },
       snapshotEveryHours: 24,
+      snapshotIncludePaper: true,
     },
     mev: { enabled: false, privateRpcs: {}, fallbackToPublic: false, labels: {} },
     db: {

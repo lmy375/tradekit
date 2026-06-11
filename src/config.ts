@@ -679,6 +679,13 @@ const engineSchema = z
      *  The worker ticks on workers.snapshot.intervalMs but only
      *  records when the last auto-snapshot is older than this. */
     snapshotEveryHours: z.number().int().min(1).max(168).default(24),
+    /** v48: also snapshot the PAPER book on the snapshot worker's
+     *  cadence — virtual balances valued at live prices, written to
+     *  portfolio_snapshots under the "paper:<account>" scope so the
+     *  ENTIRE equity stack (curve, risk metrics, web scope picker)
+     *  works on paper strategies with zero further wiring. No-op
+     *  when the paper book is empty. */
+    snapshotIncludePaper: z.boolean().default(true),
 
     /** Iter33: resilience config — controls per-worker backoff on
      *  consecutive failures + the timing window for status display. */
