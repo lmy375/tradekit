@@ -694,7 +694,7 @@ describe("simulatePlaybook — validation", () => {
     ).toThrow(/rebalance plans aren't supported/);
   });
 
-  it("rejects mixed-base playbook", () => {
+  it("rejects a base that has no price series (v43: bases are fine, MISSING SERIES is the error)", () => {
     const spec = parsePlaybookSpec({
       name: "mixed-base",
       strategies: [
@@ -710,7 +710,7 @@ describe("simulatePlaybook — validation", () => {
         initialBalance: { ETH: 1, USDC: 0 },
         series,
       }),
-    ).toThrow(/doesn't match the playbook backtest base/);
+    ).toThrow(/no price series for base "WBTC"/);
   });
 
   it("rejects mixed-quote playbook", () => {
@@ -753,7 +753,7 @@ describe("simulatePlaybook — validation", () => {
       msg = (e as Error).message;
     }
     expect(msg).toMatch(/rebalance plans/);
-    expect(msg).toMatch(/doesn't match the playbook backtest base/);
+    expect(msg).toMatch(/no price series for base "WBTC"/);
   });
 });
 
@@ -1703,5 +1703,187 @@ describe("sim results carry risk metrics (v41)", () => {
     expect(r.metrics!.equityEndUsd).toBeCloseTo(990, 9);
     // Hold curve never pays the gas.
     expect(r.holdMetrics!.equityEndUsd).toBeCloseTo(1000, 9);
+  });
+});
+
+// ── v43: multi-pair playbook backtest ────────────────────────
+
+describe("simulatePlaybook — multi-pair (v43)", () => {
+  // ETH daily flat $2000; WBTC daily 50000 → 55000 → 60000.
+  const ETH_SERIES = dailySeries("2026-04-01T00:00:00Z", [2000, 2000, 2000]);
+  const WBTC_SERIES = dailySeries("2026-04-01T00:00:00Z", [50_000, 55_000, 60_000]);
+
+  it("two bases trade out of ONE shared quote balance; valuation per base — hand-computed", () => {
+    const spec = parsePlaybookSpec({
+      name: "two-base",
+      strategies: [
+        { id: "ethdca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 1000, base: "ETH", quote: "USDC", maxRuns: 1 },
+        { id: "btcbreak", type: "order", side: "buy", trigger: "price_above", price: 54_000, quoteAmount: 1100, base: "WBTC", quote: "USDC" },
+      ],
+    });
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { USDC: 2100 },
+      series: ETH_SERIES,
+      seriesByBase: { WBTC: WBTC_SERIES },
+    });
+    // Day 0: ETH DCA buys 0.5 @2000. Day 1: WBTC breakout @55000 buys 0.02.
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0.5, 12);
+    expect(r.finalBalance["WBTC"]).toBeCloseTo(0.02, 12);
+    expect(r.finalBalance["USDC"]).toBeCloseTo(0, 9);
+    // Final: 0.5×2000 + 0.02×60000 = 1000 + 1200 = 2200 → PnL +100.
+    expect(r.finalUsd).toBeCloseTo(2200, 9);
+    expect(r.pnlUsd).toBeCloseTo(100, 9);
+    // Hold: all-USDC start → hold is flat.
+    expect(r.holdPnlUsd).toBeCloseTo(0, 9);
+    expect(r.notes.some((n) => /multi-pair backtest: ETH, WBTC vs USDC/.test(n))).toBe(true);
+    // Metrics ride along; equityEnd ≡ finalUsd still holds multi-pair.
+    expect(r.metrics!.equityEndUsd).toBeCloseTo(r.finalUsd, 9);
+    expect(r.holdMetrics!.equityEndUsd).toBeCloseTo(r.holdFinalUsd, 9);
+  });
+
+  it("hold counterfactual values MULTI-BASE initial balances at each base's end price", () => {
+    const spec = parsePlaybookSpec({
+      name: "hold-multi",
+      strategies: [
+        { id: "stop", type: "order", side: "sell", trigger: "price_below", price: 1000, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { id: "btcstop", type: "order", side: "sell", trigger: "price_below", price: 10_000, baseAmount: 0.1, base: "WBTC", quote: "USDC" },
+      ],
+    });
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 1, WBTC: 0.1, USDC: 0 },
+      series: ETH_SERIES,
+      seriesByBase: { WBTC: WBTC_SERIES },
+    });
+    // Nothing fires. initial = 2000 + 5000 = 7000; final/hold = 2000 + 6000 = 8000.
+    expect(r.initialUsd).toBeCloseTo(7000, 9);
+    expect(r.finalUsd).toBeCloseTo(8000, 9);
+    expect(r.holdPnlUsd).toBeCloseTo(1000, 9);
+    expect(r.pnlUsd).toBeCloseTo(r.holdPnlUsd, 9); // no fires → strategy ≡ hold
+  });
+
+  it("merged timeline: misaligned timestamps evaluate each strategy at its own base's at-or-before price", () => {
+    // WBTC series offset +12h from ETH's daily points.
+    const wbtcOffset: typeof WBTC_SERIES = {
+      coinId: "wbtc", daysRequested: 3,
+      points: [50_000, 55_000, 60_000].map((p, i) => ({
+        ts: new Date(Date.parse("2026-04-01T12:00:00Z") + i * 86_400_000).toISOString(),
+        priceUsd: p,
+      })),
+    };
+    const spec = parsePlaybookSpec({
+      name: "misaligned",
+      strategies: [
+        { id: "btcbreak", type: "order", side: "buy", trigger: "price_above", price: 54_000, quoteAmount: 1100, base: "WBTC", quote: "USDC" },
+      ],
+    });
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { USDC: 1100 },
+      series: ETH_SERIES,
+      seriesByBase: { WBTC: wbtcOffset },
+    });
+    const fill = r.fires.find((f) => f.multiAction === "fill")!;
+    // Fires at WBTC's own 04-02T12:00 point (price 55000) — NOT at an
+    // ETH timestamp with a stale 50000 price.
+    expect(fill.priceUsd).toBe(55_000);
+    expect(fill.ts).toBe("2026-04-02T12:00:00.000Z");
+    expect(r.finalBalance["WBTC"]).toBeCloseTo(1100 / 55_000, 12);
+    // Window spans the union of both series.
+    expect(r.windowStart).toBe(ETH_SERIES.points[0].ts);
+    expect(r.windowEnd).toBe(wbtcOffset.points[2].ts);
+  });
+
+  it("per-base hooks: a WBTC entry's bracket trades WBTC; cross-base leg is rejected naming the parent", () => {
+    const spec = parsePlaybookSpec({
+      name: "btc-bracket",
+      strategies: [
+        {
+          id: "btc", type: "order", side: "buy", trigger: "price_above", price: 54_000,
+          quoteAmount: 1100, base: "WBTC", quote: "USDC",
+          onFill: {
+            type: "createOrder",
+            spec: { side: "sell", trigger: "price_above", price: 59_000, base: "WBTC", quote: "USDC", baseAmount: "{{filled.baseAmount}}" },
+          },
+        },
+      ],
+    });
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { USDC: 1100 },
+      series: ETH_SERIES,
+      seriesByBase: { WBTC: WBTC_SERIES },
+    });
+    // Entry @55000 → 0.02 WBTC; TP @60000 sells it: 0.02×60000 = 1200 USDC.
+    const tp = r.perStrategy.find((s) => s.strategyId === "btc:hook#1")!;
+    expect(tp.finalStatus).toBe("filled");
+    expect(r.finalBalance["USDC"]).toBeCloseTo(1200, 9);
+    expect(r.finalBalance["WBTC"]).toBeCloseTo(0, 12);
+
+    // A hook leg on a DIFFERENT base than its parent is a spec error.
+    const bad = parsePlaybookSpec({
+      name: "cross-base-hook",
+      strategies: [
+        {
+          id: "btc", type: "order", side: "buy", trigger: "price_above", price: 54_000,
+          quoteAmount: 1100, base: "WBTC", quote: "USDC",
+          onFill: {
+            type: "createOrder",
+            spec: { side: "sell", trigger: "price_above", price: 2500, base: "ETH", quote: "USDC", baseAmount: "0.1" },
+          },
+        },
+      ],
+    });
+    expect(() =>
+      simulatePlaybook({
+        spec: bad, baseSymbol: "ETH", quoteSymbol: "USDC",
+        initialBalance: { USDC: 1100 },
+        series: ETH_SERIES,
+        seriesByBase: { WBTC: WBTC_SERIES },
+      }),
+    ).toThrow(/hook base "ETH" doesn't match the parent strategy's base "WBTC"/);
+  });
+
+  it("mixed quotes stay rejected (one shared quote per bundle)", () => {
+    const spec = parsePlaybookSpec({
+      name: "mixed-quote-multi",
+      strategies: [
+        { type: "order", side: "sell", trigger: "price_above", price: 3000, baseAmount: 1, base: "ETH", quote: "USDC" },
+        { type: "order", side: "sell", trigger: "price_above", price: 60000, baseAmount: 0.1, base: "WBTC", quote: "USDT" },
+      ],
+    });
+    expect(() =>
+      simulatePlaybook({
+        spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+        initialBalance: { ETH: 1, WBTC: 0.1 },
+        series: ETH_SERIES,
+        seriesByBase: { WBTC: WBTC_SERIES },
+      }),
+    ).toThrow(/one shared quote per bundle/);
+  });
+
+  it("costs apply per fill across bases; OCO works cross-base within a group", () => {
+    const spec = parsePlaybookSpec({
+      name: "cross-oco",
+      strategies: [
+        { id: "eth", type: "order", side: "buy", trigger: "price_below", price: 2100, quoteAmount: 1000, base: "ETH", quote: "USDC", group: "race" },
+        { id: "btc", type: "order", side: "buy", trigger: "price_above", price: 70_000, quoteAmount: 1000, base: "WBTC", quote: "USDC", group: "race" },
+      ],
+    });
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { USDC: 1000 },
+      series: ETH_SERIES,
+      seriesByBase: { WBTC: WBTC_SERIES },
+      costs: { slippageBps: 100, gasUsdPerFire: 2 },
+    });
+    // ETH fires first (price_below 2100 true at t0) → WBTC leg cascaded.
+    expect(r.perStrategy.find((s) => s.strategyId === "eth")!.finalStatus).toBe("filled");
+    expect(r.perStrategy.find((s) => s.strategyId === "btc")!.finalStatus).toBe("cancelled");
+    expect(r.costs!.fills).toBe(1);
+    // 1000/2000 × 0.99 = 0.495 ETH; equity end = 0.495×2000 − 2 = 988.
+    expect(r.finalBalance["ETH"]).toBeCloseTo(0.495, 12);
+    expect(r.finalUsd).toBeCloseTo(988, 9);
   });
 });

@@ -39,7 +39,7 @@ import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
 import { parseOnFillSpec, renderOnFillSpec, onFillLegs, autoHookGroup, type OnFillSpec } from "./scheduleHooks.js";
 import { parseSizingSentinel, applyFraction } from "./sizing.js";
-import { computeBacktestMetrics, type BacktestMetrics } from "./backtestMetrics.js";
+import { computeBacktestMetrics, metricsFromCurve, type BacktestMetrics, type EquityPoint } from "./backtestMetrics.js";
 import type { OrderSide, OrderTrigger } from "./db.js";
 
 // ── price series ─────────────────────────────────────────────
@@ -846,12 +846,54 @@ export interface SimSignal {
   at: string;
 }
 
+/** v43: one merged-timeline tick — the union timestamp plus the
+ *  last-seen price of every base priced so far. */
+interface MergedTick {
+  ts: string;
+  prices: Map<string, number>;
+}
+
+/** Union of all series timestamps (sorted, deduped), each carrying
+ *  the at-or-before price per base — the same convention the
+ *  rebalance backtest uses for misaligned multi-asset series. A base
+ *  contributes no price before its first datapoint (strategies on it
+ *  simply don't evaluate yet). */
+function buildMergedTicks(seriesMap: Map<string, PriceSeries>): MergedTick[] {
+  const entries = [...seriesMap.entries()];
+  if (entries.length === 1) {
+    // Single-pair fast path — identical timeline to the lone series.
+    const [base, s] = entries[0];
+    return s.points.map((pt) => ({ ts: pt.ts, prices: new Map([[base, pt.priceUsd]]) }));
+  }
+  const allTs = [...new Set(entries.flatMap(([, s]) => s.points.map((p) => p.ts)))].sort();
+  const pointers = new Map<string, number>(entries.map(([b]) => [b, 0]));
+  const lastSeen = new Map<string, number>();
+  const ticks: MergedTick[] = [];
+  for (const ts of allTs) {
+    for (const [base, s] of entries) {
+      let i = pointers.get(base)!;
+      while (i < s.points.length && s.points[i].ts <= ts) {
+        lastSeen.set(base, s.points[i].priceUsd);
+        i++;
+      }
+      pointers.set(base, i);
+    }
+    ticks.push({ ts, prices: new Map(lastSeen) });
+  }
+  return ticks;
+}
+
 export function simulatePlaybook(args: {
   spec: PlaybookSpec;
   baseSymbol: string;
   quoteSymbol: string;
   initialBalance: SymbolBalance;
   series: PriceSeries;
+  /** v43: additional price series for strategies on OTHER bases,
+   *  keyed by base symbol — lifts the v1 same-pair constraint. The
+   *  quote must still be shared across the whole bundle (shared-
+   *  balance accounting is ambiguous otherwise). */
+  seriesByBase?: Record<string, PriceSeries>;
   /** v39.5: recorded signal history. REQUIRED for specs containing
    *  signal-triggered entries — without it they stay rejected (no
    *  history to replay is not a simulation, it's a guess). */
@@ -859,19 +901,37 @@ export function simulatePlaybook(args: {
   /** v40: friction model (slippage + gas). Omit for a cost-free sim. */
   costs?: Partial<SimCosts> | null;
 }): PlaybookBacktestResult {
-  const { spec, baseSymbol, quoteSymbol, initialBalance, series } = args;
+  const { spec, baseSymbol, quoteSymbol, initialBalance } = args;
   const costs = normalizeSimCosts(args.costs);
+  const QUOTE = quoteSymbol.toUpperCase();
+
+  // base → series map. The primary pair keeps its place; extra bases
+  // ride in seriesByBase.
+  const seriesMap = new Map<string, PriceSeries>();
+  seriesMap.set(baseSymbol.toUpperCase(), args.series);
+  for (const [b, s] of Object.entries(args.seriesByBase ?? {})) {
+    seriesMap.set(b.toUpperCase(), s);
+  }
+  for (const [b, s] of seriesMap) {
+    if (s.points.length === 0) {
+      throw new ToolError("INVALID_PARAMS", `price series for base "${b}" has no datapoints.`);
+    }
+  }
+
   // Replay mode engages when a history is PROVIDED, even if empty —
   // "no alerts arrived, the entry never fires" is a legitimate
   // simulation answer, not a validation error.
-  validatePlaybookForBacktest(spec, baseSymbol, quoteSymbol, { signalsProvided: args.signals != null });
+  validatePlaybookForBacktest(spec, new Set(seriesMap.keys()), QUOTE, { signalsProvided: args.signals != null });
+
+  const ticks = buildMergedTicks(seriesMap);
+
   // Normalize signal times to canonical ISO before comparing — the
   // series carries `toISOString()` stamps ("…00.000Z") and a raw
   // lexicographic compare against second-precision input ("…00Z")
   // silently misorders ('Z' > '.'). Then drop stale-before-armed
   // signals: only arrivals at/after the series start are eligible
   // (every sim order is armed at t0).
-  const windowStart = series.points[0]?.ts ?? "";
+  const windowStart = ticks[0]?.ts ?? "";
   const simSignals = (args.signals ?? [])
     .map((s) => {
       const t = Date.parse(s.at);
@@ -888,27 +948,59 @@ export function simulatePlaybook(args: {
   const states = spec.strategies.map((entry, i) => buildStrategyState(entry, i));
 
   const balance: SymbolBalance = normalizeBalance(initialBalance);
+  const initBalance: SymbolBalance = normalizeBalance(initialBalance);
   const fires: PlaybookBacktestFire[] = [];
   const notes: string[] = [];
 
+  // v41/v43: equity curves accumulate DURING the walk — playbook
+  // fires don't carry their base, so post-hoc reconstruction can't
+  // work for multi-pair bundles. Gas accrues per fill (v40: charged
+  // to equity, not the trading balance); hold stays frictionless.
+  const stratCurve: EquityPoint[] = [];
+  const holdCurve: EquityPoint[] = [];
+  const stratFlags: boolean[] = [];
+  const holdFlags: boolean[] = [];
+  let gasPaid = 0;
+  let firesSeen = 0;
 
-  for (const pt of series.points) {
+  for (const tick of ticks) {
     // Order matters: orders evaluate first, then schedules — matches
     // the live engine where orders tick more frequently than schedules.
     // The shared-balance effect is sequential: an order fire reduces
-    // balance BEFORE a schedule in the same tick can spend.
+    // balance BEFORE a schedule in the same tick can spend. Each
+    // strategy sees its OWN base's last-seen price; before that base's
+    // first datapoint it doesn't evaluate at all.
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
-      if (st.type === "order") {
-        evaluateOrderTick({ state: st, pt, balance, baseSymbol, quoteSymbol, states, fires, notes, signals: simSignals, costs });
-      }
+      if (st.type !== "order") continue;
+      const px = tick.prices.get(st.base);
+      if (px == null) continue;
+      evaluateOrderTick({ state: st, pt: { ts: tick.ts, priceUsd: px }, balance, baseSymbol: st.base, quoteSymbol: QUOTE, states, fires, notes, signals: simSignals, costs });
     }
     for (const st of states) {
       if (st.finalStatus !== "active") continue;
-      if (st.type === "schedule") {
-        evaluateScheduleTick({ state: st, pt, balance, baseSymbol, quoteSymbol, fires, states, notes, costs });
-      }
+      if (st.type !== "schedule") continue;
+      const px = tick.prices.get(st.base);
+      if (px == null) continue;
+      evaluateScheduleTick({ state: st, pt: { ts: tick.ts, priceUsd: px }, balance, baseSymbol: st.base, quoteSymbol: QUOTE, fires, states, notes, costs });
     }
+
+    for (; firesSeen < fires.length; firesSeen++) {
+      gasPaid += fires[firesSeen].gasCostUsd ?? 0;
+    }
+
+    let baseVal = 0;
+    let holdBaseVal = 0;
+    for (const [b, px] of tick.prices) {
+      baseVal += (balance[b] ?? 0) * px;
+      holdBaseVal += (initBalance[b] ?? 0) * px;
+    }
+    const equity = baseVal + (balance[QUOTE] ?? 0) - gasPaid;
+    const holdEquity = holdBaseVal + (initBalance[QUOTE] ?? 0);
+    stratCurve.push({ ts: tick.ts, equityUsd: equity });
+    holdCurve.push({ ts: tick.ts, equityUsd: holdEquity });
+    stratFlags.push(equity > 0 && baseVal >= equity * 0.01);
+    holdFlags.push(holdEquity > 0 && holdBaseVal >= holdEquity * 0.01);
   }
 
   // v31: hook-spawn summary. Dynamic states carry spawnedBy.
@@ -933,28 +1025,50 @@ export function simulatePlaybook(args: {
       notes.push(`${st.id}: schedule never matched a datapoint (check cron cadence vs data resolution)`);
     }
     if (st.type === "order" && st.finalStatus === "active") {
-      notes.push(`${st.id}: order never triggered over the ${series.points.length} datapoints in window`);
+      notes.push(`${st.id}: order never triggered over the ${ticks.length} datapoints in window`);
     }
   }
 
-  // v40: pass the REAL fires (not []) so summarizeCosts sees the
-  // per-fill cost fields; buildResult ignores fires otherwise.
-  const built = buildResult({ initialBalance, balance, fires, notes, series, baseSymbol, quoteSymbol, costs });
+  // ── valuation: each base at its OWN first/last price ──
+  // (For a single-pair bundle this is exactly the old buildResult
+  // math; symbols in the balance without a series are ignored, same
+  // as the single-pair path always did.)
+  let initialUsd = initBalance[QUOTE] ?? 0;
+  let finalUsd = (balance[QUOTE] ?? 0) - gasPaid;
+  let holdFinalUsd = initBalance[QUOTE] ?? 0;
+  for (const [b, s] of seriesMap) {
+    const first = s.points[0].priceUsd;
+    const last = s.points[s.points.length - 1].priceUsd;
+    initialUsd += (initBalance[b] ?? 0) * first;
+    finalUsd += (balance[b] ?? 0) * last;
+    holdFinalUsd += (initBalance[b] ?? 0) * last;
+  }
+
+  const costSummary = summarizeCosts(costs, fires);
+  if (costSummary && costSummary.fills > 0) {
+    notes.push(
+      `costs: ${costSummary.slippageBps}bps slippage + $${formatNum(costSummary.gasUsdPerFire)}/fire gas × ${costSummary.fills} fill(s) = $${formatNum(costSummary.totalUsd)} total friction`,
+    );
+  }
+  if (seriesMap.size > 1) {
+    notes.push(`multi-pair backtest: ${[...seriesMap.keys()].join(", ")} vs ${QUOTE} on a merged ${ticks.length}-point timeline (each strategy prices off its own base's series, at-or-before lookup)`);
+  }
+
   return {
     fires,
     finalBalance: balance,
-    initialUsd: built.initialUsd,
-    finalUsd: built.finalUsd,
-    pnlUsd: built.pnlUsd,
-    holdFinalUsd: built.holdFinalUsd,
-    holdPnlUsd: built.holdPnlUsd,
-    notes: built.notes,
-    windowStart: built.windowStart,
-    windowEnd: built.windowEnd,
+    initialUsd,
+    finalUsd,
+    pnlUsd: finalUsd - initialUsd,
+    holdFinalUsd,
+    holdPnlUsd: holdFinalUsd - initialUsd,
+    notes,
+    windowStart: ticks[0].ts,
+    windowEnd: ticks[ticks.length - 1].ts,
     perStrategy,
-    costs: built.costs,
-    metrics: built.metrics,
-    holdMetrics: built.holdMetrics,
+    costs: costSummary,
+    metrics: metricsFromCurve({ curve: stratCurve, inMarketFlags: stratFlags }),
+    holdMetrics: metricsFromCurve({ curve: holdCurve, inMarketFlags: holdFlags }),
   };
 }
 
@@ -963,6 +1077,9 @@ export function simulatePlaybook(args: {
 interface OrderState {
   id: string;
   type: "order";
+  /** v43: uppercase base symbol — each strategy prices off its own
+   *  base's series in multi-pair bundles. */
+  base: string;
   spec: OrderSpec;
   finalStatus: "active" | "filled" | "cancelled";
   trailWaterMark: number | null;
@@ -977,6 +1094,8 @@ interface OrderState {
 interface ScheduleState {
   id: string;
   type: "schedule";
+  /** v43: uppercase base symbol. */
+  base: string;
   spec: ScheduleSpec;
   /** Parsed cron — computed once at validation time. */
   parsedCron: ParsedCron;
@@ -996,6 +1115,7 @@ function buildStrategyState(entry: StrategySpec, idx: number): StrategyState {
     return {
       id,
       type: "order",
+      base: entry.base.toUpperCase(),
       spec: entry,
       finalStatus: "active",
       trailWaterMark: null,
@@ -1010,6 +1130,7 @@ function buildStrategyState(entry: StrategySpec, idx: number): StrategyState {
     return {
       id,
       type: "schedule",
+      base: entry.base.toUpperCase(),
       spec: entry,
       parsedCron: parseCron(cronExpr),
       finalStatus: "active",
@@ -1181,6 +1302,7 @@ function spawnHookOrder(args: {
       states.push({
         id: `${parent.id}:hook#${fireNumber}${legSuffix}`,
         type: "order",
+        base: hs.base.toUpperCase(),
         spec: {
           type: "order",
           side: hs.side,
@@ -1298,7 +1420,7 @@ function cascadeOcoPeers(
  */
 function validatePlaybookForBacktest(
   spec: PlaybookSpec,
-  baseSymbol: string,
+  knownBases: Set<string>,
   quoteSymbol: string,
   opts: { signalsProvided?: boolean } = {},
 ): void {
@@ -1309,7 +1431,7 @@ function validatePlaybookForBacktest(
     const prefix = `strategies[${i}]${s.id ? ` (${s.id})` : ""}`;
     if (s.type === "rebalance") {
       hasRebalance = true;
-      errors.push(`${prefix}: rebalance plans aren't supported in playbook backtest (intrinsically multi-asset)`);
+      errors.push(`${prefix}: rebalance plans aren't supported in playbook backtest (use \`tradekit backtest rebalance\` — it has its own multi-asset simulator)`);
       continue;
     }
     // v37: signal triggers need history to replay against. v39.5:
@@ -1320,23 +1442,28 @@ function validatePlaybookForBacktest(
       errors.push(`${prefix}: signal-triggered orders need signal history to replay — pass --signals-from-history (or signals[] via MCP), or replace with a price trigger`);
       continue;
     }
-    if (s.base.toUpperCase() !== baseSymbol.toUpperCase() && !(baseSymbol.toUpperCase() === "ETH" && s.base.toUpperCase() === "ETH")) {
-      errors.push(`${prefix}: base "${s.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
+    // v43: multi-pair — each base needs its own price series. The
+    // CLI/MCP fetch one per unique base automatically; library
+    // callers pass seriesByBase.
+    if (!knownBases.has(s.base.toUpperCase())) {
+      errors.push(`${prefix}: no price series for base "${s.base}" — the CLI/MCP fetch one series per unique base; from the library pass it via seriesByBase`);
     }
+    // ONE quote across the bundle: the shared balance spends/receives
+    // a single USD-pegged token; mixing quotes makes that accounting
+    // ambiguous.
     if (s.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
-      errors.push(`${prefix}: quote "${s.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
+      errors.push(`${prefix}: quote "${s.quote}" doesn't match the playbook backtest quote "${quoteSymbol}" (one shared quote per bundle)`);
     }
-    // v31: hook orders are simulated — the same-pair invariant
-    // extends INSIDE the hook spec (one price series). Both schedule
-    // AND order entries can carry hooks.
+    // v31/v43: hook legs trade the PARENT strategy's pair — they're
+    // sized from {{filled.X}} of the parent's fill.
     if ((s.type === "schedule" || s.type === "order") && s.onFill != null) {
       try {
         const hook = parseOnFillSpec(s.onFill);
         const legs = onFillLegs(hook);
         legs.forEach((leg, li) => {
           const where = legs.length > 1 ? `${prefix}.onFill.specs[${li}]` : `${prefix}.onFill`;
-          if (leg.base.toUpperCase() !== baseSymbol.toUpperCase()) {
-            errors.push(`${where}: hook base "${leg.base}" doesn't match the playbook backtest base "${baseSymbol}"`);
+          if (leg.base.toUpperCase() !== s.base.toUpperCase()) {
+            errors.push(`${where}: hook base "${leg.base}" doesn't match the parent strategy's base "${s.base}"`);
           }
           if (leg.quote.toUpperCase() !== quoteSymbol.toUpperCase()) {
             errors.push(`${where}: hook quote "${leg.quote}" doesn't match the playbook backtest quote "${quoteSymbol}"`);
@@ -1350,7 +1477,7 @@ function validatePlaybookForBacktest(
   if (errors.length === 0) return;
   throw new ToolError(
     "INVALID_PARAMS",
-    `Playbook is not backtestable as a single-asset bundle:\n  ${errors.join("\n  ")}\n` +
+    `Playbook isn't backtestable with the provided price series:\n  ${errors.join("\n  ")}\n` +
       `Fix the spec or backtest each strategy separately with \`tradekit backtest order\` / \`tradekit backtest schedule\`.`,
     {
       details: {

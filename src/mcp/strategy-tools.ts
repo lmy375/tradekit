@@ -34,6 +34,7 @@ import {
   fetchPriceSeries,
   parseSinceDuration,
   type SymbolBalance,
+  type PriceSeries,
 } from "../backtest.js";
 import {
   insertBacktestRun,
@@ -742,18 +743,30 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
             }
             const baseInput = base ?? (firstTradeable as { base: string }).base;
             const quoteInput = quote ?? (firstTradeable as { quote: string }).quote;
-            const pair = resolveTradePair(profile, baseInput, quoteInput);
-            const baseAddrForPrice = pair.base === "ETH" ? profile.weth : pair.base;
-            if (!baseAddrForPrice) {
-              throw new ToolError("INVALID_PARAMS", `Cannot resolve a price address for ${baseInput} on ${profile.name}.`);
-            }
-            const days = parseSinceDuration(since);
-            const series = await fetchPriceSeries(baseAddrForPrice, days);
-            if (!series) {
-              throw new ToolError("UNKNOWN_TOKEN", `Backtest requires a CoinGecko-listed base token.`);
-            }
             const baseSymbol = baseInput.toUpperCase();
             const quoteSymbol = quoteInput.toUpperCase();
+            const days = parseSinceDuration(since);
+            // v43: one series per unique base (multi-pair bundles).
+            const uniqueBases: string[] = [baseSymbol];
+            for (const s of parsed.strategies) {
+              if (s.type !== "order" && s.type !== "schedule") continue;
+              const b = s.base.toUpperCase();
+              if (!uniqueBases.includes(b)) uniqueBases.push(b);
+            }
+            if (uniqueBases.length > 6) {
+              throw new ToolError("INVALID_PARAMS", `Playbook spans ${uniqueBases.length} distinct base tokens — max 6 per backtest.`);
+            }
+            const fetchFor = async (b: string) => {
+              const pair = resolveTradePair(profile, b, quoteSymbol);
+              const addr = pair.base === "ETH" ? profile.weth : pair.base;
+              if (!addr) throw new ToolError("INVALID_PARAMS", `Cannot resolve a price address for ${b} on ${profile.name}.`);
+              const s = await fetchPriceSeries(addr, days);
+              if (!s) throw new ToolError("UNKNOWN_TOKEN", `Backtest requires CoinGecko-listed base tokens ("${b}" isn't mapped).`);
+              return s;
+            };
+            const series = await fetchFor(baseSymbol);
+            const seriesByBase: Record<string, PriceSeries> = {};
+            for (const b of uniqueBases.slice(1)) seriesByBase[b] = await fetchFor(b);
             const initialBalance: SymbolBalance = Object.fromEntries(
               Object.entries(balance).map(([k, v]) => [k.toUpperCase(), v]),
             );
@@ -767,7 +780,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               simSignals = [...(simSignals ?? []), ...recorded];
             }
             const simCosts = await resolveMcpCosts({ slippage_bps, gas_usd_per_fire, costs_from_history, profile });
-            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series, signals: simSignals, costs: simCosts.costs });
+            const result = simulatePlaybook({ spec: parsed, baseSymbol, quoteSymbol, initialBalance, series, seriesByBase, signals: simSignals, costs: simCosts.costs });
             result.notes.push(...simCosts.provenance);
             const rowId = insertBacktestRun({
               strategyType: "playbook",

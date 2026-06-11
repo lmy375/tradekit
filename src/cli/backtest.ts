@@ -686,15 +686,7 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
   if (!baseInput || !quoteInput) {
     throw new ToolError(
       "INVALID_PARAMS",
-      `Could not infer base/quote from the playbook (mixed strategies?). Pass --base and --quote explicitly.`,
-    );
-  }
-  const pair = resolveTradePair(profile, baseInput, quoteInput);
-  const baseAddrForPrice = pair.base === "ETH" ? profile.weth : pair.base;
-  if (!baseAddrForPrice) {
-    throw new ToolError(
-      "INVALID_PARAMS",
-      `Cannot resolve a price address for ${baseInput} on ${profile.name} — missing WETH config.`,
+      `Could not infer base/quote from the playbook (no order/schedule strategies?). Pass --base and --quote explicitly.`,
     );
   }
 
@@ -705,12 +697,44 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
   const since = flags["since"] ?? "30d";
   const days = parseSinceDuration(since);
 
-  const series = await fetchPriceSeries(baseAddrForPrice, days);
-  if (!series) {
+  // v43: multi-pair bundles fetch ONE series per unique base. The
+  // primary base (--base override or the first tradeable strategy's)
+  // rides in `series`; the rest in seriesByBase. Capped to keep the
+  // CoinGecko round-trips bounded.
+  const MAX_BASES = 6;
+  const uniqueBases: string[] = [baseSymbol];
+  for (const s of spec.strategies) {
+    if (s.type !== "order" && s.type !== "schedule") continue;
+    const b = s.base.toUpperCase();
+    if (!uniqueBases.includes(b)) uniqueBases.push(b);
+  }
+  if (uniqueBases.length > MAX_BASES) {
     throw new ToolError(
-      "UNKNOWN_TOKEN",
-      `Playbook backtest requires a CoinGecko-listed base token. "${baseInput}" on chain "${profile.name}" isn't in the mapping.`,
+      "INVALID_PARAMS",
+      `Playbook spans ${uniqueBases.length} distinct base tokens — max ${MAX_BASES} per backtest (one price series each).`,
     );
+  }
+
+  async function fetchSeriesForBase(b: string): Promise<PriceSeries> {
+    const pair = resolveTradePair(profile, b, quoteSymbol);
+    const addr = pair.base === "ETH" ? profile.weth : pair.base;
+    if (!addr) {
+      throw new ToolError("INVALID_PARAMS", `Cannot resolve a price address for ${b} on ${profile.name} — missing WETH config.`);
+    }
+    const s = await fetchPriceSeries(addr, days);
+    if (!s) {
+      throw new ToolError(
+        "UNKNOWN_TOKEN",
+        `Playbook backtest requires CoinGecko-listed base tokens. "${b}" on chain "${profile.name}" isn't in the mapping.`,
+      );
+    }
+    return s;
+  }
+
+  const series = await fetchSeriesForBase(baseSymbol);
+  const seriesByBase: Record<string, PriceSeries> = {};
+  for (const b of uniqueBases.slice(1)) {
+    seriesByBase[b] = await fetchSeriesForBase(b);
   }
 
   // v39.5: replay recorded signal history against signal-triggered
@@ -737,6 +761,7 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
     quoteSymbol,
     initialBalance,
     series,
+    seriesByBase,
     signals,
     costs: simCosts.costs,
   });

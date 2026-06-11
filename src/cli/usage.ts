@@ -738,9 +738,13 @@ BACKTESTING (historical strategy simulation)
         renderer, {{filled.X}} substitution, sized to the simulated fill) which then
         trades like any other order — DCA+bracket composites backtest end-to-end. Per-strategy
         stats (fire count, base/quote delta, final status) surface alongside total PnL.
-        Rebalance plans + multi-base playbooks are rejected with a pointer to the
-        single-strategy commands. Base/quote inferred from the first non-rebalance
-        strategy when --base / --quote aren't passed.
+        MULTI-PAIR (v43): bundles mixing bases (ETH/USDC + WBTC/USDC) fetch one
+        series per unique base (max 6) and walk a merged timeline — each strategy
+        prices off its own base, all trading from ONE shared quote balance (quote
+        must be shared bundle-wide; hook legs trade their parent's pair). Rebalance
+        plans stay excluded ('backtest rebalance' is their own multi-asset sim).
+        Base/quote inferred from the first non-rebalance strategy when --base /
+        --quote aren't passed.
         Templates supported: --var / --vars-file work identically to 'playbook deploy'.
         Signal-triggered entries replay against RECORDED signal history with
         --signals-from-history ("with the alerts I actually received, how would this

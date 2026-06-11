@@ -112,6 +112,42 @@ export function computeBacktestMetrics(args: {
   if (series.points.length === 0) return null;
   const curve = buildEquityCurve(args);
 
+  // ── time in market flags (per point) ──
+  const inMarketFlags: boolean[] = [];
+  {
+    let base = (args.initialBalance[args.baseSymbol] ?? 0);
+    const sorted = [...args.fires].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+    let fi = 0;
+    for (let i = 0; i < series.points.length; i++) {
+      const pt = series.points[i];
+      while (fi < sorted.length && sorted[fi].ts <= pt.ts) {
+        base += sorted[fi].baseDelta;
+        fi++;
+      }
+      const equity = curve[i].equityUsd;
+      inMarketFlags.push(equity > 0 && base * pt.priceUsd >= equity * IN_MARKET_FRACTION);
+    }
+  }
+
+  return metricsFromCurve({ curve, inMarketFlags });
+}
+
+/**
+ * v43: derive the full metric set from an already-built equity curve.
+ * Extracted so the multi-pair playbook sim (which builds its curve
+ * inline during the merged-timeline walk — fires don't carry their
+ * base, so post-hoc reconstruction is impossible there) shares the
+ * exact math with the single-pair path.
+ */
+export function metricsFromCurve(args: {
+  curve: EquityPoint[];
+  /** Per-point "base exposure ≥1% of equity" flags. Same length as
+   *  curve; defaults to all-false when omitted. */
+  inMarketFlags?: boolean[];
+}): BacktestMetrics | null {
+  const { curve } = args;
+  if (curve.length === 0) return null;
+
   // ── drawdown: running-peak walk (same model as src/equity.ts) ──
   let peak = curve[0].equityUsd;
   let peakTs = curve[0].ts;
@@ -147,29 +183,15 @@ export function computeBacktestMetrics(args: {
     const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
     const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / (returns.length - 1);
     const sd = Math.sqrt(variance);
-    const periodsPerYear = inferPeriodsPerYear(series);
+    const periodsPerYear = inferPeriodsPerYearFromTimestamps(curve.map((p) => p.ts));
     volatilityPctAnnual = sd * Math.sqrt(periodsPerYear) * 100;
     // A zero-vol curve has no risk to adjust for — sharpe stays null
     // rather than ±Infinity.
     sharpe = sd > 0 ? (mean / sd) * Math.sqrt(periodsPerYear) : null;
   }
 
-  // ── time in market ──
-  let inMarket = 0;
-  {
-    let base = (args.initialBalance[args.baseSymbol] ?? 0);
-    const sorted = [...args.fires].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-    let fi = 0;
-    for (let i = 0; i < series.points.length; i++) {
-      const pt = series.points[i];
-      while (fi < sorted.length && sorted[fi].ts <= pt.ts) {
-        base += sorted[fi].baseDelta;
-        fi++;
-      }
-      const equity = curve[i].equityUsd;
-      if (equity > 0 && base * pt.priceUsd >= equity * IN_MARKET_FRACTION) inMarket++;
-    }
-  }
+  const flags = args.inMarketFlags ?? [];
+  const inMarket = flags.filter(Boolean).length;
 
   const equityStartUsd = curve[0].equityUsd;
   const equityEndUsd = curve[curve.length - 1].equityUsd;
@@ -181,7 +203,7 @@ export function computeBacktestMetrics(args: {
     troughTs: ddTroughTs,
     volatilityPctAnnual,
     sharpe,
-    timeInMarketPct: (inMarket / series.points.length) * 100,
+    timeInMarketPct: (inMarket / curve.length) * 100,
     equityStartUsd,
     equityEndUsd,
     curve: downsampleCurve(curve, CURVE_MAX_POINTS),
@@ -191,11 +213,14 @@ export function computeBacktestMetrics(args: {
 /** Median spacing between points → periods per year. Robust to the
  *  occasional gap in CoinGecko data (mean would skew on one hole). */
 export function inferPeriodsPerYear(series: PriceSeries): number {
-  const pts = series.points;
-  if (pts.length < 2) return 365;
+  return inferPeriodsPerYearFromTimestamps(series.points.map((p) => p.ts));
+}
+
+export function inferPeriodsPerYearFromTimestamps(ts: string[]): number {
+  if (ts.length < 2) return 365;
   const gaps: number[] = [];
-  for (let i = 1; i < pts.length; i++) {
-    const dt = Date.parse(pts[i].ts) - Date.parse(pts[i - 1].ts);
+  for (let i = 1; i < ts.length; i++) {
+    const dt = Date.parse(ts[i]) - Date.parse(ts[i - 1]);
     if (dt > 0) gaps.push(dt);
   }
   if (gaps.length === 0) return 365;
