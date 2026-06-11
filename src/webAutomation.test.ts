@@ -722,3 +722,25 @@ describe("/api/equity — v46 risk field", () => {
     expect(risk.maxDrawdownUsd).toBeCloseTo(120, 6);
   });
 });
+
+// ── v47.5: /api/intents ──────────────────────────────────────
+
+describe("/api/intents", () => {
+  it("lists intents with a pending count; status filter + 400 on junk", async () => {
+    const { insertTradeIntent } = await import("./db.js");
+    insertTradeIntent({
+      createdAt: new Date().toISOString(), tool: "buy", chain: "base", account: "default",
+      requestJson: "{}", previewJson: null, estUsd: 750, reason: "test",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    const r = await get("/api/intents");
+    expect(r.status).toBe(200);
+    expect(r.body.pending as number).toBeGreaterThanOrEqual(1);
+    const row = (r.body.intents as Array<Record<string, unknown>>).find((x) => x.est_usd === 750)!;
+    expect(row.status).toBe("pending");
+    expect(row.reason).toBe("test");
+
+    expect((await get("/api/intents?status=pending")).status).toBe(200);
+    expect((await get("/api/intents?status=bogus")).status).toBe(400);
+  });
+});

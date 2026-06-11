@@ -64,6 +64,14 @@ function renderText(r: DigestReport): string {
   lines.push(renderTradesText(r.trades, r.comparison?.prior?.trades));
   lines.push(``);
   lines.push(renderFiresText(r.fires, r.comparison?.prior?.fires));
+  // v47.5: approval-queue activity — pendingNow is actionable NOW.
+  if (r.intents.pendingNow > 0 || r.intents.createdInWindow > 0 || r.intents.expiredInWindow > 0) {
+    const parts = [`${r.intents.createdInWindow} proposed`];
+    if (r.intents.executedInWindow > 0) parts.push(`${r.intents.executedInWindow} approved+executed`);
+    if (r.intents.rejectedInWindow > 0) parts.push(`${r.intents.rejectedInWindow} rejected`);
+    if (r.intents.expiredInWindow > 0) parts.push(`${r.intents.expiredInWindow} EXPIRED un-reviewed ⚠`);
+    lines.push(`  Agent intents:    ${parts.join(" / ")}${r.intents.pendingNow > 0 ? `  — ${r.intents.pendingNow} AWAITING APPROVAL${r.intents.oldestPendingMinutes != null ? ` (oldest ${Math.round(r.intents.oldestPendingMinutes)}min)` : ""} ⚠` : ""}`);
+  }
   lines.push(``);
   lines.push(renderSafetyText(r.safety));
   lines.push(``);

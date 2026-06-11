@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { Card, Code, Stack, Text } from "@mantine/core";
+import {
+  Alert, Card, Code, Stack, Text } from "@mantine/core";
 import type { PageProps } from "../api";
-import { getStatus } from "../api";
+import { api, getStatus } from "../api";
 
 export function Overview({ status: initial }: PageProps) {
   const [status, setStatus] = useState(initial);
+  const [pendingIntents, setPendingIntents] = useState(0);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -13,8 +15,26 @@ export function Overview({ status: initial }: PageProps) {
     return () => clearInterval(t);
   }, []);
 
+  // v47.5: surface the approval queue where the operator lands first
+  // — an open intent means an agent is blocked waiting on a human.
+  useEffect(() => {
+    const poll = () =>
+      api.get<{ pending: number }>("/api/intents?status=pending&limit=1")
+        .then((r) => setPendingIntents(r.pending))
+        .catch(() => {});
+    poll();
+    const t = setInterval(poll, 30_000);
+    return () => clearInterval(t);
+  }, []);
+
   return (
     <Stack>
+      {pendingIntents > 0 && (
+        <Alert color="yellow" title={`${pendingIntents} agent trade${pendingIntents === 1 ? "" : "s"} awaiting your approval`}>
+          An agent proposed a trade gated by safety.tradeApproval. Review and decide on the CLI:{" "}
+          <Code>tradekit intents list</Code> → <Code>tradekit intents approve|reject &lt;id&gt;</Code> (approval is CLI-only by design).
+        </Alert>
+      )}
       <Card withBorder>
         <Text fw={600} c="blue.4" mb="xs">Active session</Text>
         <Stack gap={4}>

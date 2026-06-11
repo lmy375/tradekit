@@ -60,6 +60,8 @@ import {
   listSignalEvents,
   type SignalEventRow,
   listOperatorNotes,
+  listTradeIntents,
+  type TradeIntentRow,
   type OperatorNoteRow,
 } from "./db.js";
 
@@ -99,6 +101,8 @@ export type EventKind =
   | "alert.resolved"           // strategy_alert_state row last_evaluated_at after first_triggered_at fell to active=0
   | "alert.breaker"            // circuit breaker paused a strategy's primitives (rule action: "pause")
   | "signal.received"          // v35 external signal event arrived (webhook / cli / mcp), with consumption state
+  | "intent.created"           // v47.5 agent proposed a gated trade (warn while still awaiting approval)
+  | "intent.decided"           // v47.5 intent reached a terminal state (executed/failed/rejected/expired-unreviewed)
   | "note.operator"            // v37 human/agent annotation — the forensic stream's HUMAN layer
   // Iter39: durable engine state transitions from the v26
   // engine_events table. Replaces the iter36 audit_log heuristic
@@ -122,6 +126,7 @@ export const ALL_EVENT_KINDS: EventKind[] = [
   "audit.tool", "audit.error",
   "alert.fired", "alert.resolved", "alert.breaker",
   "signal.received",
+  "intent.created", "intent.decided",
   "note.operator",
   "engine.started", "engine.stopped", "engine.lock", "engine.unlock",
   "worker.degraded", "worker.recovered", "config.reloaded", "config.reload_failed",
@@ -131,7 +136,7 @@ export interface EventRefs {
   /** Concrete primitive id when applicable (order id, schedule id,
    *  trade id, audit id, engine_event id). Used by the renderer
    *  for the "drill into this row" link. */
-  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event" | "signal" | "note";
+  type: "trade" | "paper_trade" | "order" | "schedule" | "rebalance" | "audit" | "alert" | "engine_event" | "signal" | "note" | "intent";
   id: number | string;
   /** Chain / account / strategy denormalized so the consumer can
    *  filter without joining. Nullable when irrelevant. */
@@ -190,6 +195,7 @@ export interface TimelineInjections {
   scheduleJournalFn?: (since: string, until: string, limit: number) => ScheduleCheckLogRow[];
   signalEventsFn?: typeof listSignalEvents;
   notesFn?: typeof listOperatorNotes;
+  intentsFn?: typeof listTradeIntents;
   rebalanceJournalFn?: (since: string, until: string, limit: number) => RebalanceCheckLogRow[];
   /** Iter39: engine_events table source. */
   engineEventsFn?: typeof listEngineEvents;
@@ -851,6 +857,63 @@ export function collectSignalEvents(args: {
   return out;
 }
 
+/** v47.5: trade intents → timeline. Two point events per intent:
+ *  created (warn while still PENDING — an open approval is the
+ *  actionable state; info once decided) and decided (executed →
+ *  info, failed/rejected → warn; expiry synthesizes a decided
+ *  event at expires_at — "expired un-reviewed" is exactly the
+ *  signal an operator wants in the forensic stream). Intents are
+ *  global like signals/engine events: chain shows in the summary,
+ *  strategy filters don't apply. */
+export function collectIntentEvents(args: {
+  rows: readonly TradeIntentRow[];
+  filter: Pick<CollectTimelineArgs, "kinds" | "minSeverity">;
+  sinceIso: string;
+  untilIso: string;
+  nowIso?: string;
+}): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  const nowIso = args.nowIso ?? new Date().toISOString();
+  for (const r of args.rows) {
+    const label = `${r.tool}${r.est_usd != null ? ` ~$${r.est_usd.toFixed(2)}` : ""} on ${r.chain}`;
+    if (r.created_at >= args.sinceIso && r.created_at <= args.untilIso && kindAllowed("intent.created", args.filter.kinds)) {
+      const stillPending = r.status === "pending" && r.expires_at >= nowIso;
+      const severity: EventSeverity = stillPending ? "warn" : "info";
+      if (severityAllowed(severity, args.filter.minSeverity)) {
+        out.push({
+          at: r.created_at,
+          kind: "intent.created",
+          severity,
+          summary: `INTENT #${r.id} agent proposed ${label}${r.reason ? ` — "${r.reason}"` : ""}${stillPending ? " — AWAITING APPROVAL" : ""}`,
+          refs: { type: "intent", id: r.id, chain: r.chain, account: r.account },
+          details: { tool: r.tool, estUsd: r.est_usd, reason: r.reason, expiresAt: r.expires_at, status: r.status },
+        });
+      }
+    }
+    const decidedAt = r.decided_at ?? (r.status === "expired" ? r.expires_at : null);
+    if (decidedAt != null && decidedAt >= args.sinceIso && decidedAt <= args.untilIso && kindAllowed("intent.decided", args.filter.kinds)) {
+      const severity: EventSeverity = r.status === "executed" ? "info" : "warn";
+      if (severityAllowed(severity, args.filter.minSeverity)) {
+        const outcome =
+          r.status === "executed" ? `APPROVED + executed`
+          : r.status === "failed" ? `approved but execution FAILED`
+          : r.status === "rejected" ? `REJECTED${r.decided_note ? ` (${r.decided_note})` : ""}`
+          : r.status === "expired" ? `EXPIRED un-reviewed`
+          : r.status;
+        out.push({
+          at: decidedAt,
+          kind: "intent.decided",
+          severity,
+          summary: `INTENT #${r.id} ${outcome} — ${label}`,
+          refs: { type: "intent", id: r.id, chain: r.chain, account: r.account },
+          details: { tool: r.tool, estUsd: r.est_usd, status: r.status, decidedNote: r.decided_note },
+        });
+      }
+    }
+  }
+  return out;
+}
+
 /** v37 operator notes → timeline. Severity info; the strategy
  *  filter applies when the note is tagged (untagged notes are
  *  global context and survive any strategy filter — "rotated RPC"
@@ -979,8 +1042,12 @@ export function collectTimeline(args: CollectTimelineArgs = {}): TimelineEvent[]
   const noteRows = (args.injects?.notesFn ?? listOperatorNotes)({ limit: sourceLimit, since: sinceIso });
   const noteEvents = collectNoteEvents({ rows: noteRows, filter, sinceIso, untilIso });
 
+  // v47.5: trade intents — global like signals/engine events.
+  const intentRows = (args.injects?.intentsFn ?? listTradeIntents)({ limit: sourceLimit });
+  const intentEvents = collectIntentEvents({ rows: intentRows, filter, sinceIso, untilIso });
+
   // Merge.
-  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents, ...signalEvents, ...noteEvents];
+  const all = [...tradeEvents, ...paperEvents, ...auditEvents, ...alertEvents, ...journalEvents, ...scheduleJournalEvents, ...rebalanceJournalEvents, ...engineEvents, ...signalEvents, ...noteEvents, ...intentEvents];
 
   // Stable sort: newest first by `at`, then by `kind` for
   // determinism when multiple events share a millisecond.

@@ -137,3 +137,97 @@ describe("intent lifecycle", () => {
     expect(() => rejectTradeIntent({ id: 99_999 })).toThrow(/No trade intent/);
   });
 });
+
+// ── v47.5: operational-surface integration ───────────────────
+
+describe("timeline integration (collectIntentEvents)", () => {
+  it("created (warn while pending) + decided events; expiry synthesizes decided at expires_at", async () => {
+    const { collectIntentEvents } = await import("./timeline.js");
+    const now = new Date("2026-06-11T12:00:00Z");
+    const base = {
+      tool: "buy" as const, chain: "base", account: "default",
+      request_json: "{}", preview_json: null, est_usd: 800, reason: "breakout",
+      decided_at: null, decided_note: null, executed_at: null, result_json: null,
+    };
+    const rows = [
+      { ...base, id: 1, status: "pending" as const, created_at: "2026-06-11T11:00:00Z", expires_at: "2026-06-11T13:00:00Z" },
+      { ...base, id: 2, status: "rejected" as const, created_at: "2026-06-11T10:00:00Z", expires_at: "2026-06-11T11:00:00Z", decided_at: "2026-06-11T10:30:00Z", decided_note: "too big" },
+      { ...base, id: 3, status: "expired" as const, created_at: "2026-06-11T08:00:00Z", expires_at: "2026-06-11T09:00:00Z" },
+      { ...base, id: 4, status: "executed" as const, created_at: "2026-06-11T07:00:00Z", expires_at: "2026-06-11T08:00:00Z", decided_at: "2026-06-11T07:10:00Z" },
+    ];
+    const events = collectIntentEvents({
+      rows, filter: {}, sinceIso: "2026-06-11T00:00:00Z", untilIso: "2026-06-11T23:59:59Z",
+      nowIso: now.toISOString(),
+    });
+    const byKey = (id: number, kind: string) => events.find((e) => e.refs.id === id && e.kind === kind);
+    expect(byKey(1, "intent.created")!.severity).toBe("warn"); // still actionable
+    expect(byKey(1, "intent.created")!.summary).toMatch(/AWAITING APPROVAL/);
+    expect(byKey(2, "intent.created")!.severity).toBe("info"); // decided — created is history
+    expect(byKey(2, "intent.decided")!.summary).toMatch(/REJECTED \(too big\)/);
+    // Expiry synthesizes a decided event AT expires_at.
+    const expired = byKey(3, "intent.decided")!;
+    expect(expired.at).toBe("2026-06-11T09:00:00Z");
+    expect(expired.severity).toBe("warn");
+    expect(expired.summary).toMatch(/EXPIRED un-reviewed/);
+    expect(byKey(4, "intent.decided")!.severity).toBe("info");
+  });
+
+  it("the kinds live in ALL_EVENT_KINDS — every derived surface gets them for free", async () => {
+    const { ALL_EVENT_KINDS } = await import("./timeline.js");
+    expect(ALL_EVENT_KINDS).toContain("intent.created");
+    expect(ALL_EVENT_KINDS).toContain("intent.decided");
+  });
+});
+
+describe("digest integration (gatherIntents + verdict)", () => {
+  it("counts the window + pending now; pending pushes verdict to attention", async () => {
+    const { gatherIntents, classifyVerdict } = await import("./digest.js");
+    const now = new Date();
+    mkIntent({ now: new Date(now.getTime() - 30 * 60_000) }); // pending, 30min old
+    const s2 = mkIntent({ now: new Date(now.getTime() - 10 * 60_000) });
+    // Pin the decision clock INSIDE the window — decided_at must not
+    // land after the gather's `until` boundary.
+    rejectTradeIntent({ id: s2.intentId, note: "no", now: new Date(now.getTime() - 60_000) });
+    const section = gatherIntents({ since: new Date(now.getTime() - 3_600_000).toISOString(), now });
+    expect(section.pendingNow).toBe(1);
+    expect(section.createdInWindow).toBe(2);
+    expect(section.rejectedInWindow).toBe(1);
+    expect(Math.round(section.oldestPendingMinutes!)).toBe(30);
+
+    const empty = { } as never; // sections irrelevant for this rule
+    void empty;
+    const verdict = classifyVerdict({
+      trades: { total: 0, usdVolume: 0 } as never,
+      fires: { ordersFilled: 0, ordersFailed: 0, schedulesFired: 0, scheduleFireFailures: 0, rebalanceFailureCount: 0 } as never,
+      safety: { drawdownTrips: 0, drawdownCurrentlyTripped: [], budgetWarnings: [], budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0 } as never,
+      errors: { errorRatePct: 0 } as never,
+      alerts: { fired: 0, resolved: 0, currentlyActive: 0 } as never,
+      paper: { fills: 0 } as never,
+      intents: section,
+    });
+    expect(verdict.verdict).toBe("attention");
+    expect(verdict.verdictReasons.some((x) => /awaiting approval/.test(x))).toBe(true);
+  });
+});
+
+describe("doctor integration (checkPendingIntents)", () => {
+  it("warns on pending; ok when the queue is clear", async () => {
+    const { checkPendingIntents } = await import("./doctor.js");
+    const clear = await checkPendingIntents();
+    expect(clear.severity).toBe("ok");
+
+    mkIntent();
+    const warn = await checkPendingIntents();
+    expect(warn.severity).toBe("warn");
+    expect(warn.message).toMatch(/AWAITING APPROVAL/);
+    expect(warn.hint).toMatch(/intents list/);
+  });
+
+  it("warns on recently-expired-unreviewed even with an empty queue", async () => {
+    const { checkPendingIntents } = await import("./doctor.js");
+    mkIntent({ now: new Date(Date.now() - 2 * 3_600_000) }); // expires 1h ago
+    const r = await checkPendingIntents();
+    expect(r.severity).toBe("warn");
+    expect(r.message).toMatch(/expired UN-REVIEWED/);
+  });
+});

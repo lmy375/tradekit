@@ -334,6 +334,10 @@ TRADE APPROVAL (v47 — human-in-the-loop for agent trades)
         Terminal. Pending intents auto-expire after
         safety.tradeApproval.expiresMinutes (default 60) — a stale quote
         should never execute days later.
+        Visibility (v47.5): pending intents surface in the digest (verdict →
+        attention), 'tradekit doctor' (intents check), the timeline
+        (intent.created / intent.decided — expiry shows as EXPIRED
+        un-reviewed), and the web Overview banner (GET /api/intents).
 
 EXECUTION QUALITY (v44)
   execution [--since 30d|12h|ISO] [--chain X] [--account L] [--json]

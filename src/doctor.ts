@@ -1305,6 +1305,40 @@ export async function checkSignalReadiness(): Promise<CheckResult> {
   }
 }
 
+/** v47.5: an open pending intent means an agent is BLOCKED waiting
+ *  on a human; expiries in the last 7d mean proposals are dying
+ *  un-reviewed (the operator isn't seeing the notifications). */
+export async function checkPendingIntents(now: Date = new Date()): Promise<CheckResult> {
+  try {
+    const { listIntents } = await import("./tradeIntents.js");
+    const rows = listIntents({ limit: 200 }, now);
+    const pending = rows.filter((r) => r.status === "pending");
+    const weekAgo = new Date(now.getTime() - 7 * 86_400_000).toISOString();
+    const expiredRecently = rows.filter((r) => r.status === "expired" && r.expires_at >= weekAgo);
+    if (pending.length > 0) {
+      const soonest = pending.reduce((min, r) => (r.expires_at < min ? r.expires_at : min), pending[0].expires_at);
+      return {
+        name: "intents",
+        severity: "warn",
+        message: `${pending.length} agent trade(s) AWAITING APPROVAL (soonest expiry ${soonest}) — the agent is blocked until you decide`,
+        hint: `review: tradekit intents list · approve/reject: tradekit intents approve|reject <id>`,
+      };
+    }
+    if (expiredRecently.length > 0) {
+      return {
+        name: "intents",
+        severity: "warn",
+        message: `${expiredRecently.length} agent proposal(s) expired UN-REVIEWED in the last 7d — approval requests are being missed`,
+        hint: "check notification channels deliver trade.approval_pending, or raise safety.tradeApproval.expiresMinutes",
+      };
+    }
+    const gateOn = loadConfig().safety?.tradeApproval?.enabled === true;
+    return { name: "intents", severity: "ok", message: gateOn ? "approval gate on · queue clear" : "approval gate off (safety.tradeApproval)" };
+  } catch (e) {
+    return { name: "intents", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
 export async function checkEnv(): Promise<CheckResult> {
   const SENSITIVE = new Set(["WALLET_PASS", "TRADEKIT_WEB_TOKEN"]);
   const KNOWN = [
@@ -1421,6 +1455,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ timestamp: strin
   results.push(await checkRetryParked());
   results.push(await checkPausedForgotten());
   results.push(await checkSignalReadiness());
+  results.push(await checkPendingIntents());
 
   // RPCs (parallel)
   results.push(...(await Promise.all(chains.map((c) => checkRpc(c, opts.logger)))));

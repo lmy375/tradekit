@@ -549,6 +549,40 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── v47.5: trade-intent queue (read-only — approve is CLI-only) ──
+  app.get(
+    "/api/intents",
+    wrap(async (req, res) => {
+      const { listIntents } = await import("./tradeIntents.js");
+      const status = qStr(req, "status");
+      if (status && !["pending", "executed", "failed", "rejected", "expired"].includes(status)) {
+        throw new ToolError("INVALID_PARAMS", `"status" must be pending | executed | failed | rejected | expired.`);
+      }
+      const rows = listIntents({
+        status: status as never,
+        limit: qInt(req, "limit", { min: 1, max: 200, fallback: 50 }),
+      });
+      res.json({
+        ok: true,
+        count: rows.length,
+        pending: rows.filter((r) => r.status === "pending").length,
+        intents: rows.map((r) => ({
+          id: r.id,
+          status: r.status,
+          tool: r.tool,
+          chain: r.chain,
+          account: r.account,
+          est_usd: r.est_usd,
+          reason: r.reason,
+          created_at: r.created_at,
+          expires_at: r.expires_at,
+          decided_at: r.decided_at,
+          decided_note: r.decided_note,
+        })),
+      });
+    }),
+  );
+
   // ── v46: execution quality (read-only, offline) ───────────
   app.get(
     "/api/execution",

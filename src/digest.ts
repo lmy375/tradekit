@@ -39,6 +39,8 @@ import {
   type ScheduleRow,
   type RebalanceRow,
   listSignalEvents,
+  sweepExpiredTradeIntents,
+  listTradeIntents,
 } from "./db.js";
 import { computeBudgetConsumption } from "./strategyBudget.js";
 import { loadConfig, type Config } from "./config.js";
@@ -211,6 +213,19 @@ export interface EquitySection {
   points: number;
 }
 
+/** v47.5: agent trade-approval queue activity. pendingNow is the
+ *  actionable number — an open intent means an agent is BLOCKED
+ *  waiting on a human. */
+export interface IntentsSection {
+  pendingNow: number;
+  createdInWindow: number;
+  executedInWindow: number;
+  rejectedInWindow: number;
+  expiredInWindow: number;
+  /** Age of the oldest still-pending intent, minutes. */
+  oldestPendingMinutes: number | null;
+}
+
 export interface DigestReport {
   generatedAt: string;
   /** ISO timestamp of the window's start. */
@@ -229,6 +244,8 @@ export interface DigestReport {
   errors: ErrorsSection;
   alerts: AlertsSection;
   paper: PaperSection;
+  /** v47.5: approval-queue activity. */
+  intents: IntentsSection;
   /** v38: null when the snapshot feed has < 2 points in the window. */
   equity: EquitySection | null;
   /** When `--compare` was set, the same digest for the immediately-
@@ -305,8 +322,9 @@ function gatherWindow(args: {
   const alerts = gatherAlerts({ since: windowStart });
   const paper = gatherPaper({ since: windowStart });
   const equity = gatherEquity({ since: windowStart });
+  const intents = gatherIntents({ since: windowStart, now: new Date(args.nowMs) });
 
-  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper });
+  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents });
 
   let comparison: DigestReport["comparison"] = null;
   if (args.includeComparison) {
@@ -319,9 +337,10 @@ function gatherWindow(args: {
     const priorAlerts = gatherAlerts({ since: priorStart, until: priorEnd });
     const priorPaper = gatherPaper({ since: priorStart, until: priorEnd });
     const priorEquity = gatherEquity({ since: priorStart, until: priorEnd });
+    const priorIntents = gatherIntents({ since: priorStart, until: priorEnd, now: new Date(args.nowMs) });
     const priorVerdict = classifyVerdict({
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
-      alerts: priorAlerts, paper: priorPaper,
+      alerts: priorAlerts, paper: priorPaper, intents: priorIntents,
     });
     const prior: DigestReport = {
       generatedAt: windowStart,
@@ -331,7 +350,7 @@ function gatherWindow(args: {
       verdict: priorVerdict.verdict,
       verdictReasons: priorVerdict.verdictReasons,
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
-      alerts: priorAlerts, paper: priorPaper, equity: priorEquity,
+      alerts: priorAlerts, paper: priorPaper, intents: priorIntents, equity: priorEquity,
       comparison: null,
     };
     comparison = {
@@ -360,6 +379,7 @@ function gatherWindow(args: {
     errors,
     alerts,
     paper,
+    intents,
     equity,
     comparison,
   };
@@ -708,6 +728,36 @@ function gatherErrors(args: { since: string; until?: string }): ErrorsSection {
  * Reasons are accumulated regardless of verdict level — the renderer
  * picks the most severe but operators can inspect all signals via JSON.
  */
+/** v47.5: approval-queue section. Sweeps expiry lazily first so
+ *  pendingNow never counts a corpse. */
+export function gatherIntents(args: { since: string; until?: string; now?: Date }): IntentsSection {
+  const now = args.now ?? new Date();
+  try {
+    sweepExpiredTradeIntents(now.toISOString());
+    const rows = listTradeIntents({ limit: 500 });
+    const until = args.until ?? now.toISOString();
+    const inWindow = (ts: string | null) => ts != null && ts >= args.since && ts <= until;
+    const pending = rows.filter((r) => r.status === "pending");
+    let oldest: number | null = null;
+    for (const r of pending) {
+      const age = (now.getTime() - Date.parse(r.created_at)) / 60_000;
+      if (oldest == null || age > oldest) oldest = age;
+    }
+    return {
+      pendingNow: pending.length,
+      createdInWindow: rows.filter((r) => inWindow(r.created_at)).length,
+      executedInWindow: rows.filter((r) => r.status === "executed" && inWindow(r.executed_at ?? r.decided_at)).length,
+      rejectedInWindow: rows.filter((r) => r.status === "rejected" && inWindow(r.decided_at)).length,
+      expiredInWindow: rows.filter((r) => r.status === "expired" && inWindow(r.expires_at)).length,
+      oldestPendingMinutes: oldest,
+    };
+  } catch {
+    // The digest must render even if the intents table is somehow
+    // unreadable — empty section, never a crash.
+    return { pendingNow: 0, createdInWindow: 0, executedInWindow: 0, rejectedInWindow: 0, expiredInWindow: 0, oldestPendingMinutes: null };
+  }
+}
+
 export function classifyVerdict(args: {
   trades: TradesSection;
   fires: FiresSection;
@@ -715,10 +765,24 @@ export function classifyVerdict(args: {
   errors: ErrorsSection;
   alerts: AlertsSection;
   paper: PaperSection;
+  /** v47.5: optional so pre-existing callers/tests stay valid —
+   *  omitted means "no queue activity". */
+  intents?: IntentsSection;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
   let attention = false;
+
+  // v47.5: an open intent means an agent is BLOCKED on a human;
+  // expiries mean proposals are dying un-reviewed.
+  if (args.intents != null && args.intents.pendingNow > 0) {
+    reasons.push(`${args.intents.pendingNow} agent trade(s) awaiting approval${args.intents.oldestPendingMinutes != null ? ` (oldest ${Math.round(args.intents.oldestPendingMinutes)}min)` : ""} — tradekit intents list`);
+    attention = true;
+  }
+  if (args.intents != null && args.intents.expiredInWindow > 0) {
+    reasons.push(`${args.intents.expiredInWindow} agent proposal(s) EXPIRED un-reviewed during window`);
+    attention = true;
+  }
 
   if (args.safety.drawdownTrips > 0) {
     reasons.push(`drawdown breaker tripped ${args.safety.drawdownTrips}× during window`);
