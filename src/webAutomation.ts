@@ -390,6 +390,165 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── v42: backtest results (read-only) ──────────────────────
+  // The CLI/MCP run the simulations; the web tab makes three rounds
+  // of backtest investment VISIBLE — risk metrics, the strategy-vs-
+  // hold equity curves (persisted downsampled in metrics_json), the
+  // fire timeline. List is intentionally light (no fires/metrics
+  // payloads); detail hydrates one run fully.
+  app.get(
+    "/api/backtests",
+    wrap(async (req, res) => {
+      const { listBacktestRuns } = await import("./db.js");
+      const strategyType = qStr(req, "strategyType");
+      if (strategyType && !["order", "schedule", "playbook", "rebalance"].includes(strategyType)) {
+        throw new ToolError("INVALID_PARAMS", `"strategyType" must be order | schedule | playbook | rebalance.`);
+      }
+      const rows = listBacktestRuns({
+        strategyType: strategyType as never,
+        chain: qStr(req, "chain"),
+        limit: qInt(req, "limit", { min: 1, max: 500, fallback: 50 }),
+      });
+      res.json({
+        ok: true,
+        count: rows.length,
+        runs: rows.map((r) => ({
+          id: r.id,
+          strategy_type: r.strategy_type,
+          chain: r.chain,
+          base_symbol: r.base_symbol,
+          quote_symbol: r.quote_symbol,
+          window_start: r.window_start,
+          window_end: r.window_end,
+          points: r.points,
+          fire_count: r.fire_count,
+          pnl_usd: r.pnl_usd,
+          hold_pnl_usd: r.hold_pnl_usd,
+          vs_hold_usd: r.pnl_usd - r.hold_pnl_usd,
+          has_metrics: r.metrics_json != null,
+          created_at: r.created_at,
+        })),
+      });
+    }),
+  );
+
+  app.get(
+    "/api/backtests/:id",
+    wrap(async (req, res) => {
+      const { getBacktestRunById } = await import("./db.js");
+      const id = parseInt(String(req.params.id ?? ""), 10);
+      if (!Number.isInteger(id) || id <= 0) {
+        throw new ToolError("INVALID_PARAMS", `:id must be a positive integer.`);
+      }
+      const row = getBacktestRunById(id);
+      if (!row) {
+        res.status(404).json({ ok: false, error: { code: "INVALID_PARAMS", message: `No backtest run #${id}.` } });
+        return;
+      }
+      let metrics: unknown = null;
+      if (row.metrics_json) {
+        try {
+          metrics = JSON.parse(row.metrics_json);
+        } catch {
+          metrics = null; // malformed pre-v39 data — degrade, don't 500
+        }
+      }
+      res.json({
+        ok: true,
+        run: {
+          id: row.id,
+          strategy_type: row.strategy_type,
+          chain: row.chain,
+          base_symbol: row.base_symbol,
+          quote_symbol: row.quote_symbol,
+          spec: JSON.parse(row.spec_json),
+          initial_balance: JSON.parse(row.initial_balance_json),
+          final_balance: JSON.parse(row.final_balance_json),
+          window_start: row.window_start,
+          window_end: row.window_end,
+          points: row.points,
+          fires: JSON.parse(row.fires_json),
+          fire_count: row.fire_count,
+          pnl_usd: row.pnl_usd,
+          hold_pnl_usd: row.hold_pnl_usd,
+          vs_hold_usd: row.pnl_usd - row.hold_pnl_usd,
+          notes: row.notes,
+          metrics,
+          created_at: row.created_at,
+        },
+      });
+    }),
+  );
+
+  app.get(
+    "/api/backtest-comparisons",
+    wrap(async (req, res) => {
+      const { listBacktestComparisons } = await import("./db.js");
+      const rows = listBacktestComparisons({
+        chain: qStr(req, "chain"),
+        limit: qInt(req, "limit", { min: 1, max: 200, fallback: 25 }),
+      });
+      res.json({
+        ok: true,
+        count: rows.length,
+        comparisons: rows.map((r) => {
+          let scenarios: Array<{ scenarioName?: string }> = [];
+          try {
+            scenarios = JSON.parse(r.results_json) as Array<{ scenarioName?: string }>;
+          } catch {
+            // tolerate malformed rows
+          }
+          return {
+            id: r.id,
+            name: r.name,
+            chain: r.chain,
+            base_symbol: r.base_symbol,
+            quote_symbol: r.quote_symbol,
+            window_start: r.window_start,
+            window_end: r.window_end,
+            scenario_count: scenarios.length,
+            winner_idx: r.winner_idx,
+            winner: r.winner_idx != null ? (scenarios[r.winner_idx]?.scenarioName ?? null) : null,
+            created_at: r.created_at,
+          };
+        }),
+      });
+    }),
+  );
+
+  app.get(
+    "/api/backtest-comparisons/:id",
+    wrap(async (req, res) => {
+      const { getBacktestComparisonById } = await import("./db.js");
+      const id = parseInt(String(req.params.id ?? ""), 10);
+      if (!Number.isInteger(id) || id <= 0) {
+        throw new ToolError("INVALID_PARAMS", `:id must be a positive integer.`);
+      }
+      const row = getBacktestComparisonById(id);
+      if (!row) {
+        res.status(404).json({ ok: false, error: { code: "INVALID_PARAMS", message: `No comparison #${id}.` } });
+        return;
+      }
+      res.json({
+        ok: true,
+        comparison: {
+          id: row.id,
+          name: row.name,
+          chain: row.chain,
+          base_symbol: row.base_symbol,
+          quote_symbol: row.quote_symbol,
+          window_start: row.window_start,
+          window_end: row.window_end,
+          winner_idx: row.winner_idx,
+          scenarios: JSON.parse(row.results_json),
+          // run_ids is comma-joined in the column, not JSON
+          run_ids: row.run_ids.split(",").filter(Boolean).map((x) => parseInt(x, 10)),
+          created_at: row.created_at,
+        },
+      });
+    }),
+  );
+
   // ── funding runway ────────────────────────────────────────
   // On-demand (the UI computes it behind a button, not on the
   // auto-refresh loop): real buckets read on-chain balances, which

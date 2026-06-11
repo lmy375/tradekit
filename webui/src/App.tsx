@@ -24,6 +24,7 @@ import { Timeline } from "./pages/Timeline";
 import { Strategy } from "./pages/Strategy";
 import { Trades } from "./pages/Trades";
 import { PnL } from "./pages/PnL";
+import { Backtests } from "./pages/Backtests";
 import { Approvals } from "./pages/Approvals";
 import { Audit } from "./pages/Audit";
 import { ConfigPage } from "./pages/Config";
@@ -43,6 +44,7 @@ const TABS = [
   { value: "chart", label: "Chart", el: Chart },
   { value: "trades", label: "Trades", el: Trades },
   { value: "pnl", label: "PnL", el: PnL },
+  { value: "backtests", label: "Backtests", el: Backtests },
   { value: "approvals", label: "Approvals", el: Approvals },
   { value: "audit", label: "Audit", el: Audit },
   { value: "config", label: "Config", el: ConfigPage },

@@ -559,3 +559,117 @@ describe("GET /api/gains", () => {
     expect(r.status).toBe(400);
   });
 });
+
+// ── v42: backtest endpoints ──────────────────────────────────
+
+describe("/api/backtests", () => {
+  async function seedRun(over: Record<string, unknown> = {}): Promise<number> {
+    const { insertBacktestRun } = await import("./db.js");
+    return insertBacktestRun({
+      strategyType: "schedule",
+      chain: "base",
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      specJson: JSON.stringify({ side: "buy", cron: "0 0 * * *", quoteAmount: 100 }),
+      initialBalanceJson: JSON.stringify({ USDC: 1000 }),
+      finalBalanceJson: JSON.stringify({ ETH: 0.5, USDC: 0 }),
+      windowStart: "2026-05-01T00:00:00Z",
+      windowEnd: "2026-05-30T00:00:00Z",
+      points: 30,
+      firesJson: JSON.stringify([
+        { ts: "2026-05-02T00:00:00Z", action: "fill", priceUsd: 2000, baseDelta: 0.05, quoteDelta: -100, gasCostUsd: 1, slippageCostUsd: 0.5 },
+      ]),
+      fireCount: 1,
+      pnlUsd: 42.5,
+      holdPnlUsd: 10,
+      notes: "test run",
+      metricsJson: JSON.stringify({
+        metrics: { maxDrawdownPct: 12.5, curve: [{ ts: "2026-05-01T00:00:00Z", equityUsd: 1000 }, { ts: "2026-05-30T00:00:00Z", equityUsd: 1042.5 }] },
+        holdMetrics: { maxDrawdownPct: 20, curve: [] },
+      }),
+      ...over,
+    });
+  }
+
+  it("lists runs newest-first with summary fields, no heavy payloads", async () => {
+    const id = await seedRun();
+    const r = await get("/api/backtests");
+    expect(r.status).toBe(200);
+    const runs = r.body.runs as Array<Record<string, unknown>>;
+    const row = runs.find((x) => x.id === id)!;
+    expect(row.strategy_type).toBe("schedule");
+    expect(row.pnl_usd).toBe(42.5);
+    expect(row.vs_hold_usd).toBe(32.5);
+    expect(row.has_metrics).toBe(true);
+    expect(row.fires).toBeUndefined(); // list stays light
+    expect(row.metrics).toBeUndefined();
+  });
+
+  it("filters by strategyType; rejects unknown types", async () => {
+    await seedRun();
+    const ok = await get("/api/backtests?strategyType=order");
+    expect(ok.status).toBe(200);
+    expect((ok.body.runs as Array<{ strategy_type: string }>).every((x) => x.strategy_type === "order")).toBe(true);
+    const bad = await get("/api/backtests?strategyType=nonsense");
+    expect(bad.status).toBe(400);
+  });
+
+  it("detail hydrates spec/fires/metrics; 404 on missing id", async () => {
+    const id = await seedRun();
+    const r = await get(`/api/backtests/${id}`);
+    expect(r.status).toBe(200);
+    const run = r.body.run as Record<string, unknown>;
+    expect((run.spec as { cron: string }).cron).toBe("0 0 * * *");
+    expect((run.fires as unknown[]).length).toBe(1);
+    const metrics = run.metrics as { metrics: { maxDrawdownPct: number; curve: unknown[] }; holdMetrics: { maxDrawdownPct: number } };
+    expect(metrics.metrics.maxDrawdownPct).toBe(12.5);
+    expect(metrics.holdMetrics.maxDrawdownPct).toBe(20);
+    expect(metrics.metrics.curve.length).toBe(2);
+
+    expect((await get("/api/backtests/999999")).status).toBe(404);
+    expect((await get("/api/backtests/abc")).status).toBe(400);
+  });
+
+  it("a run without metrics serves metrics:null (pre-v39 rows)", async () => {
+    const id = await seedRun({ metricsJson: null });
+    const r = await get(`/api/backtests/${id}`);
+    expect(r.body.run).toMatchObject({ metrics: null });
+    const list = await get("/api/backtests");
+    const row = (list.body.runs as Array<Record<string, unknown>>).find((x) => x.id === id)!;
+    expect(row.has_metrics).toBe(false);
+  });
+});
+
+describe("/api/backtest-comparisons", () => {
+  it("lists comparisons with winner name; detail hydrates scenarios", async () => {
+    const { insertBacktestComparison } = await import("./db.js");
+    const id = insertBacktestComparison({
+      name: "trail-sweep",
+      scenariosJson: JSON.stringify({ name: "trail-sweep", scenarios: [] }),
+      resultsJson: JSON.stringify([
+        { scenarioName: "5pct", runId: 1, pnlUsd: 10, holdPnlUsd: 5, vsHoldUsd: 5, fireCount: 1, finalUsd: 1010, maxDrawdownPct: 8 },
+        { scenarioName: "10pct", runId: 2, pnlUsd: 30, holdPnlUsd: 5, vsHoldUsd: 25, fireCount: 1, finalUsd: 1030, maxDrawdownPct: 15 },
+      ]),
+      runIds: [1, 2],
+      baseSymbol: "ETH",
+      quoteSymbol: "USDC",
+      chain: "base",
+      windowStart: "2026-05-01T00:00:00Z",
+      windowEnd: "2026-05-30T00:00:00Z",
+      winnerIdx: 1,
+    });
+    const list = await get("/api/backtest-comparisons");
+    expect(list.status).toBe(200);
+    const row = (list.body.comparisons as Array<Record<string, unknown>>).find((x) => x.id === id)!;
+    expect(row.scenario_count).toBe(2);
+    expect(row.winner).toBe("10pct");
+
+    const detail = await get(`/api/backtest-comparisons/${id}`);
+    expect(detail.status).toBe(200);
+    const cmp = detail.body.comparison as { scenarios: Array<{ maxDrawdownPct: number }>; run_ids: number[] };
+    expect(cmp.scenarios[1].maxDrawdownPct).toBe(15);
+    expect(cmp.run_ids).toEqual([1, 2]);
+
+    expect((await get("/api/backtest-comparisons/999999")).status).toBe(404);
+  });
+});

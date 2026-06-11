@@ -528,3 +528,97 @@ export const getGains = (params: { strategy?: string; mode?: string; since?: str
   if (params.since) qs.set("since", params.since);
   return api.get<GainsResp>(`/api/gains?${qs}`);
 };
+
+// ── backtest results (v42) ───────────────────────────────────
+
+export interface BacktestRunSummary {
+  id: number;
+  strategy_type: "order" | "schedule" | "playbook" | "rebalance";
+  chain: string;
+  base_symbol: string;
+  quote_symbol: string;
+  window_start: string;
+  window_end: string;
+  points: number;
+  fire_count: number;
+  pnl_usd: number;
+  hold_pnl_usd: number;
+  vs_hold_usd: number;
+  has_metrics: boolean;
+  created_at: string;
+}
+
+export interface BacktestRiskMetrics {
+  returnPct: number;
+  maxDrawdownPct: number;
+  maxDrawdownUsd: number;
+  peakTs: string | null;
+  troughTs: string | null;
+  volatilityPctAnnual: number | null;
+  sharpe: number | null;
+  timeInMarketPct: number;
+  equityStartUsd: number;
+  equityEndUsd: number;
+  curve: Array<{ ts: string; equityUsd: number }>;
+}
+
+export interface BacktestRunDetail extends Omit<BacktestRunSummary, "has_metrics"> {
+  spec: unknown;
+  initial_balance: Record<string, number>;
+  final_balance: Record<string, number>;
+  fires: Array<{
+    ts: string;
+    action: string;
+    priceUsd: number;
+    note?: string;
+    strategyId?: string;
+    multiAction?: string;
+    slippageCostUsd?: number;
+    gasCostUsd?: number;
+  }>;
+  notes: string | null;
+  metrics: { metrics: BacktestRiskMetrics | null; holdMetrics: BacktestRiskMetrics | null } | null;
+}
+
+export interface BacktestComparisonSummary {
+  id: number;
+  name: string;
+  chain: string;
+  base_symbol: string;
+  quote_symbol: string;
+  window_start: string;
+  window_end: string;
+  scenario_count: number;
+  winner_idx: number | null;
+  winner: string | null;
+  created_at: string;
+}
+
+export interface BacktestComparisonDetail extends Omit<BacktestComparisonSummary, "scenario_count" | "winner"> {
+  scenarios: Array<{
+    scenarioName: string;
+    runId: number;
+    pnlUsd: number;
+    holdPnlUsd: number;
+    vsHoldUsd: number;
+    fireCount: number;
+    finalUsd: number;
+    frictionUsd?: number;
+    maxDrawdownPct?: number | null;
+  }>;
+  run_ids: number[];
+}
+
+export const getBacktests = (params: { strategyType?: string; chain?: string; limit?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (params.strategyType) qs.set("strategyType", params.strategyType);
+  if (params.chain) qs.set("chain", params.chain);
+  if (params.limit) qs.set("limit", String(params.limit));
+  return api.get<{ ok: true; count: number; runs: BacktestRunSummary[] }>(`/api/backtests?${qs}`);
+};
+export const getBacktest = (id: number) =>
+  api.get<{ ok: true; run: BacktestRunDetail }>(`/api/backtests/${id}`);
+export const getBacktestComparisons = (limit = 25) =>
+  api.get<{ ok: true; count: number; comparisons: BacktestComparisonSummary[] }>(`/api/backtest-comparisons?limit=${limit}`);
+export const getBacktestComparison = (id: number) =>
+  api.get<{ ok: true; comparison: BacktestComparisonDetail }>(`/api/backtest-comparisons/${id}`);

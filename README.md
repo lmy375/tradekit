@@ -22,7 +22,7 @@ A production-grade CLI / MCP / Web framework for AI agents trading ERC-20 tokens
 - **On-chain backfill** — `tradekit trades sync` scans on-chain Transfer logs to import trades made outside tradekit (Uniswap UI, MEV bots, custom routers). Idempotent on tx_hash; bookmark-resumed across cron runs.
 - **Stuck-tx recovery** — `tradekit pending` diagnoses every pending tx (gas underpriced / nonce blocked / stale) with structured verdict; `tradekit tx speedup` / `tx cancel` for replacement-at-same-nonce.
 - **Audit log** — every MCP / CLI / web invocation lands in `audit_log` with caller, params, result, tx hash. Inspect with `tradekit audit` / `tradekit audit summary`.
-- **Web UI** — config, holdings, trade, PnL, audit, TradingView Lightweight Charts K-line backed by OKX public data.
+- **Web UI** — config, holdings, trade, PnL, backtests (risk metrics + strategy-vs-hold equity curves), audit, TradingView Lightweight Charts K-line backed by OKX public data.
 - **Structured errors + structured actions** for agents — every failure has a stable `code` + `next_actions`; every monitoring/diagnostic success has `severity` + `recommendedActions[]` for at-a-glance branching.
 - **Cron-friendly monitoring** — `--summary` (one-line digest) + `--strict` (exit 1 on actionable state) + `--watch N` (re-run every N sec, JSONL stream under `--json`) across health, doctor, verify, reconcile, trades sync.
 - **Encrypted backup** — `tradekit backup export/restore` for full-state archival; CLI-only (off the agent surface for safety).
@@ -1536,6 +1536,8 @@ tradekit backtest playbook ./strategy.json --balance '{"USDC":3000}'   --costs-f
 ```
 
 The pair persists to `backtest_runs.metrics_json` (the price series itself is never stored, so metrics can't be recomputed later) — `backtest show <id>` re-renders the risk block offline, and `backtest compare` adds a per-scenario `MAX DD` column so a sweep winner that wins by leverage-shaped risk is visible at a glance. Flat curves report `sharpe —` (null), never ±Infinity.
+
+**Web view (v42).** The **Backtests tab** makes the runs browsable: a filterable run list (`GET /api/backtests`, summary-only — heavy payloads stay in the detail route), click-through to per-run detail (`GET /api/backtests/:id`) with the **strategy and hold equity curves overlaid on one y-scale** (solid vs dashed — the shape comparison text output can't show), the full risk-metric pair, the fill timeline with per-fill friction, and the comparison tables with winner marks and MAX DD (`GET /api/backtest-comparisons[/:id]`). All four endpoints are read-only and serve straight from `backtest_runs`/`backtest_comparisons` — the web surface never runs simulations; CLI/MCP produce, the tab consumes.
 
 **What's NOT simulated.** Pool-impact/MEV (the data resolution doesn't support depth modeling — v40 costs are a flat per-fill model, not price-impact curves), safety guardrails (operators want to know "would the trigger have fired"; guardrails would mask that signal). The strategy spec is what you validate; the live engine adds the production behaviors on top.
 
