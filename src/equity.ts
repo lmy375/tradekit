@@ -16,6 +16,7 @@
 
 import { listPortfolioSnapshots, listSnapshotScopes } from "./db.js";
 import { ToolError } from "./errors.js";
+import { metricsFromCurve } from "./backtestMetrics.js";
 
 export interface EquityPoint {
   at: string;
@@ -39,6 +40,19 @@ export interface EquityCurve {
   peakAt: string | null;
   /** Max peak-to-trough drawdown across the window, percent. */
   maxDrawdownPct: number | null;
+  /** v46: live risk metrics — the SAME math the backtest risk block
+   *  uses (metricsFromCurve), applied to the snapshot curve. Null
+   *  when the curve has no points. Time-in-market is not computed
+   *  for live curves (snapshots don't carry a stable/risk split). */
+  risk: {
+    returnPct: number;
+    maxDrawdownPct: number;
+    maxDrawdownUsd: number;
+    peakTs: string | null;
+    troughTs: string | null;
+    volatilityPctAnnual: number | null;
+    sharpe: number | null;
+  } | null;
   /** Other scopes that exist (for pickers). */
   availableScopes: Array<{ accountsKey: string; chainsKey: string; count: number; lastAt: string }>;
 }
@@ -84,7 +98,7 @@ export function buildEquityCurve(args: {
         accountsKey: "", chainsKey: "", scopeSource: "defaulted",
         points: [], firstAt: null, lastAt: null, firstUsd: null, lastUsd: null,
         changeAbs: null, changePct: null, peakUsd: null, peakAt: null,
-        maxDrawdownPct: null, availableScopes,
+        maxDrawdownPct: null, risk: null, availableScopes,
       };
     }
     accountsKey = best.accounts_key;
@@ -122,6 +136,25 @@ export function buildEquityCurve(args: {
     }
   }
 
+  // v46: full-resolution risk metrics via the backtest's shared math.
+  // Computed over ALL points (not the downsampled view) — annualization
+  // infers the cadence from the snapshot timestamps themselves, so
+  // hourly and daily snapshot feeds both annualize correctly.
+  const full = metricsFromCurve({
+    curve: points.map((p) => ({ ts: p.at, equityUsd: p.totalUsd })),
+  });
+  const risk = full
+    ? {
+        returnPct: full.returnPct,
+        maxDrawdownPct: full.maxDrawdownPct,
+        maxDrawdownUsd: full.maxDrawdownUsd,
+        peakTs: full.peakTs,
+        troughTs: full.troughTs,
+        volatilityPctAnnual: full.volatilityPctAnnual,
+        sharpe: full.sharpe,
+      }
+    : null;
+
   const first = points[0] ?? null;
   const last = points[points.length - 1] ?? null;
   const changeAbs = first && last ? last.totalUsd - first.totalUsd : null;
@@ -141,6 +174,7 @@ export function buildEquityCurve(args: {
     peakUsd,
     peakAt,
     maxDrawdownPct,
+    risk,
     availableScopes,
   };
 }

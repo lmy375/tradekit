@@ -165,3 +165,48 @@ describe("runSnapshotTick", () => {
     expect(listPortfolioSnapshots({ limit: 5 })).toHaveLength(0);
   });
 });
+
+// ── v46: live risk metrics (shared math with backtest risk block) ──
+
+describe("buildEquityCurve — risk metrics", () => {
+  it("hand-computed drawdown USD + vol/sharpe from daily snapshots", () => {
+    openDb().exec("DELETE FROM portfolio_snapshots");
+    const days = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"];
+    const vals = [1000, 1100, 990, 1100];
+    days.forEach((d, i) => insertPortfolioSnapshot({
+      timestamp: `${d}T00:00:00Z`, total_usd: vals[i],
+      accounts_key: "default", chains_key: "base",
+      token_count: 1, note: null, data: "{}",
+    }));
+    const c = buildEquityCurve();
+    expect(c.risk).not.toBeNull();
+    // Peak 1100 → trough 990 = −10%, −$110.
+    expect(c.risk!.maxDrawdownPct).toBeCloseTo(10, 9);
+    expect(c.risk!.maxDrawdownUsd).toBeCloseTo(110, 9);
+    expect(c.risk!.peakTs).toBe("2026-06-02T00:00:00Z");
+    expect(c.risk!.troughTs).toBe("2026-06-03T00:00:00Z");
+    expect(c.risk!.returnPct).toBeCloseTo(10, 9); // 1000 → 1100
+    // Daily cadence → vol annualizes by √365; sharpe finite.
+    expect(c.risk!.volatilityPctAnnual).toBeGreaterThan(0);
+    expect(c.risk!.sharpe).not.toBeNull();
+    // Same number the legacy field reports.
+    expect(c.risk!.maxDrawdownPct).toBeCloseTo(c.maxDrawdownPct!, 9);
+  });
+
+  it("empty scope → risk null; flat curve → zero vol, null sharpe", () => {
+    openDb().exec("DELETE FROM portfolio_snapshots");
+    expect(buildEquityCurve().risk).toBeNull();
+
+    for (let i = 0; i < 4; i++) {
+      insertPortfolioSnapshot({
+        timestamp: `2026-06-0${i + 1}T00:00:00Z`, total_usd: 500,
+        accounts_key: "default", chains_key: "base",
+        token_count: 1, note: null, data: "{}",
+      });
+    }
+    const c = buildEquityCurve();
+    expect(c.risk!.volatilityPctAnnual).toBeCloseTo(0, 12);
+    expect(c.risk!.sharpe).toBeNull(); // flat curve: no risk to adjust for
+    expect(c.risk!.maxDrawdownPct).toBe(0);
+  });
+});

@@ -490,6 +490,9 @@ STRATEGY OBSERVABILITY (iter31 — unified report; iter32 — alerts)
         rows contribute too. Scope-disciplined: one accounts×chains scope per
         curve (mixing scopes would jump on coverage, not value); defaults to
         the most-snapshotted scope.
+        v46: output includes a risk line — max drawdown (% + USD, peak→trough),
+        annualized vol + sharpe — computed by the SAME math as the backtest
+        risk block (metricsFromCurve), so live and simulated risk compare 1:1.
   runway [--chain X] [--account L] [--strategy TAG] [--days N] [--json]
         Funding-runway forecast: will my automation run out of money, and WHEN?
         Walks every active schedule's upcoming cron fires (respecting end-at +

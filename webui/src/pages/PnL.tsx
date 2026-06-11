@@ -55,6 +55,9 @@ function EquityCard() {
       <EquitySvg points={curve.points} />
       <Text size="xs" c="dimmed" ff="monospace">
         now ${curve.lastUsd?.toFixed(2)} · peak ${curve.peakUsd?.toFixed(2)} · {curve.points.length} snapshots
+        {curve.risk && (curve.risk.volatilityPctAnnual != null || curve.risk.sharpe != null)
+          ? ` · vol ${curve.risk.volatilityPctAnnual != null ? curve.risk.volatilityPctAnnual.toFixed(1) + "%/yr" : "—"} · sharpe ${curve.risk.sharpe != null ? curve.risk.sharpe.toFixed(2) : "—"}`
+          : ""}
       </Text>
     </Card>
   );

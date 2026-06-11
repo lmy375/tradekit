@@ -673,3 +673,52 @@ describe("/api/backtest-comparisons", () => {
     expect((await get("/api/backtest-comparisons/999999")).status).toBe(404);
   });
 });
+
+// ── v46: /api/execution + /api/equity risk ───────────────────
+
+describe("/api/execution", () => {
+  it("serves the execution report from seeded real trades", async () => {
+    const { insertTrade } = await import("./db.js");
+    for (let i = 0; i < 3; i++) {
+      insertTrade({
+        timestamp: new Date().toISOString(),
+        chain: "base", account: "default", direction: "buy",
+        base_token: WETH, base_symbol: "WETH", base_amount: "0.1",
+        quote_token: USDC, quote_symbol: "USDC", quote_amount: "200",
+        price: "2000", tx_hash: `0xexec${i}`, status: "success",
+        gas_used: null, gas_price_wei: null, gas_cost_native: "0.001",
+        aggregator: "kyberswap", fee_tier: null, notes: null,
+        strategy: null, realized_slippage_bps: 15,
+      });
+    }
+    const r = await get("/api/execution?since=7d");
+    expect(r.status).toBe(200);
+    const totals = r.body.totals as { fills: number; slippage: { medianBps: number } };
+    expect(totals.fills).toBeGreaterThanOrEqual(3);
+    expect(totals.slippage.medianBps).toBe(15);
+    expect((r.body.byAggregator as Array<{ aggregator: string }>).some((a) => a.aggregator === "kyberswap")).toBe(true);
+  });
+
+  it("rejects a bad since", async () => {
+    expect((await get("/api/execution?since=garbage")).status).toBe(400);
+  });
+});
+
+describe("/api/equity — v46 risk field", () => {
+  it("the curve response carries the risk metric block", async () => {
+    const { insertPortfolioSnapshot, openDb: db } = await import("./db.js");
+    db().exec("DELETE FROM portfolio_snapshots");
+    [1000, 1200, 1080].forEach((v, i) =>
+      insertPortfolioSnapshot({
+        timestamp: `2026-06-0${i + 1}T00:00:00Z`, total_usd: v,
+        accounts_key: "default", chains_key: "base",
+        token_count: 1, note: null, data: "{}",
+      }),
+    );
+    const r = await get("/api/equity");
+    expect(r.status).toBe(200);
+    const risk = r.body.risk as { maxDrawdownPct: number; maxDrawdownUsd: number };
+    expect(risk.maxDrawdownPct).toBeCloseTo(10, 6); // 1200 → 1080
+    expect(risk.maxDrawdownUsd).toBeCloseTo(120, 6);
+  });
+});

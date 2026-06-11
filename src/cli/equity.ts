@@ -59,6 +59,14 @@ export async function equityCommand(flags: Record<string, string>) {
   const sign = (curve.changeAbs ?? 0) >= 0 ? "+" : "";
   console.log(`  now ${fmt(curve.lastUsd)} · start ${fmt(curve.firstUsd)} · change ${sign}${fmt(curve.changeAbs)?.replace("$", "$")} (${sign}${curve.changePct?.toFixed(2) ?? "—"}%)`);
   console.log(`  peak ${fmt(curve.peakUsd)}${curve.peakAt ? ` on ${curve.peakAt.slice(0, 10)}` : ""} · max drawdown ${curve.maxDrawdownPct?.toFixed(2) ?? "—"}%`);
+  // v46: same risk math as the backtest risk block (metricsFromCurve).
+  if (curve.risk) {
+    const r = curve.risk;
+    const dd = r.maxDrawdownPct > 0 && r.peakTs
+      ? `max DD −${r.maxDrawdownPct.toFixed(1)}% (−$${r.maxDrawdownUsd.toFixed(2)}, ${r.peakTs.slice(5, 10)}→${r.troughTs?.slice(5, 10)})`
+      : `max DD ${r.maxDrawdownPct.toFixed(1)}%`;
+    console.log(`  risk: ${dd} · vol ${r.volatilityPctAnnual != null ? `${r.volatilityPctAnnual.toFixed(1)}%/yr` : "—"} · sharpe ${r.sharpe != null ? r.sharpe.toFixed(2) : "—"}`);
+  }
   if (curve.availableScopes.length > 1) {
     console.log(`\n  (${curve.availableScopes.length - 1} other scope(s) have snapshots — see --json availableScopes)`);
   }

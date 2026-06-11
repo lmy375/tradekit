@@ -22,7 +22,7 @@ A production-grade CLI / MCP / Web framework for AI agents trading ERC-20 tokens
 - **On-chain backfill** — `tradekit trades sync` scans on-chain Transfer logs to import trades made outside tradekit (Uniswap UI, MEV bots, custom routers). Idempotent on tx_hash; bookmark-resumed across cron runs.
 - **Stuck-tx recovery** — `tradekit pending` diagnoses every pending tx (gas underpriced / nonce blocked / stale) with structured verdict; `tradekit tx speedup` / `tx cancel` for replacement-at-same-nonce.
 - **Audit log** — every MCP / CLI / web invocation lands in `audit_log` with caller, params, result, tx hash. Inspect with `tradekit audit` / `tradekit audit summary`.
-- **Web UI** — config, holdings, trade, PnL, backtests (risk metrics + strategy-vs-hold equity curves), audit, TradingView Lightweight Charts K-line backed by OKX public data.
+- **Web UI** — config, holdings, trade, PnL, backtests (risk metrics + strategy-vs-hold equity curves), execution quality (slippage by aggregator/size + recommendations), audit, TradingView Lightweight Charts K-line backed by OKX public data.
 - **Structured errors + structured actions** for agents — every failure has a stable `code` + `next_actions`; every monitoring/diagnostic success has `severity` + `recommendedActions[]` for at-a-glance branching.
 - **Cron-friendly monitoring** — `--summary` (one-line digest) + `--strict` (exit 1 on actionable state) + `--watch N` (re-run every N sec, JSONL stream under `--json`) across health, doctor, verify, reconcile, trades sync.
 - **Encrypted backup** — `tradekit backup export/restore` for full-state archival; CLI-only (off the agent surface for safety).
@@ -1788,7 +1788,9 @@ One offline DB scan produces: **totals** (attempts/fills/failure rate, USD volum
 
 **Recommendations are deterministic and threshold-gated** — they only speak when the data clears a sample floor: aggregator preference needs ≥10 slippage-stamped fills *per aggregator* and a ≥10bps median spread (then suggests `aggregator.mode: "best"` or reordering); size-impact needs ≥5 fills per bucket and ≥15bps growth (then suggests splitting); degradation fires at +10bps recent-vs-prior median; coverage below 50% points at `tradekit reconcile` (which backfills `realized_slippage_bps` from receipts) *before* trusting the rest. No threshold crossed → "(none)", not vibes.
 
-**Paper fills are excluded by design** — their slippage is simulated, and judging execution quality from a simulation is circular (the same rule v40's `--costs-from-history` calibration follows). Transfers and incoming rows are excluded too: not swaps, nothing to measure. Agents get the same structure via MCP `execution_report`.
+**Paper fills are excluded by design** — their slippage is simulated, and judging execution quality from a simulation is circular (the same rule v40's `--costs-from-history` calibration follows). Transfers and incoming rows are excluded too: not swaps, nothing to measure. Agents get the same structure via MCP `execution_report`; the web **Execution tab** (v46, `GET /api/execution`) renders the same report — summary cards, aggregator table, size/pair cuts, trend, and the recommendations as a highlighted alert.
+
+**Live equity gets the backtest's risk math (v46).** The live equity curve (`tradekit equity`, `GET /api/equity`, web PnL card) now carries a `risk` block computed by the SAME `metricsFromCurve` the backtest risk block uses: max drawdown (% + USD + peak→trough dates), annualized volatility and Sharpe (cadence inferred from the snapshot timestamps — hourly and daily feeds both annualize correctly), and window return. One math, three surfaces: a backtest's risk profile and the live portfolio's are directly comparable because they're literally the same function.
 
 #### Incident report — the one-command postmortem (v39)
 

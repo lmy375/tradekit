@@ -496,6 +496,13 @@ export interface EquityCurveResp {
   changePct: number | null;
   peakUsd: number | null;
   maxDrawdownPct: number | null;
+  risk: {
+    returnPct: number;
+    maxDrawdownPct: number;
+    maxDrawdownUsd: number;
+    volatilityPctAnnual: number | null;
+    sharpe: number | null;
+  } | null;
   availableScopes: Array<{ accountsKey: string; chainsKey: string; count: number; lastAt: string }>;
 }
 export const getEquity = (since?: string) =>
@@ -622,3 +629,55 @@ export const getBacktestComparisons = (limit = 25) =>
   api.get<{ ok: true; count: number; comparisons: BacktestComparisonSummary[] }>(`/api/backtest-comparisons?limit=${limit}`);
 export const getBacktestComparison = (id: number) =>
   api.get<{ ok: true; comparison: BacktestComparisonDetail }>(`/api/backtest-comparisons/${id}`);
+
+// ── execution quality (v46) ──────────────────────────────────
+
+export interface SlippageStatsResp {
+  samples: number;
+  avgBps: number | null;
+  medianBps: number | null;
+  p90Bps: number | null;
+}
+
+export interface ExecutionReportResp {
+  ok: true;
+  windowLabel: string;
+  chain: string | null;
+  account: string | null;
+  totals: {
+    attempts: number;
+    fills: number;
+    failed: number;
+    pending: number;
+    successRatePct: number | null;
+    usdVolume: number;
+    slippage: SlippageStatsResp;
+    slippageCoveragePct: number | null;
+    gasByChain: Array<{ chain: string; totalNative: number; avgNative: number; samples: number }>;
+  };
+  byAggregator: Array<{
+    aggregator: string;
+    fills: number;
+    sharePct: number;
+    usdVolume: number;
+    successRatePct: number | null;
+    slippage: SlippageStatsResp;
+    avgGasNative: number | null;
+  }>;
+  byPair: Array<{ baseSymbol: string; fills: number; usdVolume: number; slippage: SlippageStatsResp }>;
+  bySize: Array<{ label: string; fills: number; slippage: SlippageStatsResp }>;
+  trend: {
+    recent: SlippageStatsResp;
+    prior: SlippageStatsResp;
+    recentDays: number;
+    deltaMedianBps: number | null;
+  } | null;
+  recommendations: string[];
+}
+
+export const getExecutionReport = (params: { since?: string; chain?: string } = {}) => {
+  const qs = new URLSearchParams();
+  if (params.since) qs.set("since", params.since);
+  if (params.chain) qs.set("chain", params.chain);
+  return api.get<ExecutionReportResp>(`/api/execution?${qs}`);
+};

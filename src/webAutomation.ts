@@ -549,6 +549,24 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── v46: execution quality (read-only, offline) ───────────
+  app.get(
+    "/api/execution",
+    wrap(async (req, res) => {
+      const { gatherExecutionReport } = await import("./executionReport.js");
+      const windowLabel = qStr(req, "since") ?? "30d";
+      const sinceIso = parseSinceDuration(windowLabel);
+      if (!sinceIso) throw new ToolError("INVALID_PARAMS", `"since" must be a duration (30d) or ISO timestamp.`);
+      const report = gatherExecutionReport({
+        windowLabel,
+        sinceIso,
+        chain: qStr(req, "chain"),
+        account: qStr(req, "account"),
+      });
+      res.json({ ok: true, ...report });
+    }),
+  );
+
   // ── funding runway ────────────────────────────────────────
   // On-demand (the UI computes it behind a button, not on the
   // auto-refresh loop): real buckets read on-chain balances, which
