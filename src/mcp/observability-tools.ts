@@ -597,6 +597,40 @@ export const registerObservabilityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── v44: execution quality ────────────────────────────────
+  server.tool(
+    "execution_report",
+    "v44: execution quality analytics over REAL fills — signed realized slippage (positive = unfavorable vs quote) cut by aggregator, pair, and order-size bucket, gas in native units per chain, a trailing-7d-vs-prior trend, and threshold-gated recommendations (aggregator preference / order splitting / degradation / low slippage coverage). Paper fills excluded (simulated slippage isn't execution quality); transfers/incoming excluded (not swaps). Deterministic + offline — one DB scan, no oracle. Use it to decide aggregator.mode (first vs best), per-fire sizing, and whether execution is degrading.",
+    {
+      since: z.string().optional().describe("Window — duration (30d, 12h) or ISO timestamp. Default 30d."),
+      chain: z.string().optional().describe("Scope to one chain."),
+      account: z.string().optional().describe("Scope to one account label."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("execution_report", rt.opts, input, input.chain, async () => {
+            const { parseSinceDuration } = await import("../timeline.js");
+            const { gatherExecutionReport } = await import("../executionReport.js");
+            const windowLabel = input.since ?? "30d";
+            const sinceIso = parseSinceDuration(windowLabel);
+            if (!sinceIso) {
+              throw new ToolError("INVALID_PARAMS", `"since" must be a duration (30d) or ISO timestamp.`);
+            }
+            return gatherExecutionReport({
+              windowLabel,
+              sinceIso,
+              chain: input.chain,
+              account: input.account,
+            });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── operator notes ────────────────────────────────────────
   server.tool(
     "note_add",

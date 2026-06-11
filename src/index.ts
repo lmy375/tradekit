@@ -583,6 +583,14 @@ async function main() {
         break;
       }
 
+      // v44: execution quality — slippage by aggregator/pair/size,
+      // trend vs prior window, threshold-gated recommendations.
+      case "execution": {
+        const { executionCommand } = await import("./cli/execution.js");
+        await executionCommand(flags);
+        break;
+      }
+
       // v39: one-command postmortem — verdict + actions + failures +
       // config changes + notes + critical/warn tail as one markdown.
       case "incident": {
@@ -775,7 +783,7 @@ async function main() {
           "holdings", "portfolio", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
-          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note", "incident",
+          "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note", "incident", "execution",
           "mcp", "web", "version", "help",
         ];
         const guess = closestCommand(command ?? "", known);

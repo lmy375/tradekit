@@ -1776,6 +1776,20 @@ tradekit config rollback 13 --yes      # schema-validated restore + SIGHUP hot-r
 
 Design points: recording is **best-effort and never blocks the save** (the file write is the contract); it only starts once the DB exists (a pure-config user doesn't get a database spawned by `config set`); identical content dedupes by hash so idempotent re-saves don't pile rows. Rollback **parses the stored snapshot through the current schema first** — old versions forward-fill newer fields with their defaults instead of stripping them, and hard validation errors abort before anything is written. A rollback records a *new* version: history only grows, the mistaken version stays for forensics. Prunable via `db.retention.configHistoryDays`.
 
+### Execution quality report (v44)
+
+Trade execution is the core of the tool, and every real fill already records its forensics: `realized_slippage_bps` (signed — **positive = unfavorable** vs the quote), the aggregator that served it, `gas_cost_native`. `tradekit execution` is the surface that turns that record into the production decisions it can answer:
+
+```bash
+tradekit execution --since 30d [--chain base] [--account ledger]
+```
+
+One offline DB scan produces: **totals** (attempts/fills/failure rate, USD volume, signed slippage median/avg/p90, slippage *coverage* — how many fills actually carry a recorded number), **by aggregator** (fills, share, median + p90 slippage, per-aggregator success rate, volume — "which router actually serves me better"), **by pair** (top by volume), **by order size** (`<$100 / $100–1k / $1k–10k / ≥$10k` — price impact made visible), **per-chain gas in native units** (converting to USD would need a live price; honesty over one merged number), and a **trailing-7d vs prior trend** (the offline twin of the `slippage_trend` alert, with the prior window as baseline).
+
+**Recommendations are deterministic and threshold-gated** — they only speak when the data clears a sample floor: aggregator preference needs ≥10 slippage-stamped fills *per aggregator* and a ≥10bps median spread (then suggests `aggregator.mode: "best"` or reordering); size-impact needs ≥5 fills per bucket and ≥15bps growth (then suggests splitting); degradation fires at +10bps recent-vs-prior median; coverage below 50% points at `tradekit reconcile` (which backfills `realized_slippage_bps` from receipts) *before* trusting the rest. No threshold crossed → "(none)", not vibes.
+
+**Paper fills are excluded by design** — their slippage is simulated, and judging execution quality from a simulation is circular (the same rule v40's `--costs-from-history` calibration follows). Transfers and incoming rows are excluded too: not swaps, nothing to measure. Agents get the same structure via MCP `execution_report`.
+
 #### Incident report — the one-command postmortem (v39)
 
 When something goes wrong the forensic data is all there — spread across six surfaces. Assembling them under stress is exactly the work an operator shouldn't be doing:

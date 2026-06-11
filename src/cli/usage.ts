@@ -298,6 +298,19 @@ SCHEDULED / RECURRING TRADES (DCA)
         Requires engine.scheduleJournal.enabled=true (default off). Answers "why
         didn't my DCA fire this morning?". Prunable: db.retention.scheduleCheckLogDays.
 
+EXECUTION QUALITY (v44)
+  execution [--since 30d|12h|ISO] [--chain X] [--account L] [--json]
+        Execution analytics over REAL fills: signed realized slippage
+        (positive = unfavorable vs quote) cut by aggregator / pair /
+        order-size bucket, per-chain gas in native units, a trailing-7d
+        vs prior trend, and threshold-gated recommendations (prefer the
+        better aggregator or aggregator.mode "best"; split orders when
+        slippage grows with size; degradation warning; low-coverage
+        pointer at 'tradekit reconcile'). Paper fills excluded —
+        simulated slippage isn't execution quality. Deterministic +
+        offline (one DB scan, no oracle; gas stays native on purpose).
+        MCP: execution_report.
+
 INCIDENT (v39 — the one-command postmortem)
   incident [--window 4h|24h|7d] [--strategy TAG] [--out FILE] [--json]
         Compose the window's digest verdict, activity counts, CONFIG CHANGES

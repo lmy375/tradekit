@@ -494,6 +494,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "note_add", "note_list",
     // One-command postmortem (read-only composition).
     "incident_report",
+    "execution_report",
     // Iter36: forensic timeline (cross-strategy chronological events).
     "timeline_query",
     // Iter38: per-provider price-fetch observability.
