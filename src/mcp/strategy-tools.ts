@@ -476,6 +476,9 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               pnlUsd: result.pnlUsd,
               holdPnlUsd: result.holdPnlUsd,
               notes: result.notes.join("; ") || null,
+              metricsJson: result.metrics || result.holdMetrics
+                ? JSON.stringify({ metrics: result.metrics, holdMetrics: result.holdMetrics })
+                : null,
             });
             return {
               ok: true,
@@ -487,6 +490,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               pnl_usd: result.pnlUsd, hold_pnl_usd: result.holdPnlUsd,
               fires: result.fires, notes: result.notes,
               costs: result.costs,
+              metrics: result.metrics, hold_metrics: result.holdMetrics,
             };
           }),
         );
@@ -780,6 +784,9 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               pnlUsd: result.pnlUsd,
               holdPnlUsd: result.holdPnlUsd,
               notes: result.notes.join("; ") || null,
+              metricsJson: result.metrics || result.holdMetrics
+                ? JSON.stringify({ metrics: result.metrics, holdMetrics: result.holdMetrics })
+                : null,
             });
             return {
               ok: true,
@@ -794,6 +801,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
               per_strategy: result.perStrategy,
               notes: result.notes,
               costs: result.costs,
+              metrics: result.metrics, hold_metrics: result.holdMetrics,
             };
           }),
         );

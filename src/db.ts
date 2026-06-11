@@ -1237,6 +1237,15 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE orders ADD COLUMN start_at TEXT;
   `,
+
+  // v39 — backtest risk metrics (v41 feature tag). Persists the
+  // strategy + hold metric pair ({metrics, holdMetrics} JSON) so
+  // \`backtest show <id>\` re-renders the risk block offline — the
+  // price series itself is never stored, so metrics can't be
+  // recomputed later. NULL on pre-v39 rows; renderers skip the block.
+  `
+  ALTER TABLE backtest_runs ADD COLUMN metrics_json TEXT;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4726,6 +4735,8 @@ export interface BacktestRunRow {
   pnl_usd: number;
   hold_pnl_usd: number;
   notes: string | null;
+  /** v41: { metrics, holdMetrics } JSON; NULL on pre-v39 rows. */
+  metrics_json: string | null;
   created_at: string;
 }
 
@@ -4745,6 +4756,8 @@ export interface InsertBacktestRunArgs {
   pnlUsd: number;
   holdPnlUsd: number;
   notes?: string | null;
+  /** v41: JSON of { metrics, holdMetrics } (BacktestMetrics pair). */
+  metricsJson?: string | null;
 }
 
 export function insertBacktestRun(args: InsertBacktestRunArgs): number {
@@ -4756,8 +4769,8 @@ export function insertBacktestRun(args: InsertBacktestRunArgs): number {
         (strategy_type, chain, base_symbol, quote_symbol, spec_json,
          initial_balance_json, final_balance_json, window_start, window_end,
          points, fires_json, fire_count, pnl_usd, hold_pnl_usd, notes,
-         created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         metrics_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       args.strategyType,
@@ -4775,6 +4788,7 @@ export function insertBacktestRun(args: InsertBacktestRunArgs): number {
       args.pnlUsd,
       args.holdPnlUsd,
       args.notes ?? null,
+      args.metricsJson ?? null,
       now,
     );
   return Number(r.lastInsertRowid);

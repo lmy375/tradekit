@@ -1525,6 +1525,18 @@ tradekit backtest playbook ./strategy.json --balance '{"USDC":3000}'   --costs-f
 
 `--slippage-bps` degrades the side you *receive* on every fill (buy: less base, or more quote spent in fixed-base mode; sell: less quote) and flows through the balance, so compounding effects are real — and it participates in affordability (a buy that can't cover price+slippage halts). `--gas-usd` charges a flat USD per fill against final equity at valuation time (the sim tracks base+quote only; gas is actually paid from the native balance it doesn't model — charging equity avoids fake insufficient-balance halts while keeping PnL honest). `--costs-from-history` fills in whichever knob you didn't pass explicitly from the trades table: slippage = avg |`realized_slippage_bps`| over your last 50 successful **real** fills on the chain (paper fills carry *simulated* slippage — calibrating a simulation from another simulation would be circular), gas = avg `gas_cost_native` × the current native USD price. Provenance lands in the result notes so `backtest show` keeps the context. The **hold counterfactual stays frictionless on purpose** — exposing that asymmetry is the whole point. Results carry a `costs` summary (`fills`, `slippageUsd`, `gasUsd`, `totalUsd`); the text output adds a `Friction:` line and `backtest compare` a per-scenario friction footnote. Omit all three knobs and behavior is bit-for-bit the pre-v40 zero-cost sim.
 
+**Risk metrics (v41).** PnL alone is half a deploy decision — "+$50 vs hold's +$30" reads as a win until you see the strategy spent the window at 2× hold's drawdown. Every backtest result now carries a `metrics` / `hold_metrics` pair computed over the mark-to-market equity curve (rebuilt point-by-point from the fire timeline, slippage in the deltas, gas charged from each fill onward): **max drawdown** (% + USD + peak→trough dates), **annualized volatility** and **Sharpe** (rf=0, annualization inferred from the series' median spacing — 5-min/hourly/daily data all annualize correctly), **time-in-market** (fraction of the window with base exposure ≥1% of equity — a stop that exits day 2 of 30 had 27 days of zero crypto risk), and a ≤100-point downsampled equity `curve` for charting. The hold counterfactual gets the SAME metrics — risk-adjusted comparison needs both sides on one scale:
+
+```
+  Strategy PnL:  +$118.40
+  Hold PnL:      +$96.00
+  Vs hold:       outperformed by +$22.40
+  Risk:          max DD −8.2% (−$176.10, 04-12→04-19)   vol 31.4%/yr   sharpe 1.21   in-market 63%
+  Hold risk:     max DD −18.0% (−$360.00, 04-10→04-19)   vol 41.0%/yr   sharpe 0.80
+```
+
+The pair persists to `backtest_runs.metrics_json` (the price series itself is never stored, so metrics can't be recomputed later) — `backtest show <id>` re-renders the risk block offline, and `backtest compare` adds a per-scenario `MAX DD` column so a sweep winner that wins by leverage-shaped risk is visible at a glance. Flat curves report `sharpe —` (null), never ±Infinity.
+
 **What's NOT simulated.** Pool-impact/MEV (the data resolution doesn't support depth modeling — v40 costs are a flat per-fill model, not price-impact curves), safety guardrails (operators want to know "would the trigger have fired"; guardrails would mask that signal). The strategy spec is what you validate; the live engine adds the production behaviors on top.
 
 **Persisted to `backtest_runs`.** Every run gets an id (visible via `backtest list`). The strategy spec, balances, fire timeline, window, and counterfactual all persist so `backtest show <id>` re-renders without re-fetching CoinGecko data.

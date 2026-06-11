@@ -704,6 +704,12 @@ BACKTESTING (historical strategy simulation)
         predicates the live engine uses (isOrderTriggered, evaluateTrailingTrigger), so
         the simulator fires when production would have fired. CoinGecko resolution:
         ≤1 day = 5min; ≤90 days = hourly; >90 days = daily.
+        RISK METRICS (v41, all backtest commands): results carry max drawdown
+        (%/USD/peak→trough), annualized vol + sharpe, time-in-market, and a
+        downsampled equity curve — for BOTH the strategy and the hold
+        counterfactual (one scale, honest comparison). Persisted to
+        backtest_runs.metrics_json; 'backtest show' re-renders offline and
+        'backtest compare' adds a MAX DD column.
         COST-AWARE MODE (v40, all backtest commands): the default sim is friction-free,
         which flatters active strategies vs hold. --slippage-bps degrades the received
         side of every fill; --gas-usd charges a flat USD per fill against final equity;

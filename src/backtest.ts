@@ -39,6 +39,7 @@ import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
 import { parseOnFillSpec, renderOnFillSpec, onFillLegs, autoHookGroup, type OnFillSpec } from "./scheduleHooks.js";
 import { parseSizingSentinel, applyFraction } from "./sizing.js";
+import { computeBacktestMetrics, type BacktestMetrics } from "./backtestMetrics.js";
 import type { OrderSide, OrderTrigger } from "./db.js";
 
 // ── price series ─────────────────────────────────────────────
@@ -235,6 +236,11 @@ export interface BacktestResult {
   windowEnd: string;
   /** v40: friction summary — null when the sim ran cost-free. */
   costs: SimCostSummary | null;
+  /** v41: risk metrics over the mark-to-market equity curve. */
+  metrics: BacktestMetrics | null;
+  /** v41: the SAME metrics for the frictionless hold counterfactual —
+   *  risk-adjusted comparison needs both sides on one scale. */
+  holdMetrics: BacktestMetrics | null;
 }
 
 // ── order simulation ─────────────────────────────────────────
@@ -636,6 +642,11 @@ function buildResult(args: {
   const holdFinalUsd = initialBase * endPrice + initialQuote;
   const holdPnlUsd = holdFinalUsd - initialUsd;
 
+  // v41: risk metrics — strategy curve (real fires) vs hold curve
+  // (no fires, no costs). Same series, same scale.
+  const metrics = computeBacktestMetrics({ initialBalance, fires, series, baseSymbol, quoteSymbol });
+  const holdMetrics = computeBacktestMetrics({ initialBalance, fires: [], series, baseSymbol, quoteSymbol });
+
   if (costSummary && costSummary.fills > 0) {
     notes.push(
       `costs: ${costSummary.slippageBps}bps slippage + $${formatNum(costSummary.gasUsdPerFire)}/fire gas × ${costSummary.fills} fill(s) = $${formatNum(costSummary.totalUsd)} total friction`,
@@ -654,6 +665,8 @@ function buildResult(args: {
     windowStart: first.ts,
     windowEnd: last.ts,
     costs: costSummary,
+    metrics,
+    holdMetrics,
   };
 }
 
@@ -811,6 +824,9 @@ export interface PlaybookBacktestResult {
   perStrategy: PlaybookStrategyStat[];
   /** v40: friction summary — null when the sim ran cost-free. */
   costs: SimCostSummary | null;
+  /** v41: risk metrics (strategy vs frictionless hold). */
+  metrics: BacktestMetrics | null;
+  holdMetrics: BacktestMetrics | null;
 }
 
 /** Walks a single price series, evaluating every order + schedule
@@ -937,6 +953,8 @@ export function simulatePlaybook(args: {
     windowEnd: built.windowEnd,
     perStrategy,
     costs: built.costs,
+    metrics: built.metrics,
+    holdMetrics: built.holdMetrics,
   };
 }
 

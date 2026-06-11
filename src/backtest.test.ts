@@ -1657,3 +1657,51 @@ describe("cost-aware backtests (SimCosts)", () => {
     expect(gross.pnlUsd - net.pnlUsd).toBeCloseTo(net.costs!.totalUsd, 6);
   });
 });
+
+// ── v41: risk metrics ride along on every sim result ─────────
+
+describe("sim results carry risk metrics (v41)", () => {
+  it("simulateOrder: strategy metrics diverge from hold after the exit", () => {
+    // Trailing-stop sells at 2520 (5% off the 2652 peak... simplified:
+    // price_above sell at 2500 fires at 2600), then the crash to 1300
+    // hurts HOLD only.
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2600, 1300, 1300]);
+    const r = simulateOrder({
+      spec: { side: "sell", trigger: "price_above", targetPriceUsd: 2500, baseAmount: 1 },
+      baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 1, USDC: 0 }, series,
+    });
+    expect(r.metrics).not.toBeNull();
+    expect(r.holdMetrics).not.toBeNull();
+    // Strategy exited at 2600 → flat through the crash → zero drawdown.
+    expect(r.metrics!.maxDrawdownPct).toBe(0);
+    // Hold rode 2600 → 1300 = −50%.
+    expect(r.holdMetrics!.maxDrawdownPct).toBeCloseTo(50, 9);
+    // In market only points 0-1 (sold AT point 1, so exposure ends there).
+    expect(r.metrics!.timeInMarketPct).toBeCloseTo(25, 9);
+    expect(r.holdMetrics!.timeInMarketPct).toBe(100);
+    // Equity end matches the result's final USD accounting.
+    expect(r.metrics!.equityEndUsd).toBeCloseTo(r.finalUsd, 9);
+    expect(r.holdMetrics!.equityEndUsd).toBeCloseTo(r.holdFinalUsd, 9);
+  });
+
+  it("playbook result carries the same metric pair; gas shows in the curve", () => {
+    const spec = parsePlaybookSpec({
+      name: "metrics-dca",
+      strategies: [
+        { id: "dca", type: "schedule", side: "buy", cron: "0 0 * * *", quoteAmount: 500, base: "ETH", quote: "USDC", maxRuns: 2 },
+      ],
+    });
+    const series = dailySeries("2026-04-01T00:00:00Z", [2000, 2000, 2000]);
+    const r = simulatePlaybook({
+      spec, baseSymbol: "ETH", quoteSymbol: "USDC",
+      initialBalance: { ETH: 0, USDC: 1000 }, series,
+      costs: { slippageBps: 0, gasUsdPerFire: 5 },
+    });
+    expect(r.metrics!.equityEndUsd).toBeCloseTo(r.finalUsd, 9);
+    // 2 fires × $5 gas, flat price, zero slippage → end equity 990.
+    expect(r.metrics!.equityEndUsd).toBeCloseTo(990, 9);
+    // Hold curve never pays the gas.
+    expect(r.holdMetrics!.equityEndUsd).toBeCloseTo(1000, 9);
+  });
+});

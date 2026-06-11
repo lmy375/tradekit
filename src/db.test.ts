@@ -2104,3 +2104,27 @@ describe("recentGasStats — account=null aggregates across accounts (v40)", () 
     expect(all.avgGasNative).toBeCloseTo(0.002, 12);
   });
 });
+
+// ── backtest_runs.metrics_json round trip (v41) ──────────────
+
+describe("backtest_runs metrics_json", () => {
+  it("persists and reads back the metric pair; omitting it stays NULL", async () => {
+    const { insertBacktestRun, getBacktestRunById } = await import("./db.js");
+    const base = {
+      strategyType: "order" as const, chain: "base", baseSymbol: "ETH", quoteSymbol: "USDC",
+      specJson: "{}", initialBalanceJson: "{}", finalBalanceJson: "{}",
+      windowStart: "2026-04-01T00:00:00Z", windowEnd: "2026-04-02T00:00:00Z",
+      points: 2, firesJson: "[]", fireCount: 0, pnlUsd: 0, holdPnlUsd: 0,
+    };
+    const withMetrics = insertBacktestRun({
+      ...base,
+      metricsJson: JSON.stringify({ metrics: { maxDrawdownPct: 12.5 }, holdMetrics: { maxDrawdownPct: 20 } }),
+    });
+    const row = getBacktestRunById(withMetrics)!;
+    const parsed = JSON.parse(row.metrics_json!) as { metrics: { maxDrawdownPct: number } };
+    expect(parsed.metrics.maxDrawdownPct).toBe(12.5);
+
+    const without = insertBacktestRun(base);
+    expect(getBacktestRunById(without)!.metrics_json).toBeNull();
+  });
+});

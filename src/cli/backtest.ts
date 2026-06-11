@@ -45,6 +45,7 @@ import {
   type PriceSeries,
   type SimCosts,
 } from "../backtest.js";
+import type { BacktestMetrics } from "../backtestMetrics.js";
 import { parsePlaybookSpec, type PlaybookSpec } from "../playbooks.js";
 import {
   insertBacktestRun,
@@ -166,6 +167,29 @@ function fmtSignedUsd(n: number): string {
   return `${s}$${n.toFixed(2)}`;
 }
 
+/** v41: serialize the metric pair for the backtest_runs row. */
+function metricsJsonOf(r: { metrics: BacktestMetrics | null; holdMetrics: BacktestMetrics | null }): string | null {
+  if (r.metrics == null && r.holdMetrics == null) return null;
+  return JSON.stringify({ metrics: r.metrics, holdMetrics: r.holdMetrics });
+}
+
+/** v41: the risk block — strategy and hold on ONE scale. The curve
+ *  array is for JSON consumers; text mode shows the derived numbers. */
+function riskLines(metrics: BacktestMetrics | null, holdMetrics: BacktestMetrics | null): string[] {
+  if (!metrics) return [];
+  const fmtM = (m: BacktestMetrics) => {
+    const dd = m.maxDrawdownPct > 0
+      ? `max DD −${m.maxDrawdownPct.toFixed(1)}% (−$${m.maxDrawdownUsd.toFixed(2)}${m.peakTs ? `, ${m.peakTs.slice(5, 10)}→${m.troughTs?.slice(5, 10)}` : ""})`
+      : `max DD 0%`;
+    const vol = m.volatilityPctAnnual != null ? `vol ${m.volatilityPctAnnual.toFixed(1)}%/yr` : "vol —";
+    const sharpe = m.sharpe != null ? `sharpe ${m.sharpe.toFixed(2)}` : "sharpe —";
+    return `${dd}   ${vol}   ${sharpe}`;
+  };
+  const lines = [`  Risk:          ${fmtM(metrics)}   in-market ${metrics.timeInMarketPct.toFixed(0)}%`];
+  if (holdMetrics) lines.push(`  Hold risk:     ${fmtM(holdMetrics)}`);
+  return lines;
+}
+
 // ── render ───────────────────────────────────────────────────
 
 function renderResultText(args: {
@@ -192,6 +216,7 @@ function renderResultText(args: {
   if (result.costs) {
     lines.push(`  Friction:      $${result.costs.totalUsd.toFixed(2)} (slippage $${result.costs.slippageUsd.toFixed(2)} + gas $${result.costs.gasUsd.toFixed(2)} over ${result.costs.fills} fill(s)) — hold pays none`);
   }
+  lines.push(...riskLines(result.metrics, result.holdMetrics));
   lines.push("");
   lines.push(`  Final balance:`);
   for (const [sym, amt] of Object.entries(result.finalBalance)) {
@@ -252,6 +277,8 @@ function buildJsonResult(args: {
     fires: result.fires,
     notes: result.notes,
     costs: result.costs,
+    metrics: result.metrics,
+    hold_metrics: result.holdMetrics,
   };
 }
 
@@ -349,6 +376,7 @@ export async function backtestOrderCommand(flags: Record<string, string>) {
     pnlUsd: result.pnlUsd,
     holdPnlUsd: result.holdPnlUsd,
     notes: result.notes.join("; ") || null,
+    metricsJson: metricsJsonOf(result),
   });
 
   if (flags["json"] != null) {
@@ -453,6 +481,7 @@ export async function backtestScheduleCommand(flags: Record<string, string>) {
     pnlUsd: result.pnlUsd,
     holdPnlUsd: result.holdPnlUsd,
     notes: result.notes.join("; ") || null,
+    metricsJson: metricsJsonOf(result),
   });
 
   if (flags["json"] != null) {
@@ -542,6 +571,7 @@ function hydrateRow(row: BacktestRunRow) {
     pnl_usd: row.pnl_usd,
     hold_pnl_usd: row.hold_pnl_usd,
     notes: row.notes,
+    metrics: row.metrics_json ? JSON.parse(row.metrics_json) : null,
     created_at: row.created_at,
   };
 }
@@ -564,6 +594,14 @@ function renderRowText(row: BacktestRunRow): string {
   const diff = row.pnl_usd - row.hold_pnl_usd;
   const verb = diff >= 0 ? "outperformed" : "underperformed";
   lines.push(`  Vs hold:       ${verb} by ${fmtSignedUsd(diff)}`);
+  if (row.metrics_json) {
+    try {
+      const m = JSON.parse(row.metrics_json) as { metrics: BacktestMetrics | null; holdMetrics: BacktestMetrics | null };
+      lines.push(...riskLines(m.metrics, m.holdMetrics));
+    } catch {
+      // pre-v39 rows / malformed JSON — render without the risk block
+    }
+  }
   if (row.notes) {
     lines.push(`  Notes:         ${row.notes}`);
   }
@@ -721,6 +759,7 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
     pnlUsd: result.pnlUsd,
     holdPnlUsd: result.holdPnlUsd,
     notes: result.notes.join("; ") || null,
+    metricsJson: metricsJsonOf(result),
   });
 
   if (flags["json"] != null) {
@@ -747,6 +786,8 @@ export async function backtestPlaybookCommand(flags: Record<string, string>, pos
       per_strategy: result.perStrategy,
       notes: result.notes,
       costs: result.costs,
+      metrics: result.metrics,
+      hold_metrics: result.holdMetrics,
     });
     return;
   }
@@ -792,6 +833,7 @@ function renderPlaybookResult(args: {
   if (result.costs) {
     lines.push(`  Friction:      $${result.costs.totalUsd.toFixed(2)} (slippage $${result.costs.slippageUsd.toFixed(2)} + gas $${result.costs.gasUsd.toFixed(2)} over ${result.costs.fills} fill(s)) — hold pays none`);
   }
+  lines.push(...riskLines(result.metrics, result.holdMetrics));
   lines.push(``);
   lines.push(`  Final balance:`);
   for (const [sym, amt] of Object.entries(result.finalBalance)) {

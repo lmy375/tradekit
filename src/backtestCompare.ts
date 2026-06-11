@@ -187,6 +187,9 @@ export interface ScenarioResult {
   /** v40: total USD friction paid (slippage + gas); 0 when the
    *  comparison ran cost-free. */
   frictionUsd: number;
+  /** v41: max peak-to-trough drawdown of the scenario's equity curve,
+   *  percent. Null on pre-v41 persisted comparisons. */
+  maxDrawdownPct?: number | null;
 }
 
 export interface ComparisonOutcome {
@@ -369,6 +372,9 @@ export function runComparison(args: RunComparisonArgs): ComparisonOutcome {
       fireCount: simResult.fires.filter((f) => f.multiAction === "fill").length,
       pnlUsd: simResult.pnlUsd,
       holdPnlUsd: simResult.holdPnlUsd,
+      metricsJson: simResult.metrics || simResult.holdMetrics
+        ? JSON.stringify({ metrics: simResult.metrics, holdMetrics: simResult.holdMetrics })
+        : null,
       notes:
         (simResult.notes.join("; ") || "") +
         (simResult.notes.length ? " | " : "") +
@@ -390,6 +396,7 @@ export function runComparison(args: RunComparisonArgs): ComparisonOutcome {
       perStrategy: simResult.perStrategy,
       hadAnyFill: fills.length > 0,
       frictionUsd: simResult.costs?.totalUsd ?? 0,
+      maxDrawdownPct: simResult.metrics?.maxDrawdownPct ?? null,
     });
   });
 
@@ -459,13 +466,14 @@ export function renderComparison(outcome: ComparisonOutcome): string {
   lines.push(``);
   // Column widths sized to ~80-col terminal.
   const nameW = Math.max(20, Math.max(...outcome.scenarios.map((s) => s.scenarioName.length)) + 2);
-  const header = `  ${"NAME".padEnd(nameW)} ${"PNL".padStart(12)}  ${"VS HOLD".padStart(11)}  ${"FIRES".padStart(5)}  ${"FINAL USD".padStart(11)}  ${"RUN".padStart(4)}  WINNER`;
+  const header = `  ${"NAME".padEnd(nameW)} ${"PNL".padStart(12)}  ${"VS HOLD".padStart(11)}  ${"MAX DD".padStart(7)}  ${"FIRES".padStart(5)}  ${"FINAL USD".padStart(11)}  ${"RUN".padStart(4)}  WINNER`;
   lines.push(header);
   lines.push(`  ${"-".repeat(header.length - 2)}`);
   outcome.scenarios.forEach((s, i) => {
     const winnerMark = i === outcome.winnerIdx ? "  ★" : "";
+    const dd = s.maxDrawdownPct != null ? `−${s.maxDrawdownPct.toFixed(1)}%` : "—";
     lines.push(
-      `  ${s.scenarioName.padEnd(nameW)} ${fmtSignedUsd(s.pnlUsd).padStart(12)}  ${fmtSignedUsd(s.vsHoldUsd).padStart(11)}  ${String(s.fireCount).padStart(5)}  ${fmtUsd(s.finalUsd).padStart(11)}  #${String(s.runId).padStart(3)}${winnerMark}`,
+      `  ${s.scenarioName.padEnd(nameW)} ${fmtSignedUsd(s.pnlUsd).padStart(12)}  ${fmtSignedUsd(s.vsHoldUsd).padStart(11)}  ${dd.padStart(7)}  ${String(s.fireCount).padStart(5)}  ${fmtUsd(s.finalUsd).padStart(11)}  #${String(s.runId).padStart(3)}${winnerMark}`,
     );
   });
   // Counterfactual row.
@@ -473,7 +481,7 @@ export function renderComparison(outcome: ComparisonOutcome): string {
   if (firstScenario) {
     lines.push(``);
     lines.push(
-      `  ${"HOLD (no trades)".padEnd(nameW)} ${fmtSignedUsd(firstScenario.holdPnlUsd).padStart(12)}  ${"—".padStart(11)}  ${"0".padStart(5)}  ${fmtUsd(firstScenario.initialUsd + firstScenario.holdPnlUsd).padStart(11)}  ${"—".padStart(4)}`,
+      `  ${"HOLD (no trades)".padEnd(nameW)} ${fmtSignedUsd(firstScenario.holdPnlUsd).padStart(12)}  ${"—".padStart(11)}  ${"—".padStart(7)}  ${"0".padStart(5)}  ${fmtUsd(firstScenario.initialUsd + firstScenario.holdPnlUsd).padStart(11)}  ${"—".padStart(4)}`,
     );
   }
   // v40: friction footnote — PnL above is NET of these costs; the
