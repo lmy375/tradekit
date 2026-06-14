@@ -64,7 +64,7 @@ describe("verdict tiers", () => {
       minTradeIntervalMs: 60_000,
       positionCaps: [{ pattern: "playbook:*", token: "WETH", maxBaseAmount: 1 }],
       drawdownCircuitBreaker: { enabled: true, maxDrawdownPct: 15, autoResumeAtPct: null, scope: "global" },
-      tradeApproval: { enabled: true, thresholdUsd: 100, expiresMinutes: 60 },
+      tradeApproval: { enabled: true, thresholdUsd: 100, expiresMinutes: 60, requireForNewToken: false },
     });
     expect(r.counts.critical).toBe(0);
     expect(r.counts.warn).toBe(0);

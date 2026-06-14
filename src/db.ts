@@ -1340,6 +1340,14 @@ const MIGRATIONS: string[] = [
   CREATE INDEX idx_preflight_runs_ts ON preflight_runs (timestamp);
   CREATE INDEX idx_preflight_runs_verdict ON preflight_runs (verdict, timestamp);
   `,
+
+  // v64 — v101: the risk-aware approval gate records WHY a trade was routed to
+  // a human (size threshold vs new-token novelty), as a JSON array of reason
+  // strings, so the CLI + intents_list show the reviewer exactly which trigger
+  // fired instead of just "pending". NULL on pre-v101 intents.
+  `
+  ALTER TABLE trade_intents ADD COLUMN approval_reasons_json TEXT;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -2883,6 +2891,27 @@ export function mostRecentTradeTimestamp(account: string, chain?: string): strin
   return row?.timestamp ?? null;
 }
 
+/**
+ * v101: has this account ever recorded a SUCCESSFUL fill of `baseToken` on
+ * `chain`? Used by the risk-aware approval gate to detect a "new token" — a
+ * base asset the operator has never traded before, the classic prompt-injection
+ * onboarding vector (a small buy of an attacker token slips under a USD
+ * threshold). Counts success only — a failed/pending attempt doesn't make a
+ * token "known". Matches base_token in EITHER buy or sell direction (once
+ * you've held it, it's no longer novel).
+ */
+export function hasPriorTokenFill(args: { account: string; chain: string; baseToken: string }): boolean {
+  const db = openDb();
+  const row = db
+    .prepare(
+      `SELECT 1 FROM trades
+        WHERE account = ? AND chain = ? AND LOWER(base_token) = LOWER(?) AND status = 'success'
+        LIMIT 1`,
+    )
+    .get(args.account, args.chain.toLowerCase(), args.baseToken) as { 1: number } | undefined;
+  return row != null;
+}
+
 // ── sync_bookmarks (iter737) ─────────────────────────────────
 
 export interface SyncBookmark {
@@ -4168,6 +4197,9 @@ export interface TradeIntentRow {
   decided_note: string | null;
   executed_at: string | null;
   result_json: string | null;
+  /** v101: JSON array of the gate-trigger reasons (size / new-token) that
+   *  routed this trade to a human. NULL on pre-v101 intents. */
+  approval_reasons_json: string | null;
 }
 
 export function insertTradeIntent(args: {
@@ -4180,14 +4212,16 @@ export function insertTradeIntent(args: {
   estUsd: number | null;
   reason: string | null;
   expiresAt: string;
+  /** v101: gate-trigger reasons (size / new-token). */
+  approvalReasons?: string[] | null;
 }): number {
   const db = openDb();
   const r = db
     .prepare(
       `INSERT INTO trade_intents
         (created_at, status, tool, chain, account, request_json, preview_json,
-         est_usd, reason, expires_at)
-       VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         est_usd, reason, expires_at, approval_reasons_json)
+       VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       args.createdAt,
@@ -4199,6 +4233,7 @@ export function insertTradeIntent(args: {
       args.estUsd,
       args.reason,
       args.expiresAt,
+      args.approvalReasons && args.approvalReasons.length > 0 ? JSON.stringify(args.approvalReasons) : null,
     );
   return Number(r.lastInsertRowid);
 }

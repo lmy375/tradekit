@@ -33,7 +33,9 @@ afterAll(() => {
 });
 beforeEach(() => { openDb().exec("DELETE FROM trade_intents"); });
 
-const GATE = { enabled: true as const, thresholdUsd: 500, expiresMinutes: 60 };
+const GATE = { enabled: true as const, thresholdUsd: 500, expiresMinutes: 60, requireForNewToken: false };
+// v101: a buy-signal helper — most existing tests only exercise the size dimension.
+const buy = (estUsd: number | null) => ({ estUsd, direction: "buy" as const });
 
 function mkIntent(over: Partial<Parameters<typeof createTradeIntent>[0]> = {}) {
   return createTradeIntent({
@@ -51,17 +53,42 @@ function mkIntent(over: Partial<Parameters<typeof createTradeIntent>[0]> = {}) {
 
 describe("needsApproval — the gate decision", () => {
   it("threshold: at-or-above gates, below passes", () => {
-    expect(needsApproval(GATE, 500)).toBe(true);
-    expect(needsApproval(GATE, 499.99)).toBe(false);
-    expect(needsApproval(GATE, 10_000)).toBe(true);
+    expect(needsApproval(GATE, buy(500)).required).toBe(true);
+    expect(needsApproval(GATE, buy(499.99)).required).toBe(false);
+    expect(needsApproval(GATE, buy(10_000)).required).toBe(true);
   });
 
   it("null threshold = EVERY agent trade gates", () => {
-    expect(needsApproval({ ...GATE, thresholdUsd: null }, 1)).toBe(true);
+    expect(needsApproval({ ...GATE, thresholdUsd: null }, buy(1)).required).toBe(true);
   });
 
   it("fails CLOSED on unpriceable trades — 'couldn't price it' must never mean 'waved through'", () => {
-    expect(needsApproval(GATE, null)).toBe(true);
+    expect(needsApproval(GATE, buy(null)).required).toBe(true);
+  });
+
+  // v101: the novelty dimension — size-blind routing of new-token buys.
+  it("requireForNewToken: a small BUY of a never-traded token gates regardless of size", () => {
+    const gate = { ...GATE, thresholdUsd: 500, requireForNewToken: true };
+    const d = needsApproval(gate, { estUsd: 20, direction: "buy", isNewToken: true });
+    expect(d.required).toBe(true);
+    expect(d.reasons.some((r) => /new-token risk/.test(r))).toBe(true);
+  });
+
+  it("requireForNewToken: a known-token buy below threshold still passes", () => {
+    const gate = { ...GATE, thresholdUsd: 500, requireForNewToken: true };
+    expect(needsApproval(gate, { estUsd: 20, direction: "buy", isNewToken: false }).required).toBe(false);
+  });
+
+  it("requireForNewToken: novelty never gates a SELL (you already hold it)", () => {
+    const gate = { ...GATE, thresholdUsd: 500, requireForNewToken: true };
+    expect(needsApproval(gate, { estUsd: 20, direction: "sell", isNewToken: true }).required).toBe(false);
+  });
+
+  it("reasons accumulate when BOTH size and novelty fire", () => {
+    const gate = { ...GATE, thresholdUsd: 100, requireForNewToken: true };
+    const d = needsApproval(gate, { estUsd: 500, direction: "buy", isNewToken: true });
+    expect(d.required).toBe(true);
+    expect(d.reasons).toHaveLength(2);
   });
 
   it("approvalGateConfig: disabled (the default) returns null", () => {
@@ -80,6 +107,19 @@ describe("intent lifecycle", () => {
     expect(row.status).toBe("pending");
     expect(row.est_usd).toBe(1000);
     expect(JSON.parse(row.preview_json!).aggregator).toBe("kyberswap");
+  });
+
+  // v101: gate-trigger reasons round-trip through the DB so the CLI/MCP show WHY.
+  it("persists approvalReasons → readable on the row + returned summary", () => {
+    const s = mkIntent({ approvalReasons: ["trade ≈ $1000.00 ≥ $500 approval threshold", "first BUY of this token on this account/chain — never traded before (new-token risk)"] });
+    expect(s.approvalReasons).toHaveLength(2);
+    const row = getTradeIntentById(s.intentId)!;
+    expect(JSON.parse(row.approval_reasons_json!)).toEqual(s.approvalReasons);
+  });
+
+  it("no approvalReasons → null column (backward-compatible)", () => {
+    const row = getTradeIntentById(mkIntent().intentId)!;
+    expect(row.approval_reasons_json).toBeNull();
   });
 
   it("approve flow: execute success → executed with result; concurrent reject loses loudly", () => {
@@ -148,6 +188,7 @@ describe("timeline integration (collectIntentEvents)", () => {
       tool: "buy" as const, chain: "base", account: "default",
       request_json: "{}", preview_json: null, est_usd: 800, reason: "breakout",
       decided_at: null, decided_note: null, executed_at: null, result_json: null,
+      approval_reasons_json: null,
     };
     const rows = [
       { ...base, id: 1, status: "pending" as const, created_at: "2026-06-11T11:00:00Z", expires_at: "2026-06-11T13:00:00Z" },

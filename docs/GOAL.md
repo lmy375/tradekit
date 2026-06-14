@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 101 — 风险感知审批门：把"该让人看的交易"路由给人，而非只看金额（risk-aware approval gate — route trades to the human by NOVELTY, not just size）** ✅
+- **修复审批门的"风险盲区"**：v47 人在回路审批门只看一个维度——USD 金额（`thresholdUsd` 之上才需人批）。但这是**风险盲的**：一笔 \$20 买入一个全新未知代币（prompt-injection 抽资的经典手法——给攻击者代币的池子打钱）轻松溜过阈值，而一笔 \$500 买你天天交易的 USDC 却要人批。金额≠风险，门却只认金额
+- 为什么是最重要的：审批门是自主交易最关键的人在回路控制——它决定**哪些交易该惊动人**。产品投了大量精力做风险检测（preflight/honeypot/allowlist），但这些信号从不影响"谁来决定这笔交易"。让门按风险（而非仅金额）路由，意味着人只为真正该看的交易被打扰——新代币——而例行安全交易无论金额自动执行。这直接服务"安全自主交易"，且把已有的风险信号接进了控制平面
+- 实现（结构化决策 + 单一新触发，纯函数）：`safety.tradeApproval` 加 `requireForNewToken`（默认 false，向后兼容）。`needsApproval(gate, signals)` 从返回 boolean 改为返回 `{required, reasons[]}`——SIZE 维度（阈值，含 unpriceable 保守 gate）+ NOVELTY 维度（仅 BUY：本账户在该链从未成功成交过的 base 代币，size-blind）。novelty 检测复用新 DB 原语 `hasPriorTokenFill`（success-only、双向、链隔离）。触发理由 `reasons[]` 贯穿：持久化（新增 `approval_reasons_json` 列，migration v64）、通知（人看到"为什么"是新代币还是金额）、MCP 结果 note + intents_list `approvalReasons`、CLI `intents show` 的 `gated by:` 行
+- 为什么不是硬 allowlist：硬代币 allowlist 是"禁止"，这是"先问人"——更软的中间地带：agent 仍可交易新代币，但人先看一眼。适合没开 allowlist 的运营商
+- 测试覆盖：+11——needsApproval（金额/novelty/SELL 不触发 novelty/双触发理由累积）、hasPriorTokenFill（never/success/failed-不算/链隔离/SELL 也算）、intent 持久化往返（approval_reasons_json）；3529 测试全绿（+11）；config schema + CLI 已烟测
+- 向后兼容：纯加法——`requireForNewToken` 默认 false（纯金额行为不变）；needsApproval 结构化返回（仅一个内部调用点）；新 DB 列 nullable（pre-v101 intent 为 null）；migration 纯加列
+
 **Phase 100 — digest 安全事件全覆盖：每一次护栏拦截都进运营商心跳（comprehensive guardrail-block accounting — no real-money safety event stays invisible in the digest）** ✅
 - **补上 digest 安全统计的静默漏洞**：cron digest 的安全段（运营商的主心跳）从一个硬编码 switch 里只数 5 个护栏码（drawdown / 策略预算 / 持仓 / honeypot / gas）。但护栏码这些迭代加了一堆——v84 止损熔断、AMOUNT_EXCEEDS_LIMIT（单笔/每日 USD 上限，**最基础的护栏**）、SLIPPAGE_TOO_HIGH、QUOTE_DEVIATION_EXCEEDED、POSITION_CAP_EXCEEDED、CONTRACT_BLOCKED——**全都没被数进去**。一笔被单笔上限拦下、或止损熔断拦下的真金白银安全事件，在 digest 里只会落进泛泛的"top errors"，不被识别为安全事件、不进 verdict。switch 在护栏码增长时静默落后了（和 v85 稳定币集合分叉同一类问题）
 - 为什么是最重要的：digest 是运营商对自主 agent 的主要可观测窗口。一个护栏触发=真钱被一道配置的安全策略拦下，这正是 digest 安全段存在的意义。最基础的护栏（单笔 USD 上限）和最新的（止损熔断 v84，刚在 v99 补了 headroom 预警）在心跳里**不可见**，是个真实的覆盖漏洞——v99 让"逼近"可见，本期让"已触发"可见

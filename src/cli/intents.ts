@@ -71,6 +71,13 @@ export async function intentsCommand(
         ? (JSON.parse(r.preview_json) as { price?: string; baseAmount?: string; quoteAmount?: string; aggregator?: string; estimatedUsd?: number })
         : null;
       console.log(summaryLine(r));
+      // v101: why the gate routed this trade to a human (size / new-token).
+      if (r.approval_reasons_json) {
+        try {
+          const triggers = JSON.parse(r.approval_reasons_json) as string[];
+          if (triggers.length > 0) console.log(`  gated by:  ${triggers.join("; ")}`);
+        } catch { /* malformed → skip */ }
+      }
       if (r.reason) console.log(`  reason:    ${r.reason}`);
       if (preview) {
         console.log(`  preview:   ${r.tool} ${preview.baseAmount} base ⇄ ${preview.quoteAmount} quote @ ${preview.price} via ${preview.aggregator}`);

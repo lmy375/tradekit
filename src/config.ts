@@ -427,9 +427,20 @@ const safetySchema = z
         /** Pending intents expire after this many minutes — a stale
          *  quote should never execute days later. */
         expiresMinutes: z.number().int().min(1).max(1440).default(60),
+        /**
+         * v101: risk-aware routing — require approval for a BUY of a base
+         * token this account has NEVER traded on the chain, regardless of
+         * size. The size threshold alone is risk-blind: a $20 buy of a
+         * brand-new attacker token (the classic prompt-injection drain
+         * vector) slips under it, while a $500 buy of a token you trade
+         * daily gets gated. This routes the trades that warrant a human
+         * look — novel tokens — to the human, independent of USD value.
+         * Default false (size-only, backward-compatible).
+         */
+        requireForNewToken: z.boolean().default(false),
       })
       .strict()
-      .default({ enabled: false, thresholdUsd: null, expiresMinutes: 60 }),
+      .default({ enabled: false, thresholdUsd: null, expiresMinutes: 60, requireForNewToken: false }),
 
     /**
      * Iter20: portfolio drawdown circuit breaker. Tracks the operator's

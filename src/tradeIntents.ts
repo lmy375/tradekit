@@ -44,22 +44,61 @@ export interface ApprovalGateConfig {
   enabled: boolean;
   thresholdUsd: number | null;
   expiresMinutes: number;
+  /** v101: route a BUY of a never-before-traded token to the human
+   *  regardless of size. */
+  requireForNewToken: boolean;
 }
 
 export function approvalGateConfig(config: Config): ApprovalGateConfig | null {
   const c = config.safety?.tradeApproval;
   if (!c?.enabled) return null;
-  return { enabled: true, thresholdUsd: c.thresholdUsd ?? null, expiresMinutes: c.expiresMinutes ?? 60 };
+  return {
+    enabled: true,
+    thresholdUsd: c.thresholdUsd ?? null,
+    expiresMinutes: c.expiresMinutes ?? 60,
+    requireForNewToken: c.requireForNewToken ?? false,
+  };
 }
 
-/** Does THIS trade need a human? Pure: thresholdUsd null = every
- *  agent trade; otherwise estUsd at-or-above the threshold. An
- *  unpriceable trade (estUsd null) with a threshold set is gated
- *  CONSERVATIVELY — "couldn't price it" must not mean "waved through". */
-export function needsApproval(gate: ApprovalGateConfig, estUsd: number | null): boolean {
-  if (gate.thresholdUsd == null) return true;
-  if (estUsd == null) return true;
-  return estUsd >= gate.thresholdUsd;
+/** v101: the inputs the gate weighs — size + risk signals. */
+export interface ApprovalSignals {
+  estUsd: number | null;
+  direction: "buy" | "sell";
+  /** True when this BUY is for a base token the account has never traded
+   *  (computed by the caller via db.hasPriorTokenFill). Ignored for sells. */
+  isNewToken?: boolean;
+}
+
+/** v101: the structured verdict — does this trade need a human, and WHY?
+ *  reasons[] feeds the intent record + notification so the reviewer sees
+ *  exactly which trigger fired (size vs novelty), not just "pending". */
+export interface ApprovalDecision {
+  required: boolean;
+  reasons: string[];
+}
+
+/** Does THIS trade need a human?
+ *  - SIZE: thresholdUsd null = every agent trade; otherwise estUsd at-or-above
+ *    the threshold. An unpriceable trade (estUsd null) with a threshold set is
+ *    gated CONSERVATIVELY — "couldn't price it" must not mean "waved through".
+ *  - NOVELTY (v101): a BUY of a never-traded token, regardless of size, when
+ *    requireForNewToken is on — the size-blind risk the threshold misses.
+ *  Pure: all risk inputs are pre-computed by the caller. */
+export function needsApproval(gate: ApprovalGateConfig, signals: ApprovalSignals): ApprovalDecision {
+  const reasons: string[] = [];
+  // ── size dimension ──
+  if (gate.thresholdUsd == null) {
+    reasons.push("every agent trade requires approval (no USD threshold configured)");
+  } else if (signals.estUsd == null) {
+    reasons.push(`trade could not be priced — gated conservatively (threshold $${gate.thresholdUsd})`);
+  } else if (signals.estUsd >= gate.thresholdUsd) {
+    reasons.push(`trade ≈ $${signals.estUsd.toFixed(2)} ≥ $${gate.thresholdUsd} approval threshold`);
+  }
+  // ── novelty dimension (BUY only) ──
+  if (gate.requireForNewToken && signals.direction === "buy" && signals.isNewToken === true) {
+    reasons.push("first BUY of this token on this account/chain — never traded before (new-token risk)");
+  }
+  return { required: reasons.length > 0, reasons };
 }
 
 export interface CreateIntentArgs {
@@ -74,6 +113,9 @@ export interface CreateIntentArgs {
   estUsd: number | null;
   reason: string | null;
   expiresMinutes: number;
+  /** v101: the gate-trigger reasons (size / new-token) that routed this
+   *  trade to a human — persisted so the CLI + intents_list show WHY. */
+  approvalReasons?: string[];
   now?: Date;
 }
 
@@ -83,6 +125,8 @@ export interface PendingIntentSummary {
   estUsd: number | null;
   expiresAt: string;
   approveHint: string;
+  /** v101: why this trade needs a human (size / new-token). */
+  approvalReasons: string[];
 }
 
 export function createTradeIntent(args: CreateIntentArgs): PendingIntentSummary {
@@ -98,9 +142,11 @@ export function createTradeIntent(args: CreateIntentArgs): PendingIntentSummary 
     estUsd: args.estUsd,
     reason: args.reason,
     expiresAt,
+    approvalReasons: args.approvalReasons ?? null,
   });
   return {
     intentId,
+    approvalReasons: args.approvalReasons ?? [],
     status: "pending_approval",
     estUsd: args.estUsd,
     expiresAt,
@@ -183,18 +229,22 @@ export async function notifyIntentCreated(args: {
   tool: "buy" | "sell";
   pairLabel: string;
   reason: string | null;
+  /** v101: the gate-trigger reasons (size / new-token) — shown to the human
+   *  so a novel-token page reads differently from a routine size page. */
+  approvalReasons?: string[];
   config: Config;
   logger: { warn: (msg: string, fields?: Record<string, unknown>) => void };
 }): Promise<void> {
   try {
     const { notify } = await import("./notify.js");
+    const triggers = args.approvalReasons && args.approvalReasons.length > 0 ? args.approvalReasons : args.intent.approvalReasons;
     await notify(
       {
         event: "trade.approval_pending",
         severity: "warn",
         title: `Agent trade awaiting approval: ${args.tool} ${args.pairLabel}${args.intent.estUsd != null ? ` (~$${args.intent.estUsd.toFixed(2)})` : ""}`,
-        body: `${args.reason ? `Reason: ${args.reason}\n` : ""}Expires ${args.intent.expiresAt}\nReview: tradekit intents show ${args.intent.intentId}`,
-        fields: { intentId: args.intent.intentId, estUsd: args.intent.estUsd, expiresAt: args.intent.expiresAt },
+        body: `${triggers.length > 0 ? `Why: ${triggers.join("; ")}\n` : ""}${args.reason ? `Agent reason: ${args.reason}\n` : ""}Expires ${args.intent.expiresAt}\nReview: tradekit intents show ${args.intent.intentId}`,
+        fields: { intentId: args.intent.intentId, estUsd: args.intent.estUsd, expiresAt: args.intent.expiresAt, approvalReasons: triggers.join("; ") },
       },
       args.config,
       args.logger as never,

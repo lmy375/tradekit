@@ -14,7 +14,7 @@ const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-db-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 // Static imports happen before tmp dir is set, so use dynamic import after env var.
-const { dailyUsdVolume, insertTrade, closeDb } = await import("./db.js");
+const { dailyUsdVolume, insertTrade, hasPriorTokenFill, closeDb } = await import("./db.js");
 type TradeRow = Awaited<ReturnType<typeof import("./db.js").recentTrades>>[number];
 
 const ACCOUNT = "test-acct";
@@ -52,6 +52,36 @@ beforeAll(() => {
 afterAll(() => {
   closeDb();
   rmSync(tmpDataDir, { recursive: true, force: true });
+});
+
+describe("hasPriorTokenFill (v101 new-token detection)", () => {
+  // Unique token/account per assertion so the shared-DB accumulation in this
+  // file can't bleed in.
+  it("false when the token was never traded on this account+chain", () => {
+    expect(hasPriorTokenFill({ account: "novel-acct", chain: CHAIN, baseToken: "0xNEVERTRADED" })).toBe(false);
+  });
+
+  it("true after a SUCCESSFUL fill of that token (address match, case-insensitive)", () => {
+    insertTrade(trade({ account: "known-acct", base_token: "0xAbCdEf", status: "success" }));
+    expect(hasPriorTokenFill({ account: "known-acct", chain: CHAIN, baseToken: "0xabcdef" })).toBe(true);
+  });
+
+  it("a FAILED/pending attempt does NOT make a token known", () => {
+    insertTrade(trade({ account: "fail-acct", base_token: "0xFAILONLY", status: "failed" }));
+    insertTrade(trade({ account: "fail-acct", base_token: "0xFAILONLY", status: "pending" }));
+    expect(hasPriorTokenFill({ account: "fail-acct", chain: CHAIN, baseToken: "0xFAILONLY" })).toBe(false);
+  });
+
+  it("scoped by chain — a fill on another chain leaves the token novel here", () => {
+    insertTrade(trade({ account: "chain-acct", chain: "arbitrum", base_token: "0xCROSSCHAIN", status: "success" }));
+    expect(hasPriorTokenFill({ account: "chain-acct", chain: "base", baseToken: "0xCROSSCHAIN" })).toBe(false);
+    expect(hasPriorTokenFill({ account: "chain-acct", chain: "arbitrum", baseToken: "0xCROSSCHAIN" })).toBe(true);
+  });
+
+  it("a prior SELL also counts — once held, no longer novel", () => {
+    insertTrade(trade({ account: "sell-acct", base_token: "0xHELD", direction: "sell", status: "success" }));
+    expect(hasPriorTokenFill({ account: "sell-acct", chain: CHAIN, baseToken: "0xHELD" })).toBe(true);
+  });
 });
 
 describe("dailyUsdVolume", () => {

@@ -216,7 +216,20 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                     // the simulate preview is the reviewer's context.
                     const preview = await executeTrade({ ...req, simulate: true }, ctx);
                     const estUsd = preview.estimatedUsd ?? (Number.isFinite(parseFloat(preview.quoteAmount)) ? parseFloat(preview.quoteAmount) : null);
-                    if (needsApproval(gate, estUsd)) {
+                    // v101: novelty signal — is this a BUY of a token this
+                    // account has never traded on the chain? Only computed when
+                    // the gate cares (requireForNewToken) + it's a buy.
+                    let isNewToken = false;
+                    if (gate.requireForNewToken && direction === "buy" && preview.baseToken) {
+                      const { hasPriorTokenFill } = await import("../db.js");
+                      isNewToken = !hasPriorTokenFill({
+                        account: wallet.label ?? "default",
+                        chain: wallet.chain,
+                        baseToken: preview.baseToken,
+                      });
+                    }
+                    const decision = needsApproval(gate, { estUsd, direction, isNewToken });
+                    if (decision.required) {
                       const intent = createTradeIntent({
                         tool: direction,
                         chain: wallet.chain,
@@ -225,6 +238,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                         preview: preview as unknown as Record<string, unknown>,
                         estUsd,
                         reason: input.approvalReason ?? null,
+                        approvalReasons: decision.reasons,
                         expiresMinutes: gate.expiresMinutes,
                       });
                       await notifyIntentCreated({
@@ -232,6 +246,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                         tool: direction,
                         pairLabel: `${preview.baseSymbol ?? input.base ?? "?"}/${preview.quoteSymbol ?? input.quote ?? "?"}`,
                         reason: input.approvalReason ?? null,
+                        approvalReasons: decision.reasons,
                         config,
                         logger: rt.opts.logger,
                       });
@@ -244,7 +259,9 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                           quoteAmount: preview.quoteAmount,
                           aggregator: preview.aggregator,
                         },
-                        note: "Trade NOT executed — safety.tradeApproval gated it. A human must run `tradekit intents approve` (CLI-only by design). Poll intents_list for the decision; do NOT re-submit this trade.",
+                        note:
+                          `Trade NOT executed — safety.tradeApproval gated it (${decision.reasons.join("; ")}). ` +
+                          "A human must run `tradekit intents approve` (CLI-only by design). Poll intents_list for the decision; do NOT re-submit this trade.",
                       };
                     }
                   }
@@ -286,7 +303,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
   // ── v47: trade intents (read-only — approve/reject is CLI-only) ──
   server.tool(
     "intents_list",
-    "v47: list agent-proposed trade intents awaiting (or past) human approval. Agents use this to POLL the decision on a pending_approval result from buy/sell — status flips to executed/failed (with result detail via the CLI) or rejected/expired. Approve/reject is deliberately NOT exposed over MCP (same security boundary as backup/panic: a prompt-injected agent must never approve its own spending) — a human runs `tradekit intents approve <id>`.",
+    "v47: list agent-proposed trade intents awaiting (or past) human approval. Agents use this to POLL the decision on a pending_approval result from buy/sell — status flips to executed/failed (with result detail via the CLI) or rejected/expired. Each intent carries `approvalReasons` (v101): WHY the gate routed it to a human — a USD-threshold hit and/or a new-token-risk flag (a BUY of a token never traded on the account when safety.tradeApproval.requireForNewToken is on). Approve/reject is deliberately NOT exposed over MCP (same security boundary as backup/panic: a prompt-injected agent must never approve its own spending) — a human runs `tradekit intents approve <id>`.",
     {
       status: z.enum(["pending", "executed", "failed", "rejected", "expired"]).optional().describe("Filter by status. Default: all."),
       limit: z.number().int().min(1).max(200).default(50),
@@ -308,6 +325,8 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 account: r.account,
                 est_usd: r.est_usd,
                 reason: r.reason,
+                // v101: why the gate routed this to a human (size / new-token).
+                approvalReasons: r.approval_reasons_json ? (JSON.parse(r.approval_reasons_json) as string[]) : [],
                 created_at: r.created_at,
                 expires_at: r.expires_at,
                 decided_at: r.decided_at,
