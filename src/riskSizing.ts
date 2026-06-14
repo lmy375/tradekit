@@ -68,6 +68,13 @@ export interface RiskSizeReport {
   /** Effective risk at finalUsd: finalUsd × stopDistancePct/100. ≤ riskUsd when
    *  the safety ceiling clamped the size (you're risking LESS than budgeted). */
   effectiveRiskUsd: number;
+  /** v118: the reward:risk target (e.g. 2 = aim for 2× the risk). Null when not
+   *  requested. */
+  targetRMultiple: number | null;
+  /** v118: take-profit % above entry for the target — targetRMultiple ×
+   *  stopDistancePct (a 2R target on a 5% stop = +10%). Null unless a target was
+   *  requested on a trailing-stop entry (the bracket the buy action attaches). */
+  takeProfitPct: number | null;
   /** v105.1: the executable next step — a ready-to-run BUY for the sized amount
    *  with the protective stop attached (protectTrailPct = the stop distance when
    *  trailing). Turns advisory sizing into a one-call risk-disciplined entry.
@@ -83,6 +90,10 @@ export function gatherRiskSize(args: {
   riskUsd?: number | null;
   riskPct?: number | null;
   portfolioUsd?: number | null;
+  /** v118: reward:risk target. When set on a trailing-stop entry, the buy
+   *  next-action also brackets a take-profit at targetRMultiple × stopDistance
+   *  (a 2R target on a 5% stop = take-profit at +10%). */
+  targetRMultiple?: number | null;
   /** Stop distance: an explicit stop-loss %, OR the trailing-stop trail %. */
   stopLossPct?: number | null;
   trailPct?: number | null;
@@ -168,6 +179,15 @@ export function gatherRiskSize(args: {
   const baseAmount = priceUsd != null && priceUsd > 0 ? finalUsd / priceUsd : null;
   if (baseAmount == null) caveats.push("No base-token price — finalUsd is not converted to a token amount.");
 
+  // ── v118: reward target — a take-profit at targetRMultiple × the risk distance
+  // (bracketed with the stop). Only meaningful on a trailing-stop entry (the
+  // bracket the buy attaches); for an explicit stop-loss source it's advisory.
+  const targetRMultiple = args.targetRMultiple != null && args.targetRMultiple > 0 ? args.targetRMultiple : null;
+  const takeProfitPct = targetRMultiple != null && stopSource === "trailing_stop" ? targetRMultiple * stopDistancePct : null;
+  if (targetRMultiple != null && stopSource !== "trailing_stop") {
+    caveats.push("targetRMultiple needs a trailing-stop entry (trailPct) to auto-bracket the take-profit — set the stop via trailPct.");
+  }
+
   // ── the executable entry: BUY the sized amount, protected by the stop ──
   const finalQuoteAmount = args.quotePriceUsd != null && args.quotePriceUsd > 0 ? finalUsd / args.quotePriceUsd : null;
   const recommendedActions: NextAction[] = [];
@@ -181,6 +201,9 @@ export function gatherRiskSize(args: {
     // The trail % IS the stop distance — attach the protective stop that the
     // sizing assumed, so the realized risk matches the budget.
     if (stopSource === "trailing_stop") params.protectTrailPct = stopDistancePct;
+    // v118: bracket the take-profit at the reward target → a one-call,
+    // fully risk-disciplined entry (size by R, stop at 1R, take-profit at N-R).
+    if (takeProfitPct != null) params.takeProfitPct = takeProfitPct;
     recommendedActions.push({
       tool: "buy",
       params,
@@ -189,6 +212,9 @@ export function gatherRiskSize(args: {
         (stopSource === "trailing_stop"
           ? ` and attach the ${stopDistancePct}% trailing stop the sizing assumed`
           : ` — attach your ${stopDistancePct}% stop so the realized risk matches the $${riskUsd.toFixed(2)} budget`) +
+        (takeProfitPct != null
+          ? ` + a take-profit at +${takeProfitPct}% (${targetRMultiple}R target) — an OCO bracket`
+          : "") +
         `. Preflight first if unsure.`,
     });
   } else if (args.direction === "buy" && args.quotePriceUsd == null) {
@@ -214,6 +240,8 @@ export function gatherRiskSize(args: {
     baseAmount,
     finalQuoteAmount,
     effectiveRiskUsd: finalUsd * (stopDistancePct / 100),
+    targetRMultiple,
+    takeProfitPct,
     recommendedActions,
     caveats,
     generatedAt: sizing.generatedAt,
@@ -238,14 +266,18 @@ export function renderRiskSize(r: RiskSizeReport): string {
       `  [bound by ${r.boundBy === "risk_budget" ? "risk budget" : r.ceilingBinding?.label ?? r.boundBy}]`,
   );
   lines.push(`    effective risk at stop: $${r.effectiveRiskUsd.toFixed(2)}`);
+  if (r.takeProfitPct != null) {
+    lines.push(`    take-profit target: +${r.takeProfitPct}% (${r.targetRMultiple}R) — bracketed OCO with the stop`);
+  }
   if (r.recommendedActions.length > 0) {
     // Translate the agent-facing buy params to the CLI's flag names
-    // (--quoteAmount / --protect-trail), so the printed command runs as-is.
+    // (--quoteAmount / --protect-trail / --take-profit-pct), so it runs as-is.
     const p = r.recommendedActions[0].params ?? {};
     lines.push("");
     lines.push(
       `  Entry: tradekit trade buy --base ${p.base ?? r.token}${p.quote ? ` --quote ${p.quote}` : ""}` +
-        ` --quoteAmount ${p.quoteAmount}${p.protectTrailPct != null ? ` --protect-trail ${p.protectTrailPct}` : ""}`,
+        ` --quoteAmount ${p.quoteAmount}${p.protectTrailPct != null ? ` --protect-trail ${p.protectTrailPct}` : ""}` +
+        `${p.takeProfitPct != null ? ` --take-profit-pct ${p.takeProfitPct}` : ""}`,
     );
   }
   for (const c of r.caveats) lines.push(`    · ${c}`);

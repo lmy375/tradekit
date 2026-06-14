@@ -92,6 +92,36 @@ describe("gatherRiskSize — clamp against the safety ceiling", () => {
   });
 });
 
+// v118: a reward target brackets the take-profit into the one-call entry.
+describe("gatherRiskSize — reward target / bracket (v118)", () => {
+  it("targetRMultiple on a trailing stop → take-profit at R × stop, in the buy action", () => {
+    // 2R on a 5% stop → take-profit at +10%.
+    const r = sizeRisk({}, { riskUsd: 50, trailPct: 5, targetRMultiple: 2, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.targetRMultiple).toBe(2);
+    expect(r.takeProfitPct).toBeCloseTo(10, 6);
+    expect(r.recommendedActions[0].params).toMatchObject({ protectTrailPct: 5, takeProfitPct: 10 });
+    expect(r.recommendedActions[0].reason).toMatch(/2R target/);
+  });
+
+  it("a tighter stop → a tighter take-profit for the same R (3% stop, 3R → +9%)", () => {
+    const r = sizeRisk({}, { riskUsd: 30, trailPct: 3, targetRMultiple: 3, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.takeProfitPct).toBeCloseTo(9, 6);
+  });
+
+  it("targetRMultiple with a stop-LOSS source (not trailing) → no take-profit + caveat", () => {
+    const r = sizeRisk({}, { riskUsd: 50, stopLossPct: 5, targetRMultiple: 2, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.takeProfitPct).toBeNull();
+    expect(r.recommendedActions[0].params!.takeProfitPct).toBeUndefined();
+    expect(r.caveats.some((c) => /trailing-stop entry/.test(c))).toBe(true);
+  });
+
+  it("no targetRMultiple → no take-profit (plain stop entry, unchanged)", () => {
+    const r = sizeRisk({}, { riskUsd: 50, trailPct: 5, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.takeProfitPct).toBeNull();
+    expect(r.recommendedActions[0].params!.takeProfitPct).toBeUndefined();
+  });
+});
+
 describe("gatherRiskSize — executable entry (v105.1)", () => {
   it("emits a ready-to-run buy with the sized quoteAmount + the protective trailing stop", () => {
     // risk $50 @ 5% trail → $1000; USDC quote (price 1) → quoteAmount 1000.

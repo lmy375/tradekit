@@ -769,7 +769,11 @@ STATEFUL SAFETY
         size + the effective risk at the final size. v105.1: prints a ready-to-run
         'trade buy' for the sized amount with the protective stop attached (the
         risk-disciplined entry in one command) — quoteAmount uses --quote-price-usd
-        (defaults to $1 for a stablecoin --quote). Offline. MCP: risk_size.
+        (defaults to $1 for a stablecoin --quote). v118: add --target-r N (with
+        --trail-pct) to bracket a take-profit at N× the stop distance (2R on a 5%
+        stop → +10%) — the printed buy carries --take-profit-pct for a one-command
+        fully-bracketed entry (size by R, stop at 1R, take-profit at N-R). Offline.
+        MCP: risk_size.
   safety drawdown [--scope global] [--json]
         Show portfolio drawdown circuit-breaker state. Peak USD, last observed value, drawdown %,
         and tripped status per scope. Reveals whether the breaker would block trading right now.

@@ -261,6 +261,7 @@ async function safetySizeByRiskCommand(flags: Record<string, string>) {
       portfolioUsd: num("portfolio-usd", "--portfolio-usd"),
       stopLossPct: num("stop-pct", "--stop-pct"),
       trailPct: num("trail-pct", "--trail-pct"),
+      targetRMultiple: num("target-r", "--target-r"),
       account: flags["account"],
       chain: flags["chain"],
       strategy: flags["strategy"] ?? null,

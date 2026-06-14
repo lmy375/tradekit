@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 118 — risk_size 一步出全括号入场：按风险定仓 + 1R 止损 + N-R 止盈（risk_size emits a fully-bracketed entry — size by R, stop at 1R, take-profit at N-R, in one call）** ✅
+- **风险管理弧的收顶（v105→v105.1→v117→v118）**：v105 按风险定仓、v105.1 让 risk_size 出可执行的带止损 buy、v117 给 buy 加了括号原语。缺的最后一环：risk_size 自己算出止盈、把完整括号 buy 一步交付。之前 agent 得手动算 takeProfitPct = N × 止损距离再穿进 buy——正是 v105.1 要消除的那类易错缝隙（v105.1 消了"尺寸+止损"穿线，本期消"止盈"穿线）
+- 为什么重要：这让"进入一个完全风险纪律的括号仓"成为**一次 risk_size 调用**——自主交易的基石工作流。agent 说"冒 \$50 风险、5% 追踪止损、目标 2R"→ risk_size 回一条现成 buy：按风险定 \$1000、5% 止损、+10% 止盈（2×止损距离）OCO 括号。尺寸来自风险预算（被安全天花板夹）、止损=风险距离、止盈=N×风险 → realized 风险/收益都对齐计划
+- 实现（扩展 v105.1 的 next-action，复用 v117 括号）：gatherRiskSize 加 targetRMultiple；追踪止损入场时 takeProfitPct = targetRMultiple × stopDistancePct，写进 buy next-action 的 takeProfitPct（v117 buy 会据此挂 OCO 止盈腿）。stop-loss 源（非追踪）→ 不出止盈 + caveat（v117 括号需追踪止损）。MCP risk_size 加 target_r_multiple、CLI safety size-by-risk 加 --target-r、render + 打印命令带 --take-profit-pct
+- 测试覆盖：+4——2R/5%止损→+10% 止盈进 buy action / 更紧止损同 R 更紧止盈（3%/3R→+9%）/ stop-loss 源→无止盈+caveat / 无 target→无止盈（不变）；3604 测试全绿（+4）；CLI 已烟测（出完整括号 buy 命令）
+- 向后兼容：纯加法——targetRMultiple optional（不传则与 v105.1 完全一致）；复用 v117 括号；不改执行路径
+
 **Phase 117 — 入场即括号单：止损 + 止盈作为 OCO 一步挂上，完成风险纪律入场闭环（protect-on-entry bracket — stop-loss + take-profit as one OCO, completing the risk-disciplined entry lifecycle）** ✅
 - **补全"入场即被完整管理的持仓"生命周期**：v105 按风险定仓、v80 入场即挂追踪止损——但只挂了**下行止损**，没有**计划的止盈出口**。完整的风险纪律交易是一个 bracket：止损（封顶 1R 风险）+ 止盈（兑现计划收益），二者 OCO（一个成交→另一个撤销）。之前 agent 得手动再挂止盈单
 - 为什么重要：这是 agent 持仓生命周期的闭环，与 v105 完美组合——按风险 R 定仓、止损在 stop 距离、止盈设在 N×R → 一步进入一个 R-multiple 目标的全托管仓。让"纪律入场"成为一次原子操作（同 v93/v105.1 的"让正确的事变容易"）。OCO 基础设施（group_id + 成交级联撤销 OCO_PEER_FIRED）早已存在且专为 bracket 设计

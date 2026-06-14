@@ -233,15 +233,16 @@ export const registerDataTools: RegisterFn = (server, rt) => {
       portfolio_usd: z.number().positive().optional().describe("Current portfolio USD value — required when using risk_pct."),
       stop_loss_pct: z.number().positive().optional().describe("Stop-loss distance from entry, % (5 = -5%)."),
       trail_pct: z.number().positive().optional().describe("Trailing-stop trail %, used as the stop distance (the protect-on-entry trail)."),
+      target_r_multiple: z.number().positive().optional().describe("v118: reward:risk target (2 = aim for 2× the risk). On a trailing-stop entry, the buy recommendedAction also brackets a take-profit at target_r_multiple × the stop distance (2R on a 5% stop → take-profit at +10%) — a one-call fully risk-disciplined bracketed entry (size by R, stop at 1R, take-profit at N-R)."),
       chain: z.string().optional(),
       token: z.string().optional().describe("Base token symbol or address — scopes position caps + prices the base-amount conversion."),
       quote: z.string().optional().describe("Quote token to spend (default USDC) — priced to convert finalUsd → the quoteAmount of the buy next-action."),
       strategy: z.string().optional().describe("Strategy tag — folds the matching budget into the safety ceiling."),
     },
-    async ({ direction, risk_usd, risk_pct, portfolio_usd, stop_loss_pct, trail_pct, chain, token, quote, strategy }) => {
+    async ({ direction, risk_usd, risk_pct, portfolio_usd, stop_loss_pct, trail_pct, target_r_multiple, chain, token, quote, strategy }) => {
       try {
         return ok(
-          await runTool("risk_size", rt.opts, { direction, risk_usd, risk_pct, stop_loss_pct, trail_pct, chain, token, quote, strategy }, chain, async () => {
+          await runTool("risk_size", rt.opts, { direction, risk_usd, risk_pct, stop_loss_pct, trail_pct, target_r_multiple, chain, token, quote, strategy }, chain, async () => {
             const config = rt.getConfig();
             const profile = resolveProfile(chain ?? config.activeChain, config);
             const resolved = token ? resolveToken(profile, token) : profile.weth;
@@ -264,6 +265,7 @@ export const registerDataTools: RegisterFn = (server, rt) => {
                 portfolioUsd: portfolio_usd ?? null,
                 stopLossPct: stop_loss_pct ?? null,
                 trailPct: trail_pct ?? null,
+                targetRMultiple: target_r_multiple ?? null,
                 config,
                 chain: chain ?? config.activeChain ?? undefined,
                 strategy: strategy ?? null,
