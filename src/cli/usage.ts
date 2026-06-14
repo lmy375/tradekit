@@ -747,6 +747,19 @@ PLAYBOOKS (declarative strategy bundles)
         (>50% → caution: "the edge may not survive real execution"). Verdict
         ready | caution | not_ready with every flag named. MCP:
         playbook_promote_check.
+  playbook outcome <id> [--json]
+        v50: "did promoting this strategy deliver what paper promised?" — the
+        BACKWARD half of the pipeline (promote-check is the forward half).
+        Compares the frozen paper baseline (paper_trades) against the live fills
+        (trades) for the same strategy tag, normalized per-fill + per-week so a
+        50-fill paper run and a 6-fill live run compare fairly. Both eras run
+        through the SAME cost-basis walker → apples-to-apples realized PnL.
+        Verdict on_track | underperforming | diverged | insufficient_data:
+        diverged = paper made money but live fills realize ≤ 0; underperforming
+        = live per-fill PnL < 60% of paper, or live slippage > 1.5× the paper
+        assumption, or live cadence < 50% of paper. Deterministic (verdict keys
+        off realized PnL + live execution quality + cadence, never MTM marks).
+        MCP: playbook_outcome.
   playbook replace <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH]
                    [--fresh-state] [--yes] [--json]
         Atomically apply a new playbook spec. Modified primitives whose changes are all

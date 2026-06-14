@@ -310,6 +310,28 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── v50: playbook_outcome ──────────────────────────────────
+  server.tool(
+    "playbook_outcome",
+    "v50: 'did promoting this strategy deliver what the paper run promised?' — the BACKWARD half of the trust pipeline (playbook_promote_check is the forward half). Compares the frozen paper baseline (paper_trades, which stopped growing at promotion) against the live fills (trades) for the same strategy tag, NORMALIZED per-fill and per-week so a 50-fill paper run and a 6-fill live run compare fairly. Both eras run through the SAME cost-basis walker (computePaperPnlMtm) → apples-to-apples realized PnL. Verdict: on_track | underperforming | diverged | insufficient_data. diverged = paper realized > 0 but live fills realize ≤ 0/fill (the strategy is not making money with real execution). underperforming = live per-fill realized < 60% of paper, OR live median slippage > 1.5× the paper assumption, OR live cadence < 50% of paper (with ≥2 live days). insufficient_data = no live fills, < 3 live fills, or no paper baseline. Deterministic + offline: the verdict keys off realized PnL (closed round-trips), the live fills' own realized slippage + gas, and cadence — never off unrealized marks. reasons[] names every flag.",
+    {
+      id: z.number().int().positive().describe("Playbook id (promoted, or paper — insufficient_data when no live fills yet)."),
+      native_usd: z.number().positive().optional().describe("Current native-token USD price (for expressing live gas in USD). Omit to degrade to native-unit gas reporting."),
+    },
+    async ({ id, native_usd }) => {
+      try {
+        return ok(
+          await runTool("playbook_outcome", rt.opts, { id, native_usd }, undefined, async () => {
+            const { gatherPromoteOutcome } = await import("../promoteOutcome.js");
+            return await gatherPromoteOutcome({ playbookId: id, nativeUsd: native_usd ?? null, config: rt.getConfig() });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── playbook_promote ───────────────────────────────────────
   server.tool(
     "playbook_promote",

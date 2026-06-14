@@ -33,6 +33,26 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 50 — 晋升结果复盘（promote outcome — "did the promote deliver?"）** ✅
+- 闭合信任管道的**反向**缺口：v49 promote-check 是**前瞻**的（"这个 paper 策略准备好上真钱了吗？"），但晋升之后**没有任何东西**回答"晋升究竟兑现了 paper 承诺的东西吗？"。运营商/agent 无法发现整个管道存在的意义所要防的那个最危险结局——一个 paper 上看着很美、上线后悄悄亏钱的策略。`deploy --paper` → `promote-check` → `promote --to real` 这条链一直缺最后一环：上线后的回头验证
+- 关键洞察：两个时代的成交**已经**带同一个 strategy tag 分表存好了——`paper_trades` 是为晋升背书的**冻结基线**（晋升把 primitives 翻成 real 后 paper 表停止增长），`trades` 是上线以来的真实成交。无需新迁移、无需晋升时间戳：表本身就是时代分割线
+- 新模块 `promoteOutcome.ts`（~360 行）：
+  - 两个时代跑**同一个**成本基准 walker（`computePaperPnlMtm` via 导出的 `toMtmRows`）→ realized PnL 是 apples-to-apples 的；real 成交通过 `toMtmRows` 适配进 paper walker 的行形状
+  - **归一化对比**：per-fill realized PnL + per-week cadence——50 笔的 paper run 和 6 笔的 live run 公平比较，而不是误导性的原始总额
+  - 三段证据：`OutcomeEra`（fills/spanDays/fillsPerWeek/realized/perFill/中位 slippage/gas）× paper + real；`comparison`（per-fill ratio / cadence ratio / slippage ratio + `hasRealizedSignal`）
+- Verdict（文档化常量阈值，reasons[] 点名每条）：
+  - **insufficient_data**——无 live 成交（"还没上真钱，先 promote 或等首笔 live 成交"）/ < `MIN_REAL_FILLS`(3)（"太早，多跑几笔再看"）/ 无 paper 基线（"从没跑过 paper，没有可对比的对象"）
+  - **diverged**——paper realized > 0 但 live 每笔 realize ≤ 0（"真实执行下这策略不赚钱"）
+  - **underperforming**——live 每笔 realized < paper 的 60%（`UNDERPERFORM_RATIO_PCT`）/ live 中位 slippage > paper 假设的 1.5×（`SLIPPAGE_DIVERGENCE_RATIO`）/ live cadence < paper 的 50%（`CADENCE_CAUTION_PCT`，且 live runtime ≥ 2 天才采信，防小样本噪音）
+  - **on_track**——零 flag
+- 确定性 + 离线：verdict 只 key off realized PnL（闭合的 round-trip，无需 oracle）、live 成交**自己**的 realized slippage + gas、cadence——**绝不**依赖 unrealized marks。MTM 总额仅作上下文展示。`markPriceFn` 注入 seam（测试用确定 fetcher；生产用 defaultPaperPriceFetcher，且只在未注入时才创建文件 logger，保持测试纯净离线）
+- 诚实降级：paper 从未平仓（只买没卖、realized=0）→ `hasRealizedSignal=false`，PnL 对比作废、verdict 改由 execution quality + cadence 决定并明说；缺 nativeUsd → gas 退化为 native 单位、不伪造 USD 投影
+- Surfaces：CLI `tradekit playbook outcome <id> [--json]`（best-effort native price 表达 USD gas）+ MCP `playbook_outcome`（agent 自动化晋升后监控同款查询）
+- 测试覆盖：`promoteOutcome.test.ts` 12 case——三类 insufficient_data + INVALID_PARAMS + on_track 零 flag + diverged + underperforming（per-fill / slippage）+ paper 未平仓降级 + 归一化（per-fill/per-week 而非原始总额）+ gas USD/native 降级 + 渲染
+- MCP_TOOLS 不变量：`playbook_outcome` 加入 iter589/iter877 set（strategy-tools 注册数 16 → 17）；导出 `toMtmRows`（原 strategyReport 私有）作为两条路径共享的 walker 适配器
+- 向后兼容：纯加法——无 schema migration、无现有 CLI/MCP 行为改动、无引擎路径触动；现有部署直接升级拿到能力。`promote-check`（前瞻）+ `outcome`（回顾）现在对称地夹住 `promote` 这一步
+- v1 限制：时代分割完全靠"paper_trades vs trades 同 tag"——若运营商在晋升后又 demote 回 paper（`promote --to paper`），新的 paper 成交会混进基线（v2 可加显式 promote 时间戳列做精确切窗）；cadence 对比对固定 cron 的 DCA 意义不大（paper/real 同频），主要服务阈值触发型策略；realized 对比只覆盖稳定币计价的闭合 round-trip（与 walker 同约定）
+
 **Phase 41 — 并发 worker tick（per-round concurrent dispatch）** ✅
 - 解决 iter33 留下来的真实生产瓶颈：pre-iter41 engine supervisor 的 worker loop 是**严格顺序**的 — `for (const worker of workers) { if (due) await worker.tick(); }`。`orders` worker 在慢 RPC 上 tick 30s，`schedules` worker 就算 interval 到了也得等 30s 才能跑。iter33 加了 per-worker backoff 应对**重复失败**，但**正常缓慢**还是 N×SUM 而不是 MAX
 - 真实场景：5+ deployed strategies + 20 active orders + 多 chain（每 chain 自己的 RPC 延迟）+ 6 个 workers（orders/schedules/reconcile/rebalance/alerts/db_maintenance）顺序运行 = wall-clock 是所有 due workers tick 时间之和。对于慢 RPC tier 的运营商，吞吐量惩罚是数倍级的

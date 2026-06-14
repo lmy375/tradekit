@@ -1027,8 +1027,10 @@ async function buildForward(args: {
 /** Adapt success-status real trades to the MTM walker's row shape.
  *  The walker only reads (strategy, timestamp, id, chain, direction,
  *  base_token/symbol/amount, quote_symbol/amount) — every one of
- *  which TradeRow shares. */
-function toMtmRows(trades: readonly TradeRow[]): PaperTradeRow[] {
+ *  which TradeRow shares. Exported so the v50 promote-outcome check
+ *  can run REAL fills through the same cost-basis walker as paper
+ *  fills, making realized PnL apples-to-apples across the two eras. */
+export function toMtmRows(trades: readonly TradeRow[]): PaperTradeRow[] {
   return trades
     .filter((t) => t.status === "success")
     .map((t, i) => ({

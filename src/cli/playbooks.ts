@@ -752,8 +752,42 @@ export async function playbookCommand(
       }
       break;
     }
+    // v50: the BACKWARD half of the trust pipeline — "did promoting this
+    // strategy deliver what the paper run promised?" Compares the frozen
+    // paper baseline against the live fills, normalized per-fill + per-week.
+    case "outcome": {
+      const idArg = positional[2];
+      const id = parseInt(idArg ?? "", 10);
+      if (!Number.isInteger(id) || id <= 0) {
+        throw new ToolError("INVALID_PARAMS", `Usage: tradekit playbook outcome <id> [--json]`);
+      }
+      const { gatherPromoteOutcome, renderPromoteOutcome } = await import("../promoteOutcome.js");
+      // Best-effort native price so live gas can be expressed in USD;
+      // failure degrades to native-only reporting.
+      let nativeUsd: number | null = null;
+      try {
+        const { loadConfig, resolveProfile } = await import("../config.js");
+        const cfg = loadConfig();
+        const profile = resolveProfile(cfg.activeChain, cfg);
+        if (profile.weth) {
+          const { getCurrentPrice } = await import("../price.js");
+          const { makeCliLogger } = await import("./helpers.js");
+          nativeUsd = await getCurrentPrice(profile.weth, makeCliLogger(flags)).catch(() => null);
+        }
+      } catch {
+        // offline / unconfigured chain — report gas in native units
+      }
+      const report = await gatherPromoteOutcome({ playbookId: id, nativeUsd });
+      if (flags["json"] === "true") {
+        const { printJson } = await import("./helpers.js");
+        printJson({ ok: true, ...report });
+      } else {
+        console.log(renderPromoteOutcome(report));
+      }
+      break;
+    }
     default:
-      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace", "promote", "promote-check"]);
+      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace", "promote", "promote-check", "outcome"]);
   }
 }
 
