@@ -1295,6 +1295,16 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_trade_intents_status ON trade_intents(status, created_at);
   `,
+
+  // v61 — schedule failure circuit-breaker. Per-schedule count of
+  // CONSECUTIVE terminal fire failures (incremented by recordScheduleError,
+  // reset to 0 on a successful fire and on operator resume). The engine's
+  // opt-in scheduleCircuitBreaker auto-pauses a schedule once this crosses
+  // the configured threshold — so a persistently-reverting schedule stops
+  // bleeding gas on every cron window instead of failing forever.
+  `
+  ALTER TABLE schedules ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3648,6 +3658,10 @@ export interface ScheduleRow {
    *  occurrence. >0 means next_run_at is a retry slot, not a
    *  natural cron slot. */
   retry_count: number;
+  /** v61: consecutive TERMINAL fire failures (resets on a successful fire
+   *  and on operator resume). The engine's opt-in scheduleCircuitBreaker
+   *  auto-pauses the schedule when this crosses its threshold. */
+  consecutive_failures: number;
   last_run_at: string | null;
   last_run_tx_hash: string | null;
   last_run_status: string | null;
@@ -3831,6 +3845,7 @@ export function recordScheduleFire(
        last_error_message = NULL,
        run_count = run_count + 1,
        retry_count = 0,
+       consecutive_failures = 0,
        total_base_filled = ?,
        total_quote_spent = ?
      WHERE id = ?`,
@@ -3853,7 +3868,7 @@ export function recordScheduleError(
   nextRunAt: string,
   errorCode: string,
   errorMessage: string,
-): void {
+): number {
   const db = openDb();
   const now = new Date().toISOString();
   // NOTE: run_count is deliberately NOT incremented. run_count counts
@@ -3872,9 +3887,14 @@ export function recordScheduleError(
        last_run_status = 'failed',
        last_error_code = ?,
        last_error_message = ?,
-       retry_count = 0
+       retry_count = 0,
+       consecutive_failures = consecutive_failures + 1
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+  // v61: return the new consecutive-failure count so the tick can decide
+  // whether the circuit-breaker should auto-pause this schedule.
+  const r = db.prepare("SELECT consecutive_failures AS n FROM schedules WHERE id = ?").get(id) as { n: number } | undefined;
+  return r?.n ?? 0;
 }
 
 // ── operator notes (v37) ────────────────────────────────────
@@ -4422,8 +4442,11 @@ export function resumeSchedule(id: number, nextRunAt: string): number {
   if (!existing) return 0;
   if (existing.status !== "paused") return -1;
   const now = new Date().toISOString();
+  // v61: resuming is a fresh start — clear the consecutive-failure streak so
+  // a re-enabled schedule (e.g. after the operator fixed the cause of a
+  // circuit-breaker trip) isn't instantly re-paused by stale failures.
   const r = db
-    .prepare(`UPDATE schedules SET status = 'active', next_run_at = ?, updated_at = ? WHERE id = ?`)
+    .prepare(`UPDATE schedules SET status = 'active', next_run_at = ?, updated_at = ?, consecutive_failures = 0 WHERE id = ?`)
     .run(nextRunAt, now, id);
   return Number(r.changes);
 }

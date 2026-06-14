@@ -948,3 +948,79 @@ describe("runScheduleTick — max sizing", () => {
     ).toThrow(/SPEND side/);
   });
 });
+
+// ── v61: failure circuit-breaker ─────────────────────────────
+
+describe("runScheduleTick — failure circuit-breaker (v61)", () => {
+  // Force the schedule due again after each failed tick (recordScheduleError
+  // advances next_run_at to a future cron slot).
+  const reDue = (id: number) =>
+    openDb().prepare("UPDATE schedules SET next_run_at = ? WHERE id = ?").run(PAST, id);
+
+  it("increments consecutive_failures on terminal failures and resets on success", async () => {
+    const id = seedSchedule(); // paper, no balance → PAPER_INSUFFICIENT_BALANCE
+    await tick();
+    expect(getScheduleById(id)!.consecutive_failures).toBe(1);
+    reDue(id);
+    await tick();
+    expect(getScheduleById(id)!.consecutive_failures).toBe(2);
+    // Now fund the virtual book so the next fire SUCCEEDS → streak resets.
+    seedQuoteBalance("10000");
+    reDue(id);
+    await tick();
+    const row = getScheduleById(id)!;
+    expect(row.consecutive_failures).toBe(0);
+    expect(row.last_run_status).toBe("success");
+  });
+
+  it("auto-pauses the schedule once the streak hits the threshold (enabled)", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, scheduleCircuitBreaker: { enabled: true, maxConsecutiveFailures: 3 } } } as never);
+    try {
+      const id = seedSchedule();
+      // Fail twice — still active.
+      await tick();
+      reDue(id);
+      await tick();
+      expect(getScheduleById(id)!.status).toBe("active");
+      expect(getScheduleById(id)!.consecutive_failures).toBe(2);
+      // Third terminal failure trips the breaker.
+      reDue(id);
+      const report = await tick();
+      const row = getScheduleById(id)!;
+      expect(row.consecutive_failures).toBe(3);
+      expect(row.status).toBe("paused");
+      expect(report.fires.find((f) => f.scheduleId === id)?.circuitBroken).toBe(true);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+
+  it("does NOT auto-pause when the breaker is disabled (default)", async () => {
+    const id = seedSchedule();
+    for (let i = 0; i < 5; i++) {
+      reDue(id);
+      await tick();
+    }
+    const row = getScheduleById(id)!;
+    expect(row.consecutive_failures).toBe(5); // streak tracked...
+    expect(row.status).toBe("active"); // ...but never auto-paused
+  });
+
+  it("operator resume clears the streak", async () => {
+    const { resumeSchedule, pauseSchedule } = await import("./db.js");
+    const id = seedSchedule();
+    await tick();
+    reDue(id);
+    await tick();
+    expect(getScheduleById(id)!.consecutive_failures).toBe(2);
+    // Pause (streak persists), then resume — resume is a fresh start.
+    pauseSchedule(id);
+    expect(getScheduleById(id)!.consecutive_failures).toBe(2);
+    resumeSchedule(id, PAST);
+    const row = getScheduleById(id)!;
+    expect(row.status).toBe("active");
+    expect(row.consecutive_failures).toBe(0);
+  });
+});

@@ -33,6 +33,19 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 61 — 计划失败熔断（schedule failure circuit-breaker — stop a broken schedule bleeding gas forever）** ✅
+- **转向引擎自主可靠性**（无人值守 agent 最关键的运行时安全）。真实money-loss向量，后端逻辑确定性可验证
+- 缺口：一个**持续失败**的 schedule（每次 fire 都 revert——坏配置、死池、永远过不了 honeypot 探测的 token）会永远 fire-and-fail：v32 `fireRetry` 只做有界 backoff（3 次后下个 cron slot 顶上，又失败……），`strategyAlerts failure_streak` 只**通知**，**没有任何东西自动暂停**它。代码注释（recordScheduleError）甚至明说"想要 halt-on-error 的运营商可以从通知回调手动暂停"——确认了这个缺口。结果：unattended agent 上一个坏 schedule 每个 cron 窗口烧一次 revert 的 gas，运营商只能靠 pull（digest/health）发现
+- 新增 opt-in `engine.scheduleCircuitBreaker { enabled=false, maxConsecutiveFailures=5 }`：连续 N 次**终态** fire 失败后，引擎**自动暂停**该 schedule + 通知（critical, `schedule.circuit_broken`）。运营商排查后 `schedule resume`（清零 streak 重新启用）。默认关 → 现有部署保持"每次 occurrence 独立 fire"的 DCA 语义，逐字节不变
+- 实现：
+  - v61 migration：schedules 加 `consecutive_failures INTEGER DEFAULT 0`（纯加法）
+  - `recordScheduleError` 自增 streak 并**返回新计数**；`recordScheduleFire`（成功）归零；`resumeSchedule`（运营商重启）归零——"连续终态失败、成功/重启即重置"语义，与 strategyAlerts failure_streak 对齐
+  - schedule tick 两个终态失败站点（钱包加载失败 + 交易执行失败）都接 `maybeCircuitBreak(schedule, failCount, code)` 闭包：enabled && count ≥ 阈值 → `dbPauseSchedule` + critical 通知 + fire 标 `circuitBroken`。transient retry 路径**不**计入 streak（occurrence 未终结）
+- 与既有机制互补：`fireRetry`=瞬时失败有界重试；`scheduleCircuitBreaker`=持续失败永久熔断；`strategyAlerts`=通知（不暂停）；`drawdownCircuitBreaker`=组合亏损暂停全部交易（非 per-primitive 失败）。四者不同层、不重叠
+- 测试覆盖：`scheduleTick.test.ts` +4（streak 在终态失败递增、成功归零 / 阈值触发自动暂停 + circuitBroken fire 标 + 暂停前两次仍 active / 默认关时连 5 次失败仍 active（streak 仍追踪）/ 运营商 pause→resume 清零 streak）
+- 向后兼容：纯加法——migration 加列、config 默认关、recordScheduleError 返回值新增（既有 void 调用忽略无碍）；3266 测试全绿、零回归
+- v1 限制：只覆盖 **schedules**（最清晰的"永远 fire"gas-bleed 风险——cron 每窗口都烧）；**rebalances**（同样 cron 永久 fire）+ **orders**（fill revert 重试）是对称跟进；streak 计入所有终态失败（含 WALLET_NOT_FOUND 这类不烧 gas 的配置错——一个怎么都 fire 不了的 schedule 也该自动暂停 + 告警，语义正确）；阈值全局非 per-schedule（未来可 per-schedule 覆盖）
+
 **Phase 60 — 持有期 + 短/长期税务分类（holding period & short/long-term tax split）** ✅
 - **转向从未碰过的生产级关键支柱：会计/税务记录**（真金白银 + 合规依赖正确的已实现收益报告）。确定性、纯离线 → 本 loop 完全可验证
 - 缺口：`gains` 报告是**扁平的**（per-realization 记录 + 一个总额），既无 per-token 汇总，也无**持有期/短期 vs 长期分类**——而短/长期是报税最重要的区分（税率天差地别）

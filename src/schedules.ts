@@ -333,6 +333,9 @@ export interface ScheduleFireReport {
   nextRunAt?: string;
   /** v32: present on retry_pending — which attempt this failure was. */
   retryAttempt?: number;
+  /** v61: true when this terminal failure tripped the circuit-breaker and
+   *  the schedule was auto-paused. */
+  circuitBroken?: boolean;
 }
 
 export interface ScheduleTickReport {
@@ -456,6 +459,43 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
     } catch (e) {
       args.logger.debug(`schedule journal write failed (#${entry.scheduleId} ${entry.decision}): ${(e as Error).message}`);
     }
+  };
+
+  // v61: failure circuit-breaker. After a TERMINAL fire failure,
+  // recordScheduleError returns the new consecutive-failure count; if the
+  // breaker is enabled and the count crossed the threshold, auto-pause the
+  // schedule (stop a persistently-reverting schedule bleeding gas every
+  // window) + page the operator. Returns true when it paused.
+  const breaker = config.engine.scheduleCircuitBreaker;
+  const maybeCircuitBreak = async (schedule: ScheduleRow, failCount: number, lastCode: string): Promise<boolean> => {
+    if (!breaker?.enabled || failCount < breaker.maxConsecutiveFailures) return false;
+    const paused = dbPauseSchedule(schedule.id!);
+    if (paused <= 0) return false; // not active anymore (race) — nothing to pause
+    journal({
+      scheduleId: schedule.id!,
+      decision: "fire_failed",
+      notes: `circuit-breaker: auto-paused after ${failCount} consecutive failures`,
+    });
+    await tryNotify(
+      {
+        event: "schedule.circuit_broken",
+        severity: "critical",
+        title: `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} AUTO-PAUSED — ${failCount} consecutive failures`,
+        body: `The circuit-breaker tripped after ${failCount} consecutive terminal fire failures (threshold ${breaker.maxConsecutiveFailures}; last error ${lastCode}). The schedule is paused so it stops retrying and burning gas. Investigate, then \`tradekit schedule resume ${schedule.id}\` to re-enable (clears the streak).`,
+        fields: {
+          id: schedule.id,
+          chain: schedule.chain,
+          account: schedule.account,
+          consecutiveFailures: failCount,
+          threshold: breaker.maxConsecutiveFailures,
+          lastErrorCode: lastCode,
+        },
+        dedupKey: `schedule.circuit_broken:${schedule.id}`,
+      },
+      config,
+      args.logger,
+    );
+    return true;
   };
 
   // Walk in deterministic id order. dueSchedules already orders by id ASC,
@@ -796,9 +836,10 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
       }
       // Wallet load is a config / password problem. Record on the row but
       // ALSO advance next_run_at — otherwise the engine re-tries every tick.
-      recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
+      const failCount = recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
       journal({ scheduleId: schedule.id, decision: "fire_failed", errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
+      const broken = await maybeCircuitBreak(schedule, failCount, code);
       fires.push({
         scheduleId: schedule.id,
         name: schedule.name,
@@ -806,6 +847,7 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
         errorCode: code,
         errorMessage: msg,
         nextRunAt: nextAt.toISOString(),
+        ...(broken ? { circuitBroken: true } : {}),
       });
       continue;
     }
@@ -926,7 +968,7 @@ Transient failure — the occurrence is NOT lost yet. Next attempt at ${retry.re
       // DCA's per-occurrence semantic. The error trail stays on the row.
       const attemptsMade = schedule.retry_count ?? 0;
       const exhausted = isTransientErrorCode(code) && attemptsMade > 0;
-      recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
+      const failCount = recordScheduleError(schedule.id, nextAt.toISOString(), code, msg);
       journal({
         scheduleId: schedule.id,
         decision: "fire_failed",
@@ -934,6 +976,7 @@ Transient failure — the occurrence is NOT lost yet. Next attempt at ${retry.re
         notes: exhausted ? `occurrence skipped after ${attemptsMade + 1} attempts: ${msg.slice(0, 150)}` : msg.slice(0, 200),
       });
       failed += 1;
+      const broken = await maybeCircuitBreak(schedule, failCount, code);
       fires.push({
         scheduleId: schedule.id,
         name: schedule.name,
@@ -941,6 +984,7 @@ Transient failure — the occurrence is NOT lost yet. Next attempt at ${retry.re
         errorCode: code,
         errorMessage: msg,
         nextRunAt: nextAt.toISOString(),
+        ...(broken ? { circuitBroken: true } : {}),
       });
       // critical severity for terminal errors (safeguard, balance) so
       // pageable channels light up; warn for transient — EXCEPT when

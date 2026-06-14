@@ -754,6 +754,26 @@ const engineSchema = z
       })
       .strict()
       .default({ enabled: true, maxAttempts: 3, backoffMinutes: 5 }),
+    /**
+     * v61: schedule failure circuit-breaker. fireRetry handles a TRANSIENT
+     * failure (bounded backoff, then the next cron slot supersedes). But a
+     * PERSISTENTLY failing schedule — one that reverts every single fire
+     * (bad config, dead pool, a token that always fails its honeypot probe)
+     * — would otherwise fire-and-fail forever, burning gas on every revert
+     * and only surfacing via pull (digest/health) or a strategyAlerts
+     * notification. When enabled, the engine AUTO-PAUSES a schedule once its
+     * consecutive TERMINAL fire failures reach maxConsecutiveFailures, and
+     * notifies (critical). The operator investigates + `schedule resume`
+     * (which clears the streak). Default OFF — opt-in, so existing
+     * deployments keep the fire-each-occurrence-independently DCA semantic.
+     */
+    scheduleCircuitBreaker: z
+      .object({
+        enabled: z.boolean().default(false),
+        maxConsecutiveFailures: z.number().int().min(2).max(100).default(5),
+      })
+      .strict()
+      .default({ enabled: false, maxConsecutiveFailures: 5 }),
   })
   .strict()
   .default({
