@@ -1046,7 +1046,18 @@ export function toMtmRows(trades: readonly TradeRow[]): PaperTradeRow[] {
       base_amount: t.base_amount,
       quote_token: t.quote_token,
       quote_symbol: t.quote_symbol,
-      quote_amount: t.quote_amount,
+      // v111: feed the MTM walker the trade-time USD value (v104 value_usd) as
+      // the "quote" amount, not the raw quote-token amount. The walker computes
+      // cost basis + realized in quote terms but marks current value in USD
+      // (fetchPrice) — consistent ONLY when quote ≈ USD. For a non-stablecoin
+      // quote (WETH) the raw amount distorts every surface that walks real
+      // trades (gains/tax, promote-check, promote-outcome, open_positions) and
+      // disagrees with pnl.ts (v107). value_usd makes them all USD-coherent.
+      // Falls back to the raw amount for legacy/unpriced rows (stablecoin ≈ USD).
+      quote_amount:
+        t.value_usd != null && Number.isFinite(t.value_usd) && t.value_usd > 0
+          ? String(t.value_usd)
+          : t.quote_amount,
       price: t.price ?? "0",
       slippage_bps: null,
       strategy: t.strategy ?? null,

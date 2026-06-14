@@ -14,6 +14,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vites
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TradeRow } from "./db.js";
 
 const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-strategy-report-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
@@ -30,6 +31,7 @@ const {
   _buildActivity,
   _buildForward,
   _buildIdentity,
+  toMtmRows,
 } = await import("./strategyReport.js");
 const {
   openDb,
@@ -1302,5 +1304,36 @@ describe("buildStrategyReport — runway section", () => {
     expect(b.exhaustsAt).toBe("2026-06-29T00:00:00.000Z");
     // Sections not requested stay absent.
     expect(report.forward).toBeUndefined();
+  });
+});
+
+// v111: toMtmRows feeds the MTM walker trade-time USD (value_usd) as the quote
+// amount, so real-trade surfaces (gains/tax, promote, open_positions) are
+// USD-coherent on non-stablecoin quotes instead of distorted.
+describe("toMtmRows — value_usd normalization (v111)", () => {
+  const tr = (o: Partial<TradeRow>): TradeRow =>
+    ({ timestamp: "2026-01-01T00:00:00Z", chain: "base", account: "default", direction: "buy",
+       base_token: "0xb", base_symbol: "WETH", base_amount: "1", quote_token: "0xq", quote_symbol: "WETH",
+       quote_amount: "0.5", price: "0", tx_hash: "0x", status: "success",
+       gas_used: null, gas_price_wei: null, gas_cost_native: null, aggregator: null, fee_tier: null, notes: null, ...o } as TradeRow);
+
+  it("substitutes value_usd for quote_amount when present", () => {
+    const rows = toMtmRows([tr({ quote_amount: "0.5", value_usd: 1000 })]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].quote_amount).toBe("1000"); // USD, not 0.5 WETH
+  });
+
+  it("falls back to the raw quote_amount for legacy rows (no value_usd)", () => {
+    const rows = toMtmRows([tr({ quote_amount: "250", quote_symbol: "USDC" })]);
+    expect(rows[0].quote_amount).toBe("250");
+  });
+
+  it("ignores a non-positive/non-finite value_usd (falls back)", () => {
+    expect(toMtmRows([tr({ quote_amount: "7", value_usd: 0 })])[0].quote_amount).toBe("7");
+    expect(toMtmRows([tr({ quote_amount: "7", value_usd: null })])[0].quote_amount).toBe("7");
+  });
+
+  it("drops non-success rows", () => {
+    expect(toMtmRows([tr({ status: "failed", value_usd: 1000 })])).toHaveLength(0);
   });
 });

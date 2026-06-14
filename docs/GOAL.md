@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 111 — MTM walker 走真实交易也用 value_usd：gains/税务/promote/持仓与 pnl.ts 一致（toMtmRows feeds the MTM walker trade-time USD — gains/tax, promote, open_positions stop disagreeing with pnl.ts on non-stablecoin quotes）** ✅
+- **修复 v107 留下的姊妹 bug（两个已实现口径分叉）**：v107 修了 pnl.ts 的 aggregateTrades 用 value_usd。但 gains.ts（税务）、promote-check、promote-outcome、open_positions 走的是另一条路——共享 MTM walker（computePaperPnlMtm），经 `toMtmRows` 把真实交易喂进去。toMtmRows 一直传**原始 quote_amount（报价代币单位）**。walker 的成本/已实现按 quote 计、但 MTM 现值按 USD（fetchPrice）算——只有 quote≈USD（稳定币）时才自洽。WETH 报价时，walker 路径的成本基础失真，且与 pnl.ts（v107 已修）**给出不同的已实现数字**
+- 为什么重要：两个已实现/税务口径对同一笔非稳定币报价交易给出不同答案，是最该消灭的 coherence bug（同 v85/v100）。gains.ts 是报税数据。让所有走真实交易的 walker 消费者（税务/promote/持仓）与 pnl.ts 用同一个交易时刻精确美元，全部自洽
+- 实现（外科手术、仅改适配器、不碰 walker/paper 路径）：toMtmRows（real→walker 适配器）把 quote_amount 设为 value_usd（有则用、否则回退原 quote_amount）。walker 的 cost=quoteAmt、sellPrice=quoteAmt/baseAmt 全部不用 `price` 字段，所以喂 USD 即让整条链 USD 自洽；fetchPrice(base) 本就 USD。稳定币/legacy 行回退（value_usd≈quote_amount，零变化）。paper 路径不经 toMtmRows，完全不动
+- 测试覆盖：+4——value_usd 存在→quote_amount 用它（USD 非 0.5 WETH）/ 无 value_usd→回退原值 / 非正非有限→回退 / 非 success 行丢弃；3589 测试全绿（+4，logger.test 偶发 flake 隔离复跑通过、与本改动无关）
+- 向后兼容：纯改进——仅 toMtmRows 适配器改动；稳定币+legacy 行为不变；walker 与 paper 路径零改动；与 v107 合体让所有已实现口径自洽
+
 **Phase 110 — 持仓审阅合并保护状态：一次调用回答"赚没赚 + 有没有保护"（open positions gains per-position protection status — "how's it doing AND is it protected?" in one call）** ✅
 - **补上持仓管理驾驶舱的缺口**：自主 agent 审阅持仓时，open_positions 给每个持仓的成本基础/未实现盈亏/税务期限/价格 context，却**不含保护状态**——"这个 +50% 的赢家有没有挂止损？离触发还有多远？"得另调 position_protection（v76，且是聚合报告、不带逐仓盈亏）。两个工具交叉对照才能回答"赚没赚 + 有没有保护"。一个裸奔的赢家在持仓审阅里看不出来
 - 为什么重要：持仓管理是 agent 核心循环的一环。把保护状态并进持仓视图，让"该不该给这个仓加止损 / 这个赢家已保护、让它跑"成为一眼可判的决策，而非跨工具拼接。surfaces 一个 UNPROTECTED 的大赢家——既是有效性（管理）也是安全（暴露下行）
