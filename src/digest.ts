@@ -687,20 +687,26 @@ function gatherTrades(args: { since: string; until?: string }): TradesSection {
   let usdVolume = 0;
   const strategyTotals = new Map<string, { count: number; usdVolume: number }>();
   const baseTotals = new Map<string, number>();
+  // v104: report DOLLARS, not raw quote-token units — use the persisted USD
+  // value (value_usd), falling back to quote_amount for legacy/stablecoin rows.
+  // Keeps the displayed volume coherent with the daily USD cap (which now does
+  // the same), instead of under-counting non-stablecoin-quoted trades.
+  const usdOf = (r: TradeRow): number => {
+    const v = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
+    return Number.isFinite(v) ? v : 0;
+  };
   for (const r of filtered) {
     if (r.status === "success") success++;
     else if (r.status === "pending") pending++;
     else if (r.status === "failed") failed++;
 
     if (r.status === "success" || r.status === "pending") {
-      const usd = parseFloat(r.quote_amount);
-      if (Number.isFinite(usd)) usdVolume += usd;
+      usdVolume += usdOf(r);
     }
     if (r.strategy) {
       const cur = strategyTotals.get(r.strategy) ?? { count: 0, usdVolume: 0 };
       cur.count++;
-      const usd = parseFloat(r.quote_amount);
-      if (Number.isFinite(usd) && (r.status === "success" || r.status === "pending")) cur.usdVolume += usd;
+      if (r.status === "success" || r.status === "pending") cur.usdVolume += usdOf(r);
       strategyTotals.set(r.strategy, cur);
     }
     const baseSym = r.base_symbol ?? "(unknown)";

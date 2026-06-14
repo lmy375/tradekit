@@ -14,7 +14,7 @@ const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-db-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 // Static imports happen before tmp dir is set, so use dynamic import after env var.
-const { dailyUsdVolume, insertTrade, hasPriorTokenFill, closeDb } = await import("./db.js");
+const { dailyUsdVolume, usdSpentUnderStrategy, insertTrade, hasPriorTokenFill, closeDb } = await import("./db.js");
 type TradeRow = Awaited<ReturnType<typeof import("./db.js").recentTrades>>[number];
 
 const ACCOUNT = "test-acct";
@@ -81,6 +81,38 @@ describe("hasPriorTokenFill (v101 new-token detection)", () => {
   it("a prior SELL also counts — once held, no longer novel", () => {
     insertTrade(trade({ account: "sell-acct", base_token: "0xHELD", direction: "sell", status: "success" }));
     expect(hasPriorTokenFill({ account: "sell-acct", chain: CHAIN, baseToken: "0xHELD" })).toBe(true);
+  });
+});
+
+// v104: the USD-budget layer must sum DOLLARS (value_usd), not raw quote-token
+// units. A WETH-quoted trade's quote_amount is in WETH — counting it as USD
+// under-counted the daily cap + strategy budgets by the WETH price.
+describe("USD budgets use value_usd, fall back to quote_amount (v104)", () => {
+  it("dailyUsdVolume sums value_usd when present (WETH-quoted trade counts its USD, not 0.5)", () => {
+    const acct = "v104-daily";
+    // A WETH-quoted buy: 0.5 WETH spent, but value_usd = $1500.
+    insertTrade(trade({ account: acct, quote_symbol: "WETH", quote_amount: "0.5", value_usd: 1500 }));
+    insertTrade(trade({ account: acct, quote_symbol: "WETH", quote_amount: "0.3", value_usd: 900 }));
+    expect(dailyUsdVolume(acct, CHAIN)).toBe(2400); // 1500 + 900, NOT 0.8
+  });
+
+  it("dailyUsdVolume falls back to quote_amount for legacy rows (value_usd null)", () => {
+    const acct = "v104-legacy";
+    insertTrade(trade({ account: acct, quote_symbol: "USDC", quote_amount: "250" })); // no value_usd
+    expect(dailyUsdVolume(acct, CHAIN)).toBe(250);
+  });
+
+  it("dailyUsdVolume mixes priced + legacy rows correctly", () => {
+    const acct = "v104-mixed";
+    insertTrade(trade({ account: acct, quote_symbol: "WETH", quote_amount: "0.5", value_usd: 1500 }));
+    insertTrade(trade({ account: acct, quote_symbol: "USDC", quote_amount: "200" })); // legacy → 200
+    expect(dailyUsdVolume(acct, CHAIN)).toBe(1700);
+  });
+
+  it("usdSpentUnderStrategy uses value_usd too", () => {
+    insertTrade(trade({ account: "v104-strat", strategy: "dca-weth", quote_symbol: "WETH", quote_amount: "1", value_usd: 3000 }));
+    insertTrade(trade({ account: "v104-strat", strategy: "dca-weth", quote_symbol: "WETH", quote_amount: "0.5", value_usd: 1500 }));
+    expect(usdSpentUnderStrategy("dca-weth")).toBe(4500); // not 1.5
   });
 });
 

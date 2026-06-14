@@ -1348,6 +1348,18 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE trade_intents ADD COLUMN approval_reasons_json TEXT;
   `,
+
+  // v65 — v104: the trade's USD VALUE at execution time. The USD-budget layer
+  // (daily cap, strategy budgets) historically summed `quote_amount` as if it
+  // were dollars — TRUE only for stablecoin quotes. A WETH-quoted trade counted
+  // 0.5 (WETH) as $0.50, silently under-counting the daily USD guardrail by
+  // ~1000×. This column stores the real USD value (estimatedUsd = quote_amount ×
+  // quote-token USD price), computed at trade time. NULL on legacy rows + when
+  // the quote couldn't be priced; consumers COALESCE to quote_amount as the
+  // fallback (correct for stablecoin installs, the only number for legacy rows).
+  `
+  ALTER TABLE trades ADD COLUMN value_usd REAL;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -1403,6 +1415,12 @@ export interface TradeRow {
    *  success/pending rows, legacy failed rows, and rows where the replay
    *  couldn't extract a reason (no block_number, RPC unavailable, etc.). */
   revert_reason?: string | null;
+  /** v104: USD value of the trade at execution time (quote_amount × quote-token
+   *  USD price). The correct number for the daily USD cap + strategy budgets —
+   *  quote_amount alone is only USD when the quote is a stablecoin. NULL for
+   *  legacy rows + unpriceable-quote trades; budget consumers fall back to
+   *  quote_amount. */
+  value_usd?: number | null;
 }
 
 /**
@@ -1445,6 +1463,8 @@ export const TRADE_COLUMNS = [
   "strategy",
   // Iter669: persisted revert reason for failed trades (eth_call replay).
   "revert_reason",
+  // v104: USD value at trade time — the correct basis for USD budgets/export.
+  "value_usd",
 ] as const satisfies readonly (keyof TradeRow)[];
 
 // Compile-time guard: every TradeRow field MUST appear in TRADE_COLUMNS. If a future
@@ -1862,8 +1882,8 @@ export function insertTrade(row: TradeRow): number {
          price, tx_hash, status,
          gas_used, gas_price_wei, gas_cost_native,
          aggregator, fee_tier, notes, block_number, realized_slippage_bps,
-         gas_cost_usd_at_trade, strategy, revert_reason
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         gas_cost_usd_at_trade, strategy, revert_reason, value_usd
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       row.timestamp,
@@ -1900,6 +1920,8 @@ export function insertTrade(row: TradeRow): number {
       // Iter669: revert reason — almost always NULL at insert time (trade is
       // pending). Reconcile populates on failure transitions.
       row.revert_reason ?? null,
+      // v104: USD value at trade time — NULL when the quote couldn't be priced.
+      row.value_usd ?? null,
     );
   return Number(result.lastInsertRowid);
 }
@@ -3049,15 +3071,18 @@ export function listSyncBookmarks(): SyncBookmark[] {
 export function usdSpentUnderStrategy(tag: string, sinceIso?: string): number {
   const db = openDb();
   const args: (string | number)[] = [tag];
-  let sql = `SELECT quote_amount FROM trades WHERE strategy = ? AND status IN ('success','pending')`;
+  // v104: USD value (value_usd) when recorded, else quote_amount — same
+  // stablecoin-only-correctness fix as dailyUsdVolume. A strategy that trades
+  // with a non-stablecoin quote was burning its USD budget at a wildly wrong rate.
+  let sql = `SELECT value_usd, quote_amount FROM trades WHERE strategy = ? AND status IN ('success','pending')`;
   if (sinceIso) {
     sql += ` AND timestamp > ?`;
     args.push(sinceIso);
   }
-  const rows = db.prepare(sql).all(...args) as unknown as { quote_amount: string }[];
+  const rows = db.prepare(sql).all(...args) as unknown as { value_usd: number | null; quote_amount: string }[];
   let total = 0;
   for (const r of rows) {
-    const n = parseFloat(r.quote_amount);
+    const n = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
     if (Number.isFinite(n)) total += n;
   }
   return total;
@@ -3071,15 +3096,19 @@ export function dailyUsdVolume(account: string, chain?: string): number {
   // still confirm. If we exclude it from the budget, the user can fire a second trade
   // and double-spend their daily limit. 'failed' is excluded — gas was paid, but no
   // value moved, so it shouldn't consume budget.
-  let sql = `SELECT quote_amount, quote_symbol FROM trades WHERE account = ? AND timestamp > ? AND status IN ('success','pending')`;
+  // v104: sum the true USD value (value_usd) when recorded; fall back to
+  // quote_amount for legacy rows + unpriceable-quote trades. Pre-v104 this
+  // summed quote_amount alone — only correct when the quote is a stablecoin; a
+  // WETH-quoted trade under-counted the daily cap by the WETH price (~1000×).
+  let sql = `SELECT value_usd, quote_amount FROM trades WHERE account = ? AND timestamp > ? AND status IN ('success','pending')`;
   if (chain) {
     sql += ` AND chain = ?`;
     args.push(chain.toLowerCase()); // see recentTrades comment
   }
-  const rows = db.prepare(sql).all(...(args as never[])) as unknown as { quote_amount: string; quote_symbol: string | null }[];
+  const rows = db.prepare(sql).all(...(args as never[])) as unknown as { value_usd: number | null; quote_amount: string }[];
   let total = 0;
   for (const r of rows) {
-    const n = parseFloat(r.quote_amount);
+    const n = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
     if (Number.isFinite(n)) total += n;
   }
   return total;

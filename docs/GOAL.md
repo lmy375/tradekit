@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 104 — USD 预算按"美元"计而非"报价代币单位"：修复每日上限/策略预算对非稳定币报价交易的静默错算（USD budgets sum DOLLARS, not raw quote-token units — fix the daily-cap/strategy-budget undercount for non-stablecoin quotes）** ✅
+- **审计发现的安全护栏正确性 bug（非加 feature，是修错）**：整个 USD 预算层（每日 USD 上限 `dailyUsdVolume` + 策略预算 `usdSpentUnderStrategy`）历史上把 `quote_amount`（报价**代币**数量）直接当美元累加——**仅当报价是稳定币时才对**。一笔 WETH 报价的交易（quote_amount=0.5 WETH，约 \$1500）只算 \$0.50 进每日上限——把第二基础的安全护栏**静默低估约 1000×**。而单笔上限（per-tx）用的是 `estimatedUsd`（quote_amount × 报价代币 USD 价，**正确**）——两者不一致，每日的那个是错的。一个用 WETH 报价交易的 agent 能把每日 USD 限额超出几个数量级
+- 为什么是最重要的：自主交易的护栏必须真的按美元约束住。这是 v85（稳定币集合分叉）/v100（护栏计数漏项）同一类静默错算 bug，但发生在**强制执行层**（不只是显示）——比任何新 feature 都重要，因为它让运营商以为有的 USD 上限保护实际是漏的
+- 实现（持久化真实 USD 值 + 同源求和）：迁移 v65 给 `trades` 加 `value_usd REAL` 列；交易记录时存入执行时算好的 `estimatedUsd`（quote_amount × 报价 USD 价）。`dailyUsdVolume` + `usdSpentUnderStrategy` 改为 `value_usd ?? quote_amount`——有真实 USD 值就用，legacy/不可定价行回退 quote_amount（稳定币装机正确，且是 legacy 行唯一可用数）。per-tx 用 estimatedUsd、daily 用持久化的同一个 estimatedUsd→现在二者一致
+- 连带修复显示层一致性：digest 的 trades `usdVolume`（也在累加 quote_amount）同样改用 value_usd 回退——否则会出现"digest 显示成交额 \$X、上限却按 \$Y 计"的新不一致。value_usd 也进了 TRADE_COLUMNS（CSV/JSON 导出 + 编译期穷尽守卫保证 TradeRow↔导出列同步）
+- 测试覆盖：+5——dailyUsdVolume 用 value_usd（WETH 交易计 \$1500 非 0.5）/ legacy 回退 quote_amount / 混合行 / usdSpentUnderStrategy 同样 / digest usdVolume 用 value_usd；3543 测试全绿（+5）；迁移经测试套件（fresh DB）验证
+- 向后兼容：纯加法——`value_usd` 列 nullable；legacy 行（null）回退 quote_amount（与旧行为一致，稳定币装机零变化）；import/transfer 路径暂不填 value_usd→回退（已知小限制，可后续增强）；不改 per-tx 逻辑（本就正确）
+
 **Phase 103 — 引擎存活进 digest：引擎死了、保护性止损静默失效，心跳必须报警（engine liveness in the digest — a dead engine means trailing stops are silently inert）** ✅
 - **补上"心跳显示健康、引擎实际已死"的盲区**：引擎守护进程负责触发每一个定时单/DCA/再平衡，以及每一个保护性追踪止损。引擎一旦宕掉，这些全部静默失效——尤其**一个静默失效的追踪止损 = 一个无保护的持仓在一路下跌、却没人知道**。doctor 能查到（"有活动 primitive 但引擎状态过期"），但只在运营商手动跑时；cron digest（运营商真正盯的主心跳、带三档 verdict）**没有引擎存活信号**。digest 报"healthy"而引擎已死、止损全失效——正是 v55/v57 修过的那类危险盲区（"心跳说健康，钱包却敞着"）
 - 为什么是最重要的：自主交易里最吓人的静默失败之一——你以为有追踪止损保护持仓，但触发它的引擎是死的，持仓一路裸奔到底。运营商必须主动知道。这是可靠性支柱（相对安全支柱被反复打磨，可靠性被低估了），且 digest 报假"healthy"比没有 digest 更糟

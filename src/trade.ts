@@ -1428,6 +1428,10 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
         gas_cost_usd_at_trade: gasUsdAtTrade,
         strategy: req.strategy ?? null,
         revert_reason: revertReason,
+        // v104: the true USD value (quote_amount × quote-USD price) so the daily
+        // cap + strategy budgets sum dollars, not raw quote-token units. NULL
+        // when the quote couldn't be priced (budgets fall back to quote_amount).
+        value_usd: estimatedUsd ?? null,
       });
     } catch (e) {
       // Iter476: sanitize before logging — sqlite errors usually one-line but

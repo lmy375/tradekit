@@ -106,6 +106,7 @@ function seedTrade(args: {
   quoteAmount?: string;
   strategy?: string | null;
   baseSymbol?: string;
+  valueUsd?: number | null;
 }): number {
   return insertTrade({
     timestamp: args.timestamp,
@@ -120,6 +121,7 @@ function seedTrade(args: {
     gas_used: null, gas_price_wei: null, gas_cost_native: null,
     aggregator: null, fee_tier: null, notes: null,
     strategy: args.strategy ?? null,
+    value_usd: args.valueUsd,
   });
 }
 
@@ -159,6 +161,16 @@ describe("gatherDigest — trades section", () => {
     seedTrade({ timestamp: "2026-05-30T11:30:00Z" }); // inside 1h
     const r = await gatherDigest({ windowLabel: "1h", windowMs: 3_600_000, now });
     expect(r.trades.total).toBe(1);
+  });
+
+  // v104: volume reports DOLLARS (value_usd), not raw quote-token units.
+  it("usdVolume uses value_usd over quote_amount (WETH-quoted trade)", async () => {
+    const now = new Date("2026-05-30T12:00:00Z");
+    // quote_amount 0.5 (WETH) but value_usd $1500 — must count 1500.
+    seedTrade({ timestamp: "2026-05-30T11:00:00Z", quoteAmount: "0.5", valueUsd: 1500 });
+    seedTrade({ timestamp: "2026-05-30T10:00:00Z", quoteAmount: "100" }); // legacy → 100
+    const r = await gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.trades.usdVolume).toBe(1600); // 1500 + 100, not 100.5
   });
 
   it("ranks top strategies by count", async () => {    const now = new Date("2026-05-30T12:00:00Z");
