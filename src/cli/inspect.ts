@@ -2827,6 +2827,8 @@ export async function openPositionsCommand(flags: Record<string, string>) {
       account: flags["account"],
       chain: flags["chain"],
       strategy: flags["strategy"],
+      withContext: flags["context"] === "true" || flags["context"] === "",
+      contextDays: parseFloatFlag(flags["days"], "--days", { min: 1, max: 3650 }) ?? undefined,
     });
     if (flags["json"] === "true") {
       printJson({ ok: true, ...report });

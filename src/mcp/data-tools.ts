@@ -456,13 +456,15 @@ export const registerDataTools: RegisterFn = (server, rt) => {
       account: z.string().optional(),
       chain: z.string().optional(),
       strategy: z.string().optional().describe("Scope to one strategy tag's positions (else portfolio-level across all)."),
+      withContext: z.boolean().optional().describe("v67: attach recent price context (range position + trend) per position for EXIT timing — is the price near a recent high (good exit) or low? Each position carries priceContext { windowDays, low, high, rangePositionPct (0=low,100=high), changePctWindow, summary } (null when the token has no CoinGecko mapping). Off by default — it fetches a price series per token (cheap on the v66 cache, but a cold portfolio is N CoinGecko calls)."),
+      contextDays: z.number().int().min(1).max(3650).optional().describe("Lookback window (days) for withContext. Default 7."),
     },
-    async ({ mode, account, chain, strategy }) => {
+    async ({ mode, account, chain, strategy, withContext, contextDays }) => {
       try {
         return ok(
-          await runTool("open_positions", rt.opts, { mode, account, chain, strategy }, chain, async () => {
+          await runTool("open_positions", rt.opts, { mode, account, chain, strategy, withContext, contextDays }, chain, async () => {
             const { gatherOpenPositions } = await import("../openPositions.js");
-            return { ok: true, ...(await gatherOpenPositions({ mode: mode ?? "real", account, chain, strategy, config: rt.getConfig() })) };
+            return { ok: true, ...(await gatherOpenPositions({ mode: mode ?? "real", account, chain, strategy, withContext, contextDays, config: rt.getConfig() })) };
           }),
         );
       } catch (e) {

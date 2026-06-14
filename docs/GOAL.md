@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 67 — 退出决策合流（price context into open positions — one-read exit view）** ✅
+- **连贯收尾，非新增 surface**：v64 price context（入场时机）、v65 open positions（退出：PnL+持有期+税务 term）、v66 序列缓存。v65 的退出视图缺了 v64 提供的那一项——**当前价在近期区间的哪个位置**（近高=好平仓点，近低=也许持有），这对退出时机是决定性的。v66 刚把"每仓位拉一次序列"变得可负担（缓存+去重），合流时机正好
+- agent 退出决策需要三样：盈亏（有）、税务影响（term，有）、**现在价格好不好**（区间位置——此前不在 open_positions）。补上第三样 → open_positions 成为**一次调用的完整退出决策面**，agent 不必再额外为每个仓位调 price_context、也不会漏判
+- 实现：`gatherOpenPositions` 新增 opt-in `withContext`（+ `contextDays` 默认 7 + `seriesFetchImpl` 测试 seam）。开启时并行为每个仓位调 `gatherPriceContext`（native 经 profile.weth 解析 CoinGecko id；无映射→null 优雅降级），attach 紧凑子集 { windowDays, low, high, rangePositionPct, changePctWindow, summary } 到 `OpenPositionEntry.priceContext`。**并行 + v66 缓存/去重** 吸收重复 token，反复 review 便宜
+- 默认关：default open_positions 不拉序列（保持便宜）；agent/运营商要完整退出上下文时 opt in
+- Surfaces：CLI `positions --context [--days N]` + MCP `open_positions { withContext, contextDays }`，渲染加每仓位 "price ctx: +X% over Nd · Y% of range" 行
+- 测试覆盖：`openPositions.test.ts` +2（withContext 给映射 token（WETH）attach context（区间位置/趋势/summary）、给无映射 token（WBTC）置 null；关闭时 priceContext 为 undefined）+ `beforeEach(__clearSeriesCache)` 隔离 v66 模块级缓存
+- 向后兼容：纯加法——`priceContext` 字段仅在 withContext 时出现；默认行为不变；3302 测试全绿
+- v1 限制：冷缓存下 N 仓位 = N 次 CoinGecko 调用（故默认关、并行、靠 v66 缓存摊薄）；native 仓位经 weth 取上下文（与 price context CLI 同款）；无 CoinGecko 映射的 token 无上下文（优雅 null）
+
 **Phase 66 — 价格序列缓存（fetchPriceSeries TTL + in-flight cache — rate-limit resilience for the hot price path）** ✅
 - **硬化我最近功能依赖的核心热路径**，而非加新 feature：现价层早有 60s 缓存（iter132），但 **序列拉取（fetchPriceSeries / CoinGecko market_chart）一直无缓存**。v64 price_context、v65 持仓 mark、所有 backtest 都直打 CoinGecko，而免费档 ~10-30 req/min 限流很硬——agent 连续 screen 几个 token、或运营商迭代 backtest，就吃 429
 - 与 v38（批量化价格抓取减少 CoinGecko 调用）同一动机：减少对限流外部 API 的负载。这是"针对最重要的东西优化"——所有价格决策依赖的层

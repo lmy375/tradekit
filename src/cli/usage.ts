@@ -937,13 +937,16 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
   portfolio [--accounts a,b,c | --accounts all] [--chains a,b,c | --chains all] [--limit N] [--strict] [--json]
         Multi-account aggregate: per-token roll-up sorted by USD + concentration (top1/3/5 %).
         --strict exits 1 when any per-(account, chain) scan failed (iter796 — cron completeness gate).
-  positions [--account L] [--chain X] [--strategy TAG] [--paper] [--json]
+  positions [--account L] [--chain X] [--strategy TAG] [--paper] [--context [--days N]] [--json]
         v65: open-position review for EXIT timing — per held position: cost basis, current
         value, unrealized P&L (abs + %), weighted-avg acquisition date, holding days, and the
         tax term it WOULD be if sold NOW (short/long) + days-to-long-term. Summary flags
         positions approaching the 1-year long-term threshold. The exit counterpart to
         'price context' (entry) and the open-position completion of realized gains' holding
-        period. Cost basis from the same walker every P&L surface shares. MCP: open_positions.
+        period. Cost basis from the same walker every P&L surface shares.
+        v67: --context adds per-position price context (range position + Nd trend) — is the
+        price near a recent high (good exit) or low? — for a one-read exit-decision view
+        (off by default; fetches a price series per token, cached). MCP: open_positions.
   portfolio snapshot [--accounts ...] [--chains ...] [--note "..."] [--json]
         v48: --paper snapshots the VIRTUAL book instead — live-priced, written
         under the "paper:<account>" equity scope (bypasses the worker cadence).

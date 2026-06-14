@@ -52,6 +52,20 @@ export interface OpenPositionEntry {
   /** Days until this short-term position becomes long-term. Null when it's
    *  already long, or untracked (no acquisition date). */
   daysToLongTerm: number | null;
+  /** v67: recent price context (range position + trend) for EXIT timing —
+   *  is the price near a recent high (good exit) or low (maybe hold)?
+   *  Present only when withContext is requested; null when the token has no
+   *  CoinGecko mapping. Backed by the v66 series cache, so repeated reviews
+   *  are cheap. */
+  priceContext?: {
+    windowDays: number;
+    low: number;
+    high: number;
+    /** 0 = at the window low, 100 = at the window high; null when flat. */
+    rangePositionPct: number | null;
+    changePctWindow: number;
+    summary: string;
+  } | null;
 }
 
 export interface OpenPositionsReport {
@@ -79,6 +93,14 @@ export async function gatherOpenPositions(args: {
    *  (live); null/omitted leaves positions unpriced (cost basis still exact). */
   markPriceFn?: PaperPriceFetcher;
   now?: Date;
+  /** v67: attach recent price context (range position + trend) per position
+   *  for exit timing. Off by default — it fetches a price series per token
+   *  (cheap on the v66 cache, but a cold portfolio is N CoinGecko calls). */
+  withContext?: boolean;
+  /** Lookback window (days) for the price context. Default 7. */
+  contextDays?: number;
+  /** Test seam: the price-series fetcher (passed through to fetchPriceSeries). */
+  seriesFetchImpl?: (url: string) => Promise<unknown>;
 }): Promise<OpenPositionsReport> {
   const config = args.config ?? loadConfig();
   const now = args.now ?? new Date();
@@ -160,6 +182,37 @@ export async function gatherOpenPositions(args: {
   // Largest current value first (unpriced trail).
   positions.sort((a, b) => (b.valueQuote ?? -1) - (a.valueQuote ?? -1));
 
+  // v67: optional per-position price context (range/trend) for exit timing.
+  // Fetched in parallel; the v66 series cache + in-flight dedup absorb
+  // repeated/duplicate tokens. Native positions resolve to WETH for the
+  // CoinGecko id; unmapped tokens degrade to priceContext: null.
+  if (args.withContext && positions.length > 0) {
+    const { gatherPriceContext } = await import("./priceContext.js");
+    const { resolveProfile } = await import("./config.js");
+    const { NATIVE_TOKEN } = await import("./tokens.js");
+    const days = args.contextDays ?? 7;
+    await Promise.all(
+      positions.map(async (p) => {
+        try {
+          const profile = resolveProfile(p.chain, config);
+          const addr = p.token === NATIVE_TOKEN ? profile.weth : p.token;
+          if (!addr) { p.priceContext = null; return; }
+          const ctx = await gatherPriceContext({ tokenAddress: addr, windowDays: days, config, now, fetchImpl: args.seriesFetchImpl });
+          p.priceContext = ctx == null ? null : {
+            windowDays: ctx.windowDays,
+            low: ctx.low,
+            high: ctx.high,
+            rangePositionPct: ctx.rangePositionPct,
+            changePctWindow: ctx.changePctWindow,
+            summary: ctx.summary,
+          };
+        } catch {
+          p.priceContext = null; // a series-fetch hiccup never breaks the review
+        }
+      }),
+    );
+  }
+
   return {
     mode: args.mode,
     generatedAt: now.toISOString(),
@@ -203,6 +256,14 @@ export function renderOpenPositions(r: OpenPositionsReport): string {
     lines.push(
       `           held ${p.holdingDays != null ? `${p.holdingDays.toFixed(0)}d` : "—"} · ${term}${p.acquiredAt ? ` · since ${p.acquiredAt.slice(0, 10)}` : ""}`,
     );
+    if (p.priceContext !== undefined) {
+      const c = p.priceContext;
+      lines.push(
+        c == null
+          ? `           price ctx: — (no CoinGecko mapping)`
+          : `           price ctx: ${c.changePctWindow >= 0 ? "+" : ""}${c.changePctWindow.toFixed(1)}% over ${c.windowDays}d · ${c.rangePositionPct != null ? `${c.rangePositionPct.toFixed(0)}% of range` : "flat range"}`,
+      );
+    }
   }
   return lines.join("\n");
 }

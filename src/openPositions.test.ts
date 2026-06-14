@@ -16,6 +16,7 @@ process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 const { gatherOpenPositions, APPROACHING_LONG_TERM_DAYS } = await import("./openPositions.js");
 const { openDb, closeDb, recordPaperTrade } = await import("./db.js");
+const { __clearSeriesCache } = await import("./backtest.js");
 
 const WETH = "0x4200000000000000000000000000000000000006";
 const WBTC = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599";
@@ -26,7 +27,7 @@ const day = (n: number) => new Date(NOW.getTime() + n * DAY).toISOString();
 
 beforeAll(() => { openDb(); });
 afterAll(() => { closeDb(); rmSync(tmpDataDir, { recursive: true, force: true }); });
-beforeEach(() => { openDb().exec("DELETE FROM paper_trades"); });
+beforeEach(() => { openDb().exec("DELETE FROM paper_trades"); __clearSeriesCache(); });
 
 function trade(o: { ts: string; dir: "buy" | "sell"; base?: string; sym?: string; amount: string; quote: string }) {
   recordPaperTrade({
@@ -100,6 +101,29 @@ describe("gatherOpenPositions", () => {
     // Cost basis + holding period are exact even without a mark.
     expect(p.costBasisQuote).toBeCloseTo(2000, 6);
     expect(p.projectedTerm).toBe("short");
+  });
+
+  it("withContext attaches price context for mapped tokens, null for unmapped", async () => {
+    trade({ ts: day(-30), dir: "buy", amount: "1", quote: "2000" }); // WETH → coinId ethereum
+    trade({ ts: day(-30), dir: "buy", base: WBTC, sym: "WBTC", amount: "1", quote: "40000" }); // no mapping
+    const prices: [number, number][] = [100, 110, 120, 130, 140].map((p, i) => [NOW.getTime() - (4 - i) * DAY, p]);
+    const r = await gatherOpenPositions({
+      mode: "paper", markPriceFn: mark(3000), now: NOW,
+      withContext: true, seriesFetchImpl: async () => ({ prices }),
+    });
+    const weth = r.positions.find((p) => p.symbol === "WETH")!;
+    const wbtc = r.positions.find((p) => p.symbol === "WBTC")!;
+    expect(weth.priceContext).not.toBeNull();
+    expect(weth.priceContext!.rangePositionPct).toBeCloseTo(100, 0); // current at the high
+    expect(weth.priceContext!.changePctWindow).toBeCloseTo(40, 0);
+    expect(weth.priceContext!.summary).toMatch(/over 7d/);
+    expect(wbtc.priceContext).toBeNull(); // no CoinGecko mapping → graceful null
+  });
+
+  it("omits priceContext entirely when withContext is off (default)", async () => {
+    trade({ ts: day(-30), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gather(3000);
+    expect(r.positions[0].priceContext).toBeUndefined();
   });
 
   it("aggregates portfolio totals across positions", async () => {
