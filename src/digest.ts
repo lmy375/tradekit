@@ -252,6 +252,31 @@ export interface StrategyDigestSection {
   bleeding: string[];
 }
 
+/** v95: promote-outcome divergence — for each PROMOTED strategy, did the
+ *  live run deliver what the paper baseline promised, or is it quietly
+ *  bleeding against expectation? This is the trust pipeline's most
+ *  dangerous outcome (looked great on paper, loses money live) made
+ *  PROACTIVE — it was previously only checkable on demand. Distinct from
+ *  the v88 strategy section, which flags raw negative P&L: a strategy can
+ *  post POSITIVE raw P&L (so v88 stays quiet) yet realize a fraction of
+ *  its paper promise or slip far worse — divergence catches that. */
+export interface PromoteOutcomeSection {
+  /** Deployed playbooks evaluated this run. */
+  checked: number;
+  /** Only the actionable verdicts — underperforming or diverged. on_track
+   *  and insufficient_data are omitted (nothing for the operator to do). */
+  flagged: Array<{
+    playbookId: number;
+    name: string;
+    verdict: "underperforming" | "diverged";
+    /** The lead reason from the outcome report (most-severe first). */
+    topReason: string;
+  }>;
+  /** The single worst flagged strategy (diverged ranks above
+   *  underperforming), for the one-line verdict reason. Null when none. */
+  worst: { playbookId: number; name: string; verdict: "underperforming" | "diverged" } | null;
+}
+
 /** v47.5: agent trade-approval queue activity. pendingNow is the
  *  actionable number — an open intent means an agent is BLOCKED
  *  waiting on a human. */
@@ -293,6 +318,10 @@ export interface DigestReport {
   /** v88: per-strategy realized P&L for the window (null when no priced
    *  strategy trades fall in it). Surfaces bleeders proactively. */
   strategy?: StrategyDigestSection | null;
+  /** v95: promote-outcome divergence across promoted strategies (null when
+   *  no deployed playbooks, or the scan failed best-effort). A STANDING
+   *  signal (paper-vs-live, not window-scoped), so null in comparisons. */
+  promote?: PromoteOutcomeSection | null;
   /** When `--compare` was set, the same digest for the immediately-
    *  prior window with the same length. */
   comparison: {
@@ -313,17 +342,42 @@ export interface GatherDigestArgs {
   now?: Date;
 }
 
-export function gatherDigest(args: GatherDigestArgs): DigestReport {
+export async function gatherDigest(args: GatherDigestArgs): Promise<DigestReport> {
   const now = args.now ?? new Date();
   const config = args.config ?? loadConfig();
 
-  return gatherWindow({
+  const report = gatherWindow({
     nowMs: now.getTime(),
     windowMs: args.windowMs,
     windowLabel: args.windowLabel,
     config,
     includeComparison: args.compare ?? false,
   });
+
+  // v95: fold in promote-outcome divergence — a STANDING signal computed
+  // here (not in gatherWindow) because it's async and not window-scoped, like
+  // posture. Re-run classifyVerdict with it so the verdict has a single source
+  // of truth (rather than escalating ad hoc). The prior-window comparison keeps
+  // promote=null, consistent with posture (a current-state concept).
+  const promote = await gatherPromoteOutcomes(config, now);
+  report.promote = promote;
+  if (promote && promote.flagged.length > 0) {
+    const re = classifyVerdict({
+      trades: report.trades,
+      fires: report.fires,
+      safety: report.safety,
+      errors: report.errors,
+      alerts: report.alerts,
+      paper: report.paper,
+      intents: report.intents,
+      posture: report.posture,
+      strategy: report.strategy,
+      promote,
+    });
+    report.verdict = re.verdict;
+    report.verdictReasons = re.verdictReasons;
+  }
+  return report;
 }
 
 /** v57: standing posture — config review (v51) + binding runtime limit
@@ -402,6 +456,57 @@ function gatherStrategyPerf(args: { since: string; until?: string }): StrategyDi
     };
   } catch {
     return null; // feed unavailable — the digest never fails on strategy perf
+  }
+}
+
+// v95: promote-outcome divergence — a STANDING (not window-scoped) signal.
+// For every DEPLOYED playbook, reuse the SAME gatherPromoteOutcome verdict
+// engine (v50) that the on-demand check uses — no duplicated thresholds, so
+// the digest can never disagree with `playbook promote-outcome`. The verdict
+// is deterministic and offline (it keys off realized PnL + execution + cadence,
+// never MTM), so we inject a null mark-price fetcher to keep the digest's
+// no-RPC nature. Best-effort: one bad playbook never breaks the digest, and
+// the whole scan degrades to null on any failure.
+async function gatherPromoteOutcomes(config: Config, now: Date): Promise<PromoteOutcomeSection | null> {
+  try {
+    const { listPlaybooks } = await import("./db.js");
+    const deployed = listPlaybooks({ status: "deployed" });
+    if (deployed.length === 0) return null;
+    const { gatherPromoteOutcome } = await import("./promoteOutcome.js");
+    const flagged: PromoteOutcomeSection["flagged"] = [];
+    for (const pb of deployed) {
+      try {
+        const r = await gatherPromoteOutcome({
+          playbookId: pb.id,
+          config,
+          nativeUsd: null,
+          // Offline: the verdict never depends on MTM, so a null fetcher
+          // keeps the digest RPC-free while preserving the verdict exactly.
+          markPriceFn: async () => null,
+          now,
+        });
+        if (r.verdict === "underperforming" || r.verdict === "diverged") {
+          flagged.push({
+            playbookId: pb.id,
+            name: pb.name,
+            verdict: r.verdict,
+            topReason: r.reasons[0] ?? r.verdict,
+          });
+        }
+      } catch {
+        // a single playbook's outcome check failing must not sink the digest
+      }
+    }
+    // diverged outranks underperforming for the one-line verdict reason.
+    const worst =
+      flagged.find((f) => f.verdict === "diverged") ?? flagged.find((f) => f.verdict === "underperforming") ?? null;
+    return {
+      checked: deployed.length,
+      flagged,
+      worst: worst ? { playbookId: worst.playbookId, name: worst.name, verdict: worst.verdict } : null,
+    };
+  } catch {
+    return null; // promote-outcome unavailable — the digest never fails on it
   }
 }
 
@@ -881,6 +986,9 @@ export function classifyVerdict(args: {
   /** v88: per-strategy realized performance — a bleeding strategy is an
    *  effectiveness concern (losing money), distinct from operational health. */
   strategy?: StrategyDigestSection | null;
+  /** v95: promote-outcome divergence — a promoted strategy not delivering its
+   *  paper promise. The trust pipeline's most dangerous outcome. */
+  promote?: PromoteOutcomeSection | null;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
@@ -951,6 +1059,33 @@ export function classifyVerdict(args: {
         " — tradekit strategies compare",
     );
     attention = true;
+  }
+  // v95: promote-outcome divergence — a promoted strategy not delivering its
+  // paper promise. `diverged` (not making money with real execution, against a
+  // paper baseline that justified deploying real capital) is the trust
+  // pipeline's most dangerous outcome → critical, the operator should pause/cut
+  // it. `underperforming` (edge shrank, or execution materially worse) →
+  // attention. Distinct from v88 bleeding: divergence flags even a strategy
+  // posting positive raw P&L that falls short of its paper promise.
+  if (args.promote && args.promote.flagged.length > 0) {
+    const diverged = args.promote.flagged.filter((f) => f.verdict === "diverged");
+    const under = args.promote.flagged.filter((f) => f.verdict === "underperforming");
+    if (diverged.length > 0) {
+      const w = diverged[0];
+      reasons.push(
+        `${diverged.length} promoted strateg${diverged.length === 1 ? "y" : "ies"} DIVERGED from paper` +
+          ` (worst: ${w.name} #${w.playbookId}) — losing money vs the paper promise · tradekit playbook promote-outcome ${w.playbookId}`,
+      );
+      critical = true;
+    }
+    if (under.length > 0) {
+      const w = under[0];
+      reasons.push(
+        `${under.length} promoted strateg${under.length === 1 ? "y" : "ies"} underperforming paper` +
+          ` (e.g. ${w.name} #${w.playbookId}) — tradekit playbook promote-outcome ${w.playbookId}`,
+      );
+      attention = true;
+    }
   }
   // v28: a strategy alert firing inside the window is by definition
   // worth attention — that's what the operator configured it for.

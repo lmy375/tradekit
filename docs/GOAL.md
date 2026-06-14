@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 95 — promote-outcome 进 cron digest：主动抓住"纸面漂亮、实盘悄悄亏钱"的已晋升策略（promote-outcome divergence in the digest — surface the trust pipeline's most dangerous outcome PROACTIVELY）** ✅
+- **让信任管道最危险的信号变主动**：v49/v50 建了完整的纸面→实盘信任管道——promoteCheck（前向：这个纸面策略能上真钱吗？）+ promoteOutcome（后向：晋升后实盘兑现了纸面承诺吗？）。promoteOutcome 模块自己的注释说它抓的是"整个管道存在的意义就是防止的那个最危险结局：纸面看着很棒、实盘悄悄亏钱"。但它**只能按需查**（CLI/MCP），运营商得记得去跑。cron digest 是运营商的主动心跳；v88 把"原始亏损策略"放进了 digest，但一个策略可以**实盘正收益**（v88 不报警）却只兑现了纸面承诺的 30%、或滑点是纸面的 2 倍——这个 divergence 信号正是 digest 缺的
+- 为什么是最重要的：把真钱托付给自主 agent，最危险的不是单笔爆炸，而是**一个已晋升策略在"机械上成功"的同时持续低于预期地漏钱**——运营商不主动查就发现不了，等发现真金白银已经流走。把这个信号接进每 15 分钟的心跳，让管道最重要的判断从"按需"变"主动"。这收尾了 detect→journal→correlate→validate→**proactive surfacing** 这条可观测性弧
+- 实现（复用 v50 verdict 引擎，零阈值重复）：`gatherPromoteOutcomes(config, now)` 枚举所有 `status=deployed` 的 playbook，对每个调用**同一个** `gatherPromoteOutcome`（v50）——digest 永远不会和 `playbook promote-outcome` 给出不同判断。verdict 是确定性 + 离线的（只看已实现 PnL + 执行质量 + cadence，从不依赖 MTM），所以注入 `markPriceFn: async () => null` 保持 digest 的无 RPC 本性。只收集 `underperforming`/`diverged`（on_track/insufficient_data 无可操作项，略过）。最佳努力：单个 playbook 失败不拖垮 digest，整个扫描失败降级为 null
+- verdict 升级：`diverged`（实盘不赚钱、对着一个证明该投真钱的纸面基线）= 管道最危险结局 → **critical**（运营商应暂停/砍掉）；`underperforming`（edge 缩水 / 执行明显更差）→ **attention**。在 `classifyVerdict` 里统一升级（单一 verdict 真相源，不 ad-hoc），digest 文本 + slack + MCP `digest_summary` 的 `promote` 字段都带；prior-window 对比里 promote=null（标准 STANDING 信号约定，同 posture）
+- 架构：promote 是 STANDING（非窗口）信号，所以在 `gatherDigest`（异步）层算、不在 `gatherWindow`（同步）里——`gatherDigest` 因此变 async，连带 `gatherIncidentReport` + 各 4/2 个调用点 await（全在 async 上下文，无 ripple 阻力）
+- 测试覆盖：digest.test.ts +7——classifyVerdict 4（diverged→critical / underperforming→attention / diverged 压过 underperforming 且两条理由都出 / 无 flagged 不升级）+ 端到端 3（无 deployed playbook→promote=null / 纸面赚钱实盘亏→diverged+critical / on_track→section 在但 flagged 空、不升级）；3500 测试全绿（+7）
+- 向后兼容：纯加法——`promote` 字段 optional；digest 文本/slack 只在 flagged 非空时渲染（on-track 静默）；复用既有 verdict 引擎（零阈值漂移）；async 化 ripple 全在已 async 的调用点
+
 **Phase 94 — 逐信号校准：每个预交易告警真的预测更差的成交吗？（per-signal calibration — does each advisory flag earn its keep, or fire as noise?）** ✅
 - **让护栏诚实面对自己**：preflight 这些月累积了一堆 warn/critical 告警码（market_timing_caution / concentration_high / drawdown_approaching / mev_exposed…），每个都让 agent 更谨慎。但**从没人验证过它们到底准不准**——某个告警一响，随后的成交真的更差了吗？还是它只是噪声、徒增"caution"verdict、教 agent 把真信号也一起忽略？v75 校准只看 verdict 层（go vs caution 整体），看不到单个信号
 - 为什么是最重要的：信号可信度是整个 preflight 决策系统的根。一个常响却不预测任何坏处的告警，比没有更糟——它制造警报疲劳，稀释真正重要的告警。把"我们累积的每个建议信号"对着**实际成交结果**验证，是让 agent 的谨慎有的放矢、而非机械堆砌护栏。这正好收尾 detect→journal→correlate→**validate** 这条可观测性弧（v74 记录、v75 关联 verdict、v94 关联到逐信号）

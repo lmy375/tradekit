@@ -38,18 +38,18 @@ export interface IncidentReport {
   configChanges: Array<{ id: number; saved_at: string; source: string | null; hash: string }>;
 }
 
-export function gatherIncidentReport(args: {
+export async function gatherIncidentReport(args: {
   windowLabel: string;
   windowMs: number;
   strategy?: string;
   config?: Config;
   now?: Date;
-}): IncidentReport {
+}): Promise<IncidentReport> {
   const now = args.now ?? new Date();
   const windowEnd = now.toISOString();
   const windowStart = new Date(now.getTime() - args.windowMs).toISOString();
 
-  const digest = gatherDigest({
+  const digest = await gatherDigest({
     windowLabel: args.windowLabel,
     windowMs: args.windowMs,
     config: args.config,

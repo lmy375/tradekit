@@ -10,7 +10,7 @@ import { gatherIncidentReport, renderIncidentMarkdown } from "../incident.js";
 export async function incidentCommand(flags: Record<string, string>) {
   const windowLabel = flags["window"] ?? "4h";
   const windowMs = parseWindowMs(windowLabel);
-  const report = gatherIncidentReport({
+  const report = await gatherIncidentReport({
     windowLabel,
     windowMs,
     strategy: flags["strategy"],

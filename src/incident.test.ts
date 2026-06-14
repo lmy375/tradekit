@@ -57,13 +57,12 @@ function seedWindow(): void {
 }
 
 describe("gatherIncidentReport", () => {
-  it("composes digest + events + notes + config changes for the window", () => {
-    seedWindow();
+  it("composes digest + events + notes + config changes for the window", async () => {    seedWindow();
     // Out-of-window rows must not leak in.
     insertOperatorNote({ at: "2025-01-01T00:00:00Z", text: "ancient", strategy: null, source: "cli" });
     insertConfigHistory({ savedAt: "2025-01-01T00:00:00Z", hash: "old", source: "old", content: "{}" });
 
-    const r = gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000 });
+    const r = await gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000 });
     expect(r.notes).toHaveLength(1);
     expect(r.notes[0].text).toMatch(/rotated RPC/);
     expect(r.configChanges).toHaveLength(1);
@@ -76,9 +75,8 @@ describe("gatherIncidentReport", () => {
     expect(r.events.some((e) => e.kind === "signal.received")).toBe(true);
   });
 
-  it("strategy filter scopes the tail but keeps global notes", () => {
-    seedWindow();
-    const r = gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000, strategy: "other-tag" });
+  it("strategy filter scopes the tail but keeps global notes", async () => {    seedWindow();
+    const r = await gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000, strategy: "other-tag" });
     // The dca-eth failed trade is filtered out of the tail…
     expect(r.events.some((e) => e.kind === "trade.failure")).toBe(false);
     // …but the untagged note survives (global context semantics).
@@ -87,9 +85,8 @@ describe("gatherIncidentReport", () => {
 });
 
 describe("renderIncidentMarkdown", () => {
-  it("renders the reviewer order: verdict → activity → config → notes → events", () => {
-    seedWindow();
-    const r = gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000 });
+  it("renders the reviewer order: verdict → activity → config → notes → events", async () => {    seedWindow();
+    const r = await gatherIncidentReport({ windowLabel: "4h", windowMs: 4 * 3_600_000 });
     const md = renderIncidentMarkdown(r);
     const order = ["## Verdict", "## Activity", "## Config changes in window", "## Operator / agent notes", "## Critical events", "## Warnings"];
     let last = -1;
@@ -104,8 +101,7 @@ describe("renderIncidentMarkdown", () => {
     expect(md).toMatch(/config diff-version/); // remediation pointers
   });
 
-  it("empty window renders honest placeholders, never crashes", () => {
-    const r = gatherIncidentReport({ windowLabel: "1h", windowMs: 3_600_000 });
+  it("empty window renders honest placeholders, never crashes", async () => {    const r = await gatherIncidentReport({ windowLabel: "1h", windowMs: 3_600_000 });
     const md = renderIncidentMarkdown(r);
     expect(md).toMatch(/\(none — the config did not change/);
     expect(md).toMatch(/\(none in window — record context/);

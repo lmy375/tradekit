@@ -98,7 +98,7 @@ export async function runDigestPushTick(args: {
     args.logger.warn(`digest push: invalid notifications.digest.window "${cfg.window}": ${(e as Error).message}`);
     return { skipped: true, reason: "invalid window" };
   }
-  const report = gatherDigest({ windowLabel: cfg.window, windowMs, now, config: args.config });
+  const report = await gatherDigest({ windowLabel: cfg.window, windowMs, now, config: args.config });
 
   if (VERDICT_RANK[report.verdict] < VERDICT_RANK[cfg.minVerdict]) {
     // Deliberately NOT marked sent: if health degrades later today,

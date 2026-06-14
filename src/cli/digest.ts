@@ -96,6 +96,18 @@ function renderText(r: DigestReport): string {
       lines.push(`  ⚠ bleeding: ${s.bleeding.join(", ")}${s.worst && s.worst.realizedUsd < 0 ? ` (worst ${s.worst.strategy} −$${Math.abs(s.worst.realizedUsd).toFixed(2)})` : ""} — review/cut`);
     }
   }
+  // v95: promote-outcome divergence — promoted strategies not delivering their
+  // paper promise. Only rendered when something is flagged (the common
+  // all-on-track case stays quiet).
+  if (r.promote && r.promote.flagged.length > 0) {
+    lines.push(``);
+    lines.push(`PROMOTE OUTCOMES (${r.promote.checked} promoted): ${r.promote.flagged.length} diverging from paper`);
+    for (const f of r.promote.flagged) {
+      const badge = f.verdict === "diverged" ? "⛔ DIVERGED" : "⚠ underperforming";
+      lines.push(`  ${badge}: ${f.name} #${f.playbookId} — ${f.topReason}`);
+    }
+    lines.push(`  → tradekit playbook promote-outcome <id> for the full paper-vs-live comparison`);
+  }
   lines.push(``);
   lines.push(renderPaperText(r.paper));
   lines.push(``);
@@ -343,6 +355,15 @@ function renderSlack(r: DigestReport): string {
     lines.push(`*Safety:* ${safetyParts.join(" · ")}`);
   }
 
+  // v95: promote-outcome divergence — promoted strategies missing their paper
+  // promise. Only when flagged (the on-track case stays quiet).
+  if (r.promote && r.promote.flagged.length > 0) {
+    const parts = r.promote.flagged.map(
+      (f) => `${f.verdict === "diverged" ? "⛔" : "⚠"} \`${f.name}\` #${f.playbookId} ${f.verdict}`,
+    );
+    lines.push(`*Promote outcomes:* ${parts.join(" · ")}`);
+  }
+
   // Errors.
   if (r.errors.errorRows > 0) {
     lines.push(``);
@@ -380,7 +401,7 @@ export async function digestCommand(flags: Record<string, string>) {
   const strict = flags["strict"] === "true";
   const quiet = flags["quiet"] === "true";
 
-  const report = gatherDigest({
+  const report = await gatherDigest({
     windowLabel: window,
     windowMs,
     compare,
