@@ -517,6 +517,32 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── position_protection (v76) ─────────────────────────────
+  // Cross-references open positions against active stop/trailing sell orders
+  // to surface UNPROTECTED downside exposure — a position with no automated
+  // exit can crater the book in a crash, and nothing else flags it.
+  server.tool(
+    "position_protection",
+    "v76: which open positions have NO downside protection, and how much value is exposed? Cross-references open positions (v65) against active SELL orders that exit on a fall — a trailing stop or a price_below stop-loss. An autonomous agent accumulates spot positions; one unguarded holding can crater the book in a crash, and no other surface flags it. Returns { ok, positions: [{ chain, token, symbol, heldAmount, heldValueUsd, protectedAmount, unprotectedAmount, unprotectedValueUsd, status ('protected'|'partial'|'unprotected'), protectingOrders[] {id, triggerType, coversAmount, trailPct, targetPriceUsd}, takeProfitOrders }], totalValueUsd, totalUnprotectedValueUsd, unprotectedCount, partialCount, unpricedCount, summary }, sorted most-exposed first. Take-profit orders (price_above sells) are an UPSIDE exit, counted separately — NOT crash protection. Dynamic order sizes resolve: 'max' covers the whole position, 'N%' that fraction. mode='real' (default) audits real holdings; 'paper' the virtual book. Use to find holdings that need a stop, or as a risk gate (totalUnprotectedValueUsd). Deterministic given live marks.",
+    {
+      mode: z.enum(["real", "paper"]).optional().describe("Default real. paper audits the virtual book."),
+      account: z.string().optional(),
+      chain: z.string().optional(),
+    },
+    async ({ mode, account, chain }) => {
+      try {
+        return ok(
+          await runTool("position_protection", rt.opts, { mode, account, chain }, chain, async () => {
+            const { gatherPositionProtection } = await import("../positionProtection.js");
+            return { ok: true, ...(await gatherPositionProtection({ mode: mode ?? "real", account, chain, config: rt.getConfig() })) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── portfolio_snapshot / portfolio_history / portfolio_diff (iter618) ──
   // Persist + compare portfolio states over time. PnL captures realized trades
   // only; these capture the FULL position view (priced + unpriced, all

@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 76 — 持仓保护审计（position protection audit — which holdings have NO downside exit, and how much is at risk?）** ✅
+- **补一个真实的风控能力缺口，换个支柱发力（连续 3 期在 preflight，刻意离开）**：自主 agent 不断累积现货持仓。一个**没有保护性退出**（移动止损 / 止损单）的持仓在暴跌中完全裸露——单个无保护的大仓就能击穿整个 book。tradekit 早已分别追踪**开仓持仓**（v65）和**条件单**（trailing / price_below / price_above），但**没有任何地方交叉引用二者**：agent 可以持 $5k 某币、零自动下行退出，而无任何 surface 指出
+- 为什么是最重要的：安全 = 不因可预防的错误亏钱。preflight 把关**入场**，但**已持有的仓位**的下行保护此前是盲区。over-concentration（v72）、over-sizing（v70）之后，"裸奔持仓"是第三类爆仓源——且最隐蔽（仓位一旦建立就脱离了 pre-trade 把关）
+- 实现（纯 join + 注入 IO）：纯函数 `computeProtection(positions, orders)`——对每个持仓，找同 (chain, token) 的 active SELL 单中**下行保护型**（trailing 移动止损 / price_below 止损），按 base_amount 累加覆盖量（动态 sentinel 解析："max"→全仓、"N%"→该比例、定额→其值，封顶持仓量），算出 unprotected 余量 + 价值敞口。**take-profit（price_above sell）单独计数**——那是**上行**退出，非暴跌保护。status: protected/partial/unprotected
+- `gatherPositionProtection` 做 IO：gatherOpenPositions（v65 walker，live marks）× listOrders(active, sell) → computeProtection。按敞口降序（最危险在前）
+- Surfaces：CLI `positions --protection [--strict]`（per-position 表：held/protected/unprotected/at-risk$/stops + 🟢protected/🟡partial/🔴UNPROTECTED 徽章；--strict 在任一未保护时退 1，供 cron 风控门）+ MCP `position_protection`。MCP_TOOLS 不变量加 `position_protection`
+- 测试覆盖：`positionProtection.test.ts` 10——无单→unprotected 全额敞口 / "max" trailing→protected / price_below 止损→protected / 定额覆盖半仓→partial / "N%" sentinel 按比例 / **take-profit 不算保护**（单独计数）/ 跨 token-chain 不误配 / 超额覆盖封顶持仓 / 无价持仓→null 敞口仍分类 / 按敞口降序 + 汇总；CLI 离线烟雾（seed WETH+trailing→🟢、WBTC 无单→🔴 $64k 敞口，汇总「1 of 2」）
+- 向后兼容：纯加法——新模块、`positions` 加 `--protection` 旗、新 MCP 工具；只读；3387 测试全绿（+10）
+- v1 限制：下行保护 = trailing + price_below（price_above 是 TP，单独列）；动态单 "N%" 按持仓量近似（实际 % 按 fire 时 spendable，已注释）；覆盖按 base_amount 求和（未建模多单重叠的同一批，封顶持仓量足够保守）；按 (chain, token) 组合级（与 open_positions 一致）
+
 **Phase 75 — preflight 校准（preflight calibration — close the decision→outcome loop: were the verdicts actually predictive?）** ✅
 - **闭合 v74 的问责回路，而非加新面**：v74 让 agent 的**决策**可见（每次 go/caution/no_go），但只回答"决定了什么"。运营商更深的信任问题是"**判断对不对**"——preflight 裁决到底有没有预测力，还是噪音？本期把每次记录的裁决关联到其后发生的交易，按 verdict 报告实际结果（成交率、已实现滑点、失败数）
 - 为什么是最重要的：托管真钱给自主 agent，安全（已封顶）+ 问责（v74 决策可见）之后，第一位是**判断质量的验证**。"go 单干净成交（20bps、0% 失败）、caution 单更差（70bps、50% 失败）→ 裁决有预测力"——这是判断 agent 是否真的擅长此事的直接证据，也是 calibration/learning 回路此前缺失的一环

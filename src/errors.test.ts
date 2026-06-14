@@ -435,6 +435,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
   "price_context",
     // v65: open-position review (cost basis + unrealized + holding/term) for exit-timing.
     "open_positions",
+    // v76: open positions vs active stop/trailing orders → unprotected value at risk.
+    "position_protection",
     // v70: solve for the max admissible trade size (inverse of safety_headroom).
     "trade_sizing",
     // v74: preflight decision journal (verdicts incl. refused trades).

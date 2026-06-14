@@ -2828,6 +2828,20 @@ export async function openPositionsCommand(flags: Record<string, string>) {
   const mode = (flags["paper"] === "true" ? "paper" : "real") as "real" | "paper";
   const logger = makeCliLogger(flags);
   try {
+    // v76: `positions --protection` — audit open positions for downside
+    // protection (a trailing stop / stop-loss covering them) vs. unprotected
+    // value at risk. Different question from the holding-period exit review.
+    if (flags["protection"] === "true" || flags["protection"] === "") {
+      const { gatherPositionProtection, renderPositionProtection } = await import("../positionProtection.js");
+      const report = await gatherPositionProtection({ mode, account: flags["account"], chain: flags["chain"] });
+      if (flags["json"] === "true") {
+        printJson({ ok: true, ...report });
+      } else {
+        console.log(renderPositionProtection(report));
+        if (report.unprotectedCount + report.partialCount > 0 && flags["strict"] === "true") process.exitCode = 1;
+      }
+      return;
+    }
     const { gatherOpenPositions, renderOpenPositions } = await import("../openPositions.js");
     const report = await gatherOpenPositions({
       mode,

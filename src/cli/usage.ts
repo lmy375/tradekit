@@ -982,6 +982,13 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
         v67: --context adds per-position price context (range position + Nd trend) — is the
         price near a recent high (good exit) or low? — for a one-read exit-decision view
         (off by default; fetches a price series per token, cached). MCP: open_positions.
+  positions --protection [--account L] [--chain X] [--paper] [--strict] [--json]
+        v76: PROTECTION AUDIT — cross-references open positions against active stop /
+        trailing SELL orders. Per position: held vs protected vs unprotected amount +
+        the value at risk with NO downside exit. An unguarded spot holding can crater
+        the book in a crash and nothing else flagged it. Take-profit (price_above)
+        sells are counted separately — they're an upside exit, not crash protection.
+        --strict exits 1 when any position is unprotected/partial. MCP: position_protection.
   portfolio snapshot [--accounts ...] [--chains ...] [--note "..."] [--json]
         v48: --paper snapshots the VIRTUAL book instead — live-priced, written
         under the "paper:<account>" equity scope (bypasses the worker cadence).
