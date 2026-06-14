@@ -355,6 +355,18 @@ async function buildHealthReport(
     headroom = { error: (e as Error).message };
   }
 
+  // v124: position-protection audit (live marks + active orders) — feeds the
+  // risk verdict's protection dimension + the unprotected_positions nextAction.
+  // Whole-book (no account/chain filter) so the safety signal isn't narrowed by
+  // the dashboard's scope. Best-effort: a failure degrades to {error}.
+  let protection: import("../positionProtection.js").PositionProtectionReport | { error: string } | undefined;
+  try {
+    const { gatherPositionProtection } = await import("../positionProtection.js");
+    protection = await gatherPositionProtection({ mode: "real", config });
+  } catch (e) {
+    protection = { error: (e as Error).message };
+  }
+
   return composeHealthReport({
     scope: { accounts, chains },
     portfolio,
@@ -370,6 +382,7 @@ async function buildHealthReport(
     legacyBackfillCounts,
     config,
     headroom,
+    protection,
     // Iter729: pass measured orchestration time so the report carries it.
     elapsedMs: Date.now() - t0,
   });

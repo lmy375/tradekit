@@ -34,13 +34,14 @@ import { failureReasonHistogram } from "./db.js";
 import { computeAggregatorStats } from "./aggregatorStats.js";
 import { reviewSafety } from "./safetyReview.js";
 import type { SafetyHeadroomReport } from "./safetyHeadroom.js";
-import { combineRiskPosture } from "./riskPosture.js";
+import { combineRiskPosture, type ProtectionSummaryLite } from "./riskPosture.js";
+import type { PositionProtectionReport } from "./positionProtection.js";
 import { assessMevExposure } from "./mev.js";
 import { computePairStats } from "./pairStats.js";
 
 export interface HealthSectionError {
   /** Stable code an agent can branch on. */
-  code: "portfolio_failed" | "pnl_failed" | "approvals_failed" | "trades_failed" | "snapshots_failed" | "safety_failed";
+  code: "portfolio_failed" | "pnl_failed" | "approvals_failed" | "trades_failed" | "snapshots_failed" | "safety_failed" | "protection_failed";
   /** Human-readable error message. */
   message: string;
 }
@@ -222,7 +223,11 @@ export interface NextAction {
     | "concentration_high"
     // v81: trading on a public-mempool chain with no MEV protection (v77) —
     // ~0.5-3% sandwich leak per trade. Advisory.
-    | "mev_exposed";
+    | "mev_exposed"
+    // v124: open spot position(s) with no downside stop — a crash has no
+    // automated exit. Surfaced from the protection dimension (v76) the risk
+    // posture now assesses in the dashboard.
+    | "unprotected_positions";
   /** Imperative description an operator can act on. */
   message: string;
   /** Suggested CLI invocation. */
@@ -564,6 +569,24 @@ export function deriveNextActions(args: {
         severity: "medium",
       });
     }
+    // v124: unprotected positions. Historically the dashboard's risk verdict
+    // skipped protection (notChecked: ["protection"]) because it didn't fetch
+    // positions — so the agent's action inbox never said "you hold open
+    // positions with no downside stop". Now that the orchestrator feeds a
+    // protection summary, surface it like concentration/mev: a crash on
+    // unguarded spot has no automated exit. The standalone open_positions /
+    // position_protection tools carry the per-position re-arm actions.
+    if (args.risk.concernCodes.includes("unprotected_exposure")) {
+      actions.push({
+        code: "unprotected_positions",
+        message:
+          args.risk.topConcern && args.risk.concernCodes[0] === "unprotected_exposure"
+            ? args.risk.topConcern
+            : "Open position(s) have no downside stop — a crash has no automated exit. Arm a trailing stop.",
+        command: "tradekit positions --protection",
+        severity: "high",
+      });
+    }
   }
 
   // Iter693: sort by severity so the CLI render (which iterates in order)
@@ -884,6 +907,12 @@ export function composeHealthReport(args: {
    *  computes it — same orchestrator contract as portfolio/pnl). Drives the
    *  binding-constraint summary + limit_near_exhaustion rule. */
   headroom?: SafetyHeadroomReport | { error: string };
+  /** v124: pre-computed position-protection audit (needs live marks + active
+   *  orders, so the CLI/MCP layer fetches it — same contract as headroom). When
+   *  supplied, the risk verdict assesses the `protection` dimension it used to
+   *  skip (notChecked: ["protection"]) and the action inbox gains the
+   *  unprotected_positions rule. An {error} placeholder leaves it unchecked. */
+  protection?: PositionProtectionReport | { error: string };
 }): HealthReport {
   const errors: HealthSectionError[] = [];
 
@@ -953,24 +982,42 @@ export function composeHealthReport(args: {
     safety = buildSafetySection(args.config, headroom);
   }
 
+  // v124: position-protection summary (orchestrator-fetched like headroom —
+  // it needs live marks + active orders). An {error} placeholder leaves the
+  // dimension unchecked, exactly as before this wiring existed.
+  let protectionLite: ProtectionSummaryLite | null = null;
+  let protectionChecked = false;
+  if (args.protection && "error" in args.protection) {
+    errors.push({ code: "protection_failed", message: args.protection.error });
+  } else if (args.protection) {
+    protectionLite = {
+      totalValueUsd: args.protection.totalValueUsd,
+      totalUnprotectedValueUsd: args.protection.totalUnprotectedValueUsd,
+      unprotectedCount: args.protection.unprotectedCount,
+      partialCount: args.protection.partialCount,
+    };
+    protectionChecked = true;
+  }
+
   // v81: unified runtime risk verdict — composed from data we already have
-  // (portfolio concentration v72 + headroom v53 + pure MEV v77). No extra
-  // fetch. Protection (v76) needs positions we don't fetch here — left to the
-  // standalone `risk` command and noted in notChecked.
+  // (portfolio concentration v72 + headroom v53 + pure MEV v77). v124: the
+  // PROTECTION dimension (v76) is now included when the orchestrator supplies
+  // the audit — previously skipped here because positions weren't fetched, so
+  // the agent's primary dashboard was blind to unguarded spot exposure.
   let risk: HealthRiskSection | undefined;
   if (args.config) {
     const concentration =
       args.portfolio && !("error" in args.portfolio) ? args.portfolio.concentrationRisk : null;
     const headroomForRisk = args.headroom && !("error" in args.headroom) ? args.headroom : null;
     const mev = assessMevExposure(args.config.activeChain, args.config.mev);
-    const posture = combineRiskPosture({ concentration, headroom: headroomForRisk, mev, protection: null });
+    const posture = combineRiskPosture({ concentration, headroom: headroomForRisk, mev, protection: protectionLite });
     risk = {
       verdict: posture.verdict,
       criticalCount: posture.concerns.filter((c) => c.severity === "critical").length,
       elevatedCount: posture.concerns.filter((c) => c.severity === "warn").length,
       topConcern: posture.concerns[0]?.message ?? null,
       concernCodes: posture.concerns.map((c) => c.code),
-      notChecked: ["protection"],
+      notChecked: protectionChecked ? [] : ["protection"],
     };
   }
 

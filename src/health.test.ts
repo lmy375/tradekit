@@ -1300,4 +1300,50 @@ describe("health risk section (v81)", () => {
     expect(r.risk!.verdict).toBe("ok");
     expect(r.nextActions.some((a) => a.code === "concentration_high" || a.code === "mev_exposed")).toBe(false);
   });
+
+  // v124: protection dimension wired into the dashboard risk verdict + inbox.
+  function protReport(over: Partial<import("./positionProtection.js").PositionProtectionReport> = {}): import("./positionProtection.js").PositionProtectionReport {
+    return {
+      positions: [], totalValueUsd: 1000, totalUnprotectedValueUsd: 0,
+      unprotectedCount: 0, partialCount: 0, unpricedCount: 0,
+      summary: "test", generatedAt: "2026-06-15T00:00:00Z", ...over,
+    };
+  }
+  function composeWithProtection(protection: import("./positionProtection.js").PositionProtectionReport | { error: string }) {
+    return composeHealthReport({
+      scope: { accounts: [{ label: "a", address: "0x1111111111111111111111111111111111111111" as Address }], chains: ["base"] },
+      portfolio: makePortfolio({}), analyses: [], recentRows: [], since7d: "2026-05-22T00:00:00.000Z",
+      config: cfg({ perTxUsdLimit: 100 }), protection,
+    });
+  }
+
+  it("≥50% of the book unprotected → unprotected_exposure concern + unprotected_positions action (high)", () => {
+    const r = composeWithProtection(protReport({ totalValueUsd: 1000, totalUnprotectedValueUsd: 700, unprotectedCount: 2, partialCount: 0 }));
+    expect(r.risk!.concernCodes).toContain("unprotected_exposure");
+    expect(r.risk!.notChecked).not.toContain("protection"); // now assessed
+    const a = r.nextActions.find((x) => x.code === "unprotected_positions");
+    expect(a).toBeDefined();
+    expect(a!.severity).toBe("high");
+    expect(a!.command).toMatch(/positions --protection/);
+  });
+
+  it("fully protected book → protection assessed, no concern, no action", () => {
+    const r = composeWithProtection(protReport({ totalValueUsd: 1000, totalUnprotectedValueUsd: 0, unprotectedCount: 0, partialCount: 0 }));
+    expect(r.risk!.notChecked).not.toContain("protection");
+    expect(r.risk!.concernCodes).not.toContain("unprotected_exposure");
+    expect(r.nextActions.some((a) => a.code === "unprotected_positions")).toBe(false);
+  });
+
+  it("a small unprotected slice (<50% of book) does not nag the inbox", () => {
+    const r = composeWithProtection(protReport({ totalValueUsd: 1000, totalUnprotectedValueUsd: 100, unprotectedCount: 1, partialCount: 0 }));
+    expect(r.risk!.notChecked).not.toContain("protection");
+    expect(r.nextActions.some((a) => a.code === "unprotected_positions")).toBe(false);
+  });
+
+  it("protection fetch failed → dimension stays unchecked + a section error, dashboard still composes", () => {
+    const r = composeWithProtection({ error: "marks unavailable" });
+    expect(r.risk!.notChecked).toContain("protection");
+    expect(r.errors.some((e) => e.code === "protection_failed")).toBe(true);
+    expect(r.nextActions.some((a) => a.code === "unprotected_positions")).toBe(false);
+  });
 });

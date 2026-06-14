@@ -890,7 +890,7 @@ export const registerDataTools: RegisterFn = (server, rt) => {
   // health.errors[] can branch on the section that failed.
   server.tool(
     "health",
-    "Operator dashboard — single call returning current portfolio snapshot + 7d PnL + trade quality + standing approvals + composed next-action suggestions. Returns { ok, timestamp, elapsedMs, scope: {accounts[], chains[]}, portfolio?: {totalUsd, delta24h?, delta7d?, top[], concentration, ...}, pnl?: {realized7dUsd, unrealizedUsd, gas7dUsd, netAfterGas7dUsd, topWinner?, topLoser?}, trades?: {total, success/failed/pending counts, median/avg slippageBps, byVerdict}, security?: {totalApprovals, criticalCount, warnCount, topConcerns[]}, safety?: {postureVerdict, binding}, risk?: {verdict, criticalCount, elevatedCount, topConcern, concernCodes, notChecked}, errors[], nextActions[], nextActionsSummary, severity, criticalActions[] }. v81 — `risk` is the unified runtime risk verdict (v78) folded into the dashboard: concentration (v72) + headroom (v53) + MEV (v77) synthesized to ok/elevated/critical, computed from data the report already has (zero extra fetch); the `protection` dimension is in notChecked (run risk_posture for it). Drives concentration_high / mev_exposed next-actions the headroom binding doesn't cover. Iter764 — nextActionsSummary pre-computes {critical, high, medium, low} counts so agents don't iterate. Iter786 — top-level severity is the worst-bucket string ('ok' | 'critical' | 'high' | 'medium' | 'low'); branch on this for at-a-glance status. Iter827 — `criticalActions` is a pre-filtered slice of nextActions where severity==='critical' (always present, empty array when no critical actions). Dashboards / pager triggers branch on this field directly without iterating nextActions[]. Each top-level section is OPTIONAL — a failed sub-query drops the section into errors[] and the rest of the report still returns. nextActions[] is rule-derived (e.g. \"5 critical approvals → revoke_critical\"); each action carries a code + command + message so agents can dispatch automatically. Use as the morning briefing for an agent overseeing one or more accounts.",
+    "Operator dashboard — single call returning current portfolio snapshot + 7d PnL + trade quality + standing approvals + composed next-action suggestions. Returns { ok, timestamp, elapsedMs, scope: {accounts[], chains[]}, portfolio?: {totalUsd, delta24h?, delta7d?, top[], concentration, ...}, pnl?: {realized7dUsd, unrealizedUsd, gas7dUsd, netAfterGas7dUsd, topWinner?, topLoser?}, trades?: {total, success/failed/pending counts, median/avg slippageBps, byVerdict}, security?: {totalApprovals, criticalCount, warnCount, topConcerns[]}, safety?: {postureVerdict, binding}, risk?: {verdict, criticalCount, elevatedCount, topConcern, concernCodes, notChecked}, errors[], nextActions[], nextActionsSummary, severity, criticalActions[] }. v81 — `risk` is the unified runtime risk verdict (v78) folded into the dashboard: concentration (v72) + headroom (v53) + MEV (v77) synthesized to ok/elevated/critical. v124 — the `protection` dimension (v76) is now ALSO assessed here (the orchestrator fetches the position-protection audit), so notChecked is empty when it succeeds; if >50% of the book sits unprotected the inbox gains an `unprotected_positions` action (high) — previously the dashboard was blind to unguarded spot exposure and you had to run risk_posture separately. Drives concentration_high / mev_exposed / unprotected_positions next-actions the headroom binding doesn't cover. Iter764 — nextActionsSummary pre-computes {critical, high, medium, low} counts so agents don't iterate. Iter786 — top-level severity is the worst-bucket string ('ok' | 'critical' | 'high' | 'medium' | 'low'); branch on this for at-a-glance status. Iter827 — `criticalActions` is a pre-filtered slice of nextActions where severity==='critical' (always present, empty array when no critical actions). Dashboards / pager triggers branch on this field directly without iterating nextActions[]. Each top-level section is OPTIONAL — a failed sub-query drops the section into errors[] and the rest of the report still returns. nextActions[] is rule-derived (e.g. \"5 critical approvals → revoke_critical\"); each action carries a code + command + message so agents can dispatch automatically. Use as the morning briefing for an agent overseeing one or more accounts.",
     {
       chains: z.array(z.string()).optional().describe("Subset of chain names. Omit to scan every built-in + custom chain (same default as portfolio)."),
       accounts: z
@@ -1123,6 +1123,16 @@ export const registerDataTools: RegisterFn = (server, rt) => {
               healthHeadroom = { error: (e as Error).message };
             }
 
+            // v124: position-protection audit (best-effort) — feeds the risk
+            // verdict's protection dimension + the unprotected_positions action.
+            let healthProtection: import("../positionProtection.js").PositionProtectionReport | { error: string } | undefined;
+            try {
+              const { gatherPositionProtection } = await import("../positionProtection.js");
+              healthProtection = await gatherPositionProtection({ mode: "real", config });
+            } catch (e) {
+              healthProtection = { error: (e as Error).message };
+            }
+
             return {
               ok: true,
               ...composeHealthReport({
@@ -1140,6 +1150,7 @@ export const registerDataTools: RegisterFn = (server, rt) => {
                 legacyBackfillCounts,
                 config,
                 headroom: healthHeadroom,
+                protection: healthProtection,
                 // Iter729: orchestration wall-clock for the MCP path.
                 elapsedMs: Date.now() - t0,
               }),
