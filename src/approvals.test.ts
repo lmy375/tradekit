@@ -6,9 +6,29 @@
 
 import { describe, it, expect } from "vitest";
 import type { Address } from "viem";
-import { filterRevokeTargets, classifySpender, type ApprovalRow } from "./approvals.js";
+import { filterRevokeTargets, classifySpender, assertApproveSpenderAllowed, type ApprovalRow } from "./approvals.js";
 import type { ChainProfile } from "./chains.js";
 import type { Config } from "./config.js";
+import { ToolError } from "./errors.js";
+
+describe("assertApproveSpenderAllowed (v92 — approve-side drain gate)", () => {
+  const S = "0x9999999999999999999999999999999999999999";
+  it("throws APPROVE_SPENDER_NOT_ALLOWED for an unknown spender when allowlistOnly is on", () => {
+    expect(() => assertApproveSpenderAllowed({ allowlistOnly: true, spenderKnown: false, spender: S, chainName: "base" })).toThrowError(ToolError);
+    try {
+      assertApproveSpenderAllowed({ allowlistOnly: true, spenderKnown: false, spender: S, chainName: "base" });
+    } catch (e) {
+      expect((e as ToolError).code).toBe("APPROVE_SPENDER_NOT_ALLOWED");
+      expect((e as ToolError).message).toContain(S);
+    }
+  });
+  it("allows a KNOWN spender even when allowlistOnly is on", () => {
+    expect(() => assertApproveSpenderAllowed({ allowlistOnly: true, spenderKnown: true, spender: S, chainName: "base" })).not.toThrow();
+  });
+  it("is a no-op when allowlistOnly is off (unknown spender passes)", () => {
+    expect(() => assertApproveSpenderAllowed({ allowlistOnly: false, spenderKnown: false, spender: S, chainName: "base" })).not.toThrow();
+  });
+});
 
 const USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" as Address;
 const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as Address;

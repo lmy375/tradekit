@@ -341,7 +341,7 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
     label: "Transfer recipient allowlist",
     category: "exposure",
     state: allowlistOnly ? "active" : "off",
-    detail: allowlistOnly ? "agent transfers restricted to address-book recipients" : "off (agent can transfer to any address)",
+    detail: allowlistOnly ? "agent transfers + approvals restricted to known recipients/spenders" : "off (agent can transfer/approve to any address)",
   });
   if (!allowlistOnly) {
     gap(

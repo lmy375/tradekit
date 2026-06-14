@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 92 — 堵住 approve 侧门（close the approve drain side-door — make the v91 fund-movement lock actually sound）** ✅
+- **修复 v91 的旁路，使其真正生效（而非新主题）**：v91 锁住 transfer 到任意地址。但有个**旁路**：`approve(恶意 spender, max)` → 该合约用 transferFrom 直接抽走代币，完全绕过转账白名单。运营商开了 transferAllowlistOnly 以为"资金移动锁住了"，但 approve 仍开着（contractWhitelist 默认空=放行任意 spender）。前门锁了、侧门敞着——v91 的保护是虚的
+- 为什么是 v91 的一部分而非新功能：半关的门比明知敞着更糟。要让 v91 真正成立，approve 必须用同一开关一起关。这是让 v91 实际生效，不是第 N 个安全功能
+- 实现（同一开关 + 复用既有分类器）：`transferAllowlistOnly` 开启时，MCP `approve` 到**未知 spender**（非 iter681 `classifySpender` 判定的 curated router / contractWhitelist / address-book）→ 抛 `APPROVE_SPENDER_NOT_ALLOWED`。纯 gate `assertApproveSpenderAllowed`（镜像 v91 的 assertTransferAllowed）。revoke 不受限（移除敞口永远安全）。一个开关现在覆盖 transfer + approve = "agent 资金移动限于可信目的地/spender"
+- 边界一致：CLI（运营商）不受限——批准任意 spender、CLI 策展白名单；MCP 受限。默认 off（transferAllowlistOnly 本就默认 off）→零行为变化
+- 测试覆盖：`approvals.test.ts` +3（assertApproveSpenderAllowed 纯函数：未知 spender+on→抛带地址 / 已知→放行 / off→放行）；approve 工具描述 + safety review detail 更新（白名单现含 approve-spender）；新 ErrorCode `APPROVE_SPENDER_NOT_ALLOWED`（403）
+- 向后兼容：纯加法——复用 v91 的 transferAllowlistOnly 开关（无新 config）；默认 off 零行为变化；3483 测试全绿（+3）
+- 注入防御弧完整：config 改写（v89/v90）+ transfer 到任意地址（v91）+ approve 恶意 spender（v92）——agent 侧的盗窃/破坏面全封（外加既有 backup/panic/approve-own-trade 的 CLI-only 边界）
+- v1 限制：approve gate 端到端 RPC-bound 未单测（纯 assert 已测，与 v91 同纪律）；与 v91 共用一个 opt-in 开关（语义自然扩展）；revoke 永远放行（降敞口）
+
 **Phase 91 — 转账收款人白名单（transfer recipient allowlist — block agent fund-exfiltration to arbitrary addresses）** ✅
 - **堵住最直接的盗窃向量**：v89/v90 锁了配置改写，但**最直接的盗窃**——`transfer` 把资金转出到任意地址——此前在 MCP 上无收款人限制、无审批门（交易安全栈管 swap 的滑点/限额，但 transfer 是把钱整个转走到任意收款人，不可逆，目的地不受任何护栏约束）。被注入的 agent 一次 `transfer @max 0xattacker` 即可清空钱包。地址簿此前只是**信息性**的（recipientIsKnown 标记），不拦截
 - 为什么是最重要的：自主 agent 托管真钱，最坏情况是资金被转给攻击者（不可逆，比坏成交严重得多）。审批门（v47）只覆盖 buy/sell，transfer 漏掉了。这是 backup/panic/config-lock 同一信任边界的最后一块、也是危害最大的一块

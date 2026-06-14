@@ -68,6 +68,13 @@ export type ErrorCode =
   // and (unlike a swap) the trade safety stack doesn't constrain the
   // destination. The operator adds trusted recipients via the CLI.
   | "TRANSFER_RECIPIENT_NOT_ALLOWED"
+  // v92: approve over MCP to an UNKNOWN spender (not a curated router /
+  // contractWhitelist / address-book entry) while safety.transferAllowlistOnly
+  // is on. An approval to a malicious spender is an external drain (the spender
+  // pulls via transferFrom) — the side door that bypasses the v91 transfer
+  // allowlist. Closed by the same switch. Operator approves unknown spenders
+  // via the CLI.
+  | "APPROVE_SPENDER_NOT_ALLOWED"
   // v91: the agent tried to mutate the address book over MCP while
   // transferAllowlistOnly is on. The book is the operator's trusted-recipient
   // allowlist — letting the agent write it would let a prompt-injected agent
@@ -438,6 +445,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
     case "SAFETY_CONFIG_LOCKED":
     case "TRANSFER_RECIPIENT_NOT_ALLOWED":
+    case "APPROVE_SPENDER_NOT_ALLOWED":
     case "ADDRESS_BOOK_LOCKED":
     case "ENGINE_LOCKED":
       return 403;

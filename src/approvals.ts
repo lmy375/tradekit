@@ -189,6 +189,29 @@ export async function classifySpender(
   return { isKnown: false, source: "unknown" };
 }
 
+/**
+ * v92: approve-side fund-movement gate (pure). The completion of the v91
+ * transfer allowlist — an approval to an untrusted spender is an external drain
+ * (the spender pulls via transferFrom), bypassing the transfer allowlist. When
+ * `allowlistOnly` is on and the spender isn't known (router / contractWhitelist
+ * / address-book), refuse the (MCP) approve. No-op when off or the spender is
+ * known. The CLI (operator) never calls this. `spenderHint` flavors the error.
+ */
+export function assertApproveSpenderAllowed(args: {
+  allowlistOnly: boolean;
+  spenderKnown: boolean;
+  spender: string;
+  chainName: string;
+}): void {
+  if (args.allowlistOnly && !args.spenderKnown) {
+    throw new ToolError(
+      "APPROVE_SPENDER_NOT_ALLOWED",
+      `Refusing to approve spender ${args.spender} over MCP — safety.transferAllowlistOnly is on and this spender isn't a known router, in safety.contractWhitelist, or in the address book. An approval to an untrusted spender is an external drain vector. The operator allow-lists it via the CLI (\`tradekit config push safety.contractWhitelist.${args.chainName} ${args.spender}\` or \`tradekit address add\`), or runs the approve from the CLI.`,
+      { details: { spender: args.spender, allowlistOnly: true }, nextActions: [] },
+    );
+  }
+}
+
 export async function approveToken(
   ctx: {
     publicClient: PublicClient<Transport, Chain>;

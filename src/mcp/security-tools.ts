@@ -92,7 +92,7 @@ export const registerSecurityTools: RegisterFn = (server, rt) => {
   // ── approve ───────────────────────────────────────────────
   server.tool(
     "approve",
-    "Approve an ERC20 token allowance for a spender. Pass infinite=true for max approval (blocked by safety unless override=true or safety.allowInfiniteApprovals=true). Units: amount is in token decimal units. Result also carries (iter681) `spenderIsKnown` (boolean), `spenderLabel` (when known), `spenderClassification` (`router` for curated aggregators like KyberSwap/OpenOcean/Uniswap, `whitelist` for config-driven matches, `address-book` for operator-labeled, `unknown` otherwise) — agents approving to a spender with `spenderIsKnown=false` should treat the allowance as higher-risk and verify the spender out-of-band before proceeding to a follow-up trade that would use it. Errors: INVALID_PARAMS (no amount AND no infinite — explicit intent required), UNKNOWN_TOKEN (symbol/address can't be resolved on this chain; details.suggestion may carry a close match), TOKEN_BLOCKED, CONTRACT_BLOCKED (spender not in safety.contractWhitelist — nextActions points to config push), SAFEGUARD_TRIGGERED (infinite without override), AMOUNT_EXCEEDS_LIMIT (USD value over maxApprovalUsdLimit cap), TX_TIMEOUT (tx sent but no receipt within waitForReceipt timeout — row is persisted as pending; reconcile to resolve), TX_REVERTED (sendTransaction itself rejected — gas too low / nonce conflict / replacement-underpriced; classifyReason patterns provide actionable nextActions). On a reverted on-chain approve (status=\"failed\") the result carries explorerUrl + a viewTx nextAction; the tx still cost gas.",
+    "Approve an ERC20 token allowance for a spender. Pass infinite=true for max approval (blocked by safety unless override=true or safety.allowInfiniteApprovals=true). Units: amount is in token decimal units. Result also carries (iter681) `spenderIsKnown` (boolean), `spenderLabel` (when known), `spenderClassification` (`router` for curated aggregators like KyberSwap/OpenOcean/Uniswap, `whitelist` for config-driven matches, `address-book` for operator-labeled, `unknown` otherwise) — agents approving to a spender with `spenderIsKnown=false` should treat the allowance as higher-risk and verify the spender out-of-band before proceeding to a follow-up trade that would use it. v92 SECURITY: when safety.transferAllowlistOnly is on, approving an UNKNOWN spender (not a curated router / safety.contractWhitelist / address-book entry) over MCP is refused with APPROVE_SPENDER_NOT_ALLOWED — an approval to an untrusted spender is an external drain vector (it pulls via transferFrom), the side door that bypasses the transfer allowlist; the operator allow-lists the spender or approves from the CLI. Errors: APPROVE_SPENDER_NOT_ALLOWED (unknown spender under transferAllowlistOnly), INVALID_PARAMS (no amount AND no infinite — explicit intent required), UNKNOWN_TOKEN (symbol/address can't be resolved on this chain; details.suggestion may carry a close match), TOKEN_BLOCKED, CONTRACT_BLOCKED (spender not in safety.contractWhitelist — nextActions points to config push), SAFEGUARD_TRIGGERED (infinite without override), AMOUNT_EXCEEDS_LIMIT (USD value over maxApprovalUsdLimit cap), TX_TIMEOUT (tx sent but no receipt within waitForReceipt timeout — row is persisted as pending; reconcile to resolve), TX_REVERTED (sendTransaction itself rejected — gas too low / nonce conflict / replacement-underpriced; classifyReason patterns provide actionable nextActions). On a reverted on-chain approve (status=\"failed\") the result carries explorerUrl + a viewTx nextAction; the tx still cost gas.",
     {
       chain: z.string().optional(),
       token: z.string().describe("ERC20 token address or symbol (must resolve via chain profile)."),
@@ -139,6 +139,22 @@ export const registerSecurityTools: RegisterFn = (server, rt) => {
                 "INVALID_PARAMS",
                 `amount "${input.amount}" rounds to 0 raw units at ${meta.decimals} decimals — too small to grant. Use at least the minimum representable amount (${formatUnits(1n, meta.decimals)}). To revoke an existing allowance, use the dedicated \`revoke\` tool instead.`,
               );
+            }
+            // v92: close the approve side-door of the v91 fund-movement lock.
+            // An approval to a malicious spender is an external drain (it pulls
+            // via transferFrom) — bypassing the transfer allowlist. When
+            // transferAllowlistOnly is on, refuse an approve to an UNKNOWN
+            // spender (not a curated router / contractWhitelist / address-book
+            // entry) over MCP. The operator approves unknown spenders via CLI.
+            if (config.safety.transferAllowlistOnly === true) {
+              const { classifySpender, assertApproveSpenderAllowed } = await import("../approvals.js");
+              const cls = await classifySpender(input.spender as `0x${string}`, profile, config);
+              assertApproveSpenderAllowed({
+                allowlistOnly: true,
+                spenderKnown: cls.isKnown,
+                spender: input.spender,
+                chainName: profile.name,
+              });
             }
             return await approveToken(
               {
