@@ -76,7 +76,11 @@ export interface Logger {
   recordTrade(row: Omit<TradeRow, "id">): number;
   readRecentTrades(n: number, filter?: { chain?: string; account?: string }): TradeRow[];
   recordAudit(row: Omit<AuditRow, "id">): number;
-  close(): void;
+  /** Closes the file stream. Returns a Promise that resolves once the stream
+   *  has FLUSHED to the OS (so a caller that reads the log right after — e.g.
+   *  a test, or a shutdown that tails the log — sees every line). Callers that
+   *  don't care can ignore the return (fire-and-forget still flushes). */
+  close(): void | Promise<void>;
 }
 
 export interface LoggerOptions {
@@ -162,8 +166,14 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
       return insertAudit(row);
     },
 
-    close() {
-      logStream?.end();
+    close(): void | Promise<void> {
+      const s = logStream;
+      logStream = null; // idempotent: a second close is a no-op
+      if (s == null) return;
+      // end(cb) fires the callback on the stream's 'finish' event — i.e. after
+      // all buffered writes have flushed. Awaiting this removes the race where
+      // a fixed setTimeout guessed at the flush delay.
+      return new Promise<void>((resolve) => s.end(() => resolve()));
     },
   };
 }

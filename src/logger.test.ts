@@ -138,9 +138,7 @@ describe("createLogger central newline-collapse (iter480)", () => {
     logger.info("first line\nsecond line");
     logger.warn("crlf\r\nstyle");
     logger.error("triple\n\n\nblank");
-    logger.close();
-    // Allow the write stream to flush before reading.
-    await new Promise((r) => setTimeout(r, 50));
+    await logger.close(); // resolves once the stream has flushed — no timing race
     const serverLog = join(tmpDir, "server.log");
     const contents = readFileSync(serverLog, "utf-8");
     // Each logger call produced exactly one line (terminating "\n" only).
@@ -165,8 +163,7 @@ describe("createLogger fileLevel + createSilentLogger", () => {
   it("default createLogger opens + writes the server log", async () => {
     const logger = createLogger({ stderrLevel: "silent" });
     logger.info("hello-from-default");
-    logger.close();
-    await new Promise((r) => setTimeout(r, 50)); // let the async stream flush
+    await logger.close(); // resolves once the stream has flushed — no timing race
     expect(existsSync(serverLogPath)).toBe(true);
     expect(readFileSync(serverLogPath, "utf8")).toContain("hello-from-default");
   });
@@ -197,8 +194,7 @@ describe("createLogger fileLevel + createSilentLogger", () => {
     logger.info("info-skip");
     logger.warn("warn-keep");
     logger.error("error-keep");
-    logger.close();
-    await new Promise((r) => setTimeout(r, 50)); // let the async stream flush
+    await logger.close(); // resolves once the stream has flushed — no timing race
     const body = readFileSync(serverLogPath, "utf8");
     expect(body).not.toContain("dbg-skip");
     expect(body).not.toContain("info-skip");

@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 112 — logger.close() 保证 flush：消除测试套件里的计时竞态 flake（awaitable logger flush — kill the fixed-setTimeout race that made the suite intermittently red）** ✅
+- **修复侵蚀"全绿"信号的 flaky 测试**：每次迭代我都靠"3589 全绿"来验证正确性工作。但 logger.test.ts 偶发失败（"fileLevel gates which levels reach the disk"）——`logger.close()` 是 fire-and-forget（`logStream.end()`），测试用固定 `setTimeout(50ms)` 等异步 flush 再读文件；并行满载下 50ms 不够，readFileSync 在 warn-keep/error-keep 落盘前就读了→失败。一个偶发红是真实负债：它侵蚀对测试套件的信任，还可能掩盖真实失败（开发者看到红以为是 flake 而忽略真 break）
+- 为什么重要：测试套件是保护所有正确性投资（v104-v111 整条 value_usd 弧）的根基。一个不可信的"全绿"让每次迭代的验证打折。修掉 flake 的根因比任何新 feature 都更保护已有工作
+- 实现（顺带改善生产）：`close()` 从 `void` 改为 `void | Promise<void>`——返回一个在流 `'finish'`（即已 flush 到 OS）时 resolve 的 Promise（`s.end(() => resolve())`），无流时立即返回；idempotent（二次 close 是 no-op）。不 await 的调用者（如 web.ts 关停）行为不变（Promise 被忽略、end 照常）；想要 flush 保证的（测试、tail 日志的关停）可 await。logger.test.ts 的 3 处 `close(); await setTimeout(50)` 换成 `await close()`——确定性、零竞态
+- 生产收益：任何"关闭 logger 后读/依赖日志文件"的路径现在确定（如关停时 tail server.log）
+- 测试覆盖：现有 15 个 logger 测试不变（行为相同、只是等待方式确定化）；logger 单跑 5×、全套跑 2× 全绿确认 flake 消除；3589 测试全绿
+- 向后兼容：纯改进——接口拓宽为 `void | Promise<void>`（void 调用点全兼容）；createSilentLogger 委托 createLogger 无单独实现；不改日志写入逻辑
+
 **Phase 111 — MTM walker 走真实交易也用 value_usd：gains/税务/promote/持仓与 pnl.ts 一致（toMtmRows feeds the MTM walker trade-time USD — gains/tax, promote, open_positions stop disagreeing with pnl.ts on non-stablecoin quotes）** ✅
 - **修复 v107 留下的姊妹 bug（两个已实现口径分叉）**：v107 修了 pnl.ts 的 aggregateTrades 用 value_usd。但 gains.ts（税务）、promote-check、promote-outcome、open_positions 走的是另一条路——共享 MTM walker（computePaperPnlMtm），经 `toMtmRows` 把真实交易喂进去。toMtmRows 一直传**原始 quote_amount（报价代币单位）**。walker 的成本/已实现按 quote 计、但 MTM 现值按 USD（fetchPrice）算——只有 quote≈USD（稳定币）时才自洽。WETH 报价时，walker 路径的成本基础失真，且与 pnl.ts（v107 已修）**给出不同的已实现数字**
 - 为什么重要：两个已实现/税务口径对同一笔非稳定币报价交易给出不同答案，是最该消灭的 coherence bug（同 v85/v100）。gains.ts 是报税数据。让所有走真实交易的 walker 消费者（税务/promote/持仓）与 pnl.ts 用同一个交易时刻精确美元，全部自洽
