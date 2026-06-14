@@ -23,6 +23,8 @@ const {
   validateTargets,
   computeDrift,
   planRebalanceTrades,
+  gatherRebalancePreview,
+  renderRebalancePreview,
   createRebalancePlanRow,
   pauseRebalancePlanById,
   resumeRebalancePlanById,
@@ -45,6 +47,7 @@ const {
 } = await import("./db.js");
 import type { PortfolioSnapshot, PortfolioToken } from "./positionLimits.js";
 import type { RebalanceTarget } from "./db.js";
+const { configSchema } = await import("./config.js");
 
 beforeAll(() => {
   openDb();
@@ -616,5 +619,77 @@ describe("lifecycle helpers throw INVALID_PARAMS on bad transitions", () => {
     dbCancel(id);
     const row = cancelRebalancePlanById(id);
     expect(row.status).toBe("cancelled");
+  });
+});
+
+// ── gatherRebalancePreview (v56) — ad-hoc drift + trade plan ──
+
+describe("gatherRebalancePreview", () => {
+  const config = configSchema.parse({});
+  const noopLogger = {
+    debug: () => {}, info: () => {}, warn: () => {}, error: () => {},
+    child: () => noopLogger, recordAudit: () => {}, close: () => {},
+  } as unknown as import("./logger.js").Logger;
+
+  // A 72/28 ETH/USDC book on a $10k portfolio — over-weight ETH.
+  const snapshot = {
+    totalUsd: 10_000,
+    hasUnpriced: false,
+    tokens: [
+      { chain: "base", symbol: "ETH", address: "NATIVE", usd: 7200 },
+      { chain: "base", symbol: "USDC", address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", usd: 2800 },
+    ],
+  };
+  const fetchPortfolio = async () => snapshot;
+
+  const preview = (over: Record<string, unknown> = {}) =>
+    gatherRebalancePreview({
+      targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 40 }],
+      chain: "base", account: "default", quoteToken: "USDC",
+      config, logger: noopLogger, fetchPortfolio,
+      now: new Date("2026-06-14T12:00:00Z"),
+      ...over,
+    });
+
+  it("computes drift + a corrective sell of the over-weight token", async () => {
+    const r = await preview();
+    expect(r.totalUsd).toBe(10_000);
+    expect(r.maxDriftPct).toBeCloseTo(12, 6);
+    const eth = r.drift.find((d) => d.token === "ETH")!;
+    expect(eth.currentPct).toBeCloseTo(72, 6);
+    expect(eth.driftPct).toBeCloseTo(12, 6);
+    // ETH is over-weight → sell ~$1,200; USDC is the quote anchor → no leg.
+    expect(r.steps).toHaveLength(1);
+    expect(r.steps[0].direction).toBe("sell");
+    expect(r.steps[0].baseToken).toBe("ETH");
+    expect(r.steps[0].amountUsd).toBeCloseTo(1200, 6);
+    expect(r.totalTradeUsd).toBeCloseTo(1200, 6);
+  });
+
+  it("wouldFire reflects the supplied drift threshold", async () => {
+    expect((await preview({ driftThresholdPct: 5 })).wouldFire).toBe(true);
+    expect((await preview({ driftThresholdPct: 20 })).wouldFire).toBe(false);
+    expect((await preview()).wouldFire).toBeNull(); // no threshold → null
+  });
+
+  it("minTradeUsd pushes sub-threshold legs into skipped[]", async () => {
+    const r = await preview({ minTradeUsd: 5000 }); // $1,200 leg < $5,000
+    expect(r.steps).toHaveLength(0);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0].reason).toBe("below_min_trade_usd");
+  });
+
+  it("flags paper mode + rejects targets that don't sum to 100", async () => {
+    expect((await preview({ paper: true })).paper).toBe(true);
+    await expect(preview({ targets: [{ token: "ETH", targetPct: 60 }, { token: "USDC", targetPct: 30 }] }))
+      .rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  });
+
+  it("renders drift, the trade plan, and the would-fire context", async () => {
+    const text = renderRebalancePreview(await preview({ driftThresholdPct: 5 }));
+    expect(text).toMatch(/Rebalance preview — account:default × base/);
+    expect(text).toMatch(/max drift 12\.0%/);
+    expect(text).toMatch(/would fire \(≥5%\): YES/);
+    expect(text).toMatch(/sell \$1200\.00 of ETH/);
   });
 });

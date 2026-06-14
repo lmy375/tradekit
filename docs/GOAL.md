@@ -33,6 +33,20 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 56 — 临时再平衡预览（ad-hoc rebalance preview — "if I targeted this, what's my drift + corrective trades RIGHT NOW?"）** ✅
+- **刻意离开安全主题**（v50–v55 连续 6 个安全/信任迭代）转向另一条核心腿：**持仓管理（position management）**。诚实自检——再在安全栈上加东西就是指令警告的"疯狂加量"
+- 真实缺口：drift + 交易计划的纯函数（`computeDrift` + `planRebalanceTrades`）此前**只在引擎 tick 内、针对已部署 plan**运行。一个运营商/agent 想问"我该不该再平衡、平衡到什么比例？"必须先建一个 plan row + `rebalance run --dry-run` 才能**看到**答案。没有一次性的"给定目标配比，我现在的 drift 是多少、需要哪些交易"的分析入口
+- 新增 `gatherRebalancePreview()` + `renderRebalancePreview()`（在 rebalance.ts 内，复用私有 `defaultFetchPortfolio` / `defaultFetchPaperPortfolio`）：把同一套**纯原语**组合到一份一次性报告——只读、无 plan row、无引擎、无 keystore
+  - `validateTargets`（同样的 ≥2 目标 / 和=100% 规则）→ `computeDrift(snapshot, targets)` → `planRebalanceTrades(drift, {quoteToken, minTradeUsd})`
+  - 报告：`totalUsd / maxDriftPct / wouldFire（对可选 driftThresholdPct）/ drift[]（每目标 current%→target% + drift + USD delta）/ steps[]（修正交易，卖在前）/ skipped[]（低于 minTradeUsd 的腿）/ totalTradeUsd`
+  - 确定性 given snapshot：唯一 IO 是组合 fetch（可注入 seam）；与引擎 tick 用**完全相同**的 drift/计划数学——预览即真实行为
+- Surfaces：CLI `rebalance preview --targets '[...]' [--quote-token] [--min-trade-usd] [--drift-threshold] [--paper] [--json]` + MCP `rebalance_preview`（只读，agent 在 `rebalance_create` 之前**决策**用，或给一次性手动再平衡定量）
+- 与已部署 plan 的分工：`rebalance create` 部署一个引擎周期性纠偏的计划；`rebalance preview` 是当下一次性"如果……会怎样"分析，不留痕
+- 测试覆盖：`rebalance.test.ts` +5 case（注入 snapshot seam，纯确定性——drift+卖出超配腿 / wouldFire 对阈值 / minTradeUsd 推入 skipped / paper 标志 + 和≠100 抛 INVALID_PARAMS / 渲染含 would-fire 上下文）
+- MCP_TOOLS 不变量：`rebalance_preview` 加入 iter589/iter877 set
+- 向后兼容：纯加法——无 schema migration、无现有行为改动、无引擎触动；纯读现有 holdings/paper book
+- v1 限制：quote anchor 默认 "USDC"（与 create 一致，可 --quote-token 覆盖）；preview 取当下快照不预测多步（连续纠偏的收敛留给部署 plan 的 tick 反馈）；价格用 holdings 的 USD（oracle 缺失 → hasUnpriced 标记，drift 为部分视图，与引擎 soft-skip 同款诚实降级）
+
 **Phase 55 — 安全态势进主仪表盘（safety posture + headroom in `health`）** ✅
 - 不是新工具，是**让既有投资落到运营商真正看的地方**：v51 safety_review（配置态势）和 v53 safety_headroom（运行时余量）是独立命令——运营商得**记得去跑**。但运营商的主交互是 `tradekit health`（一键仪表盘）和 cron `digest`。`health` 的 SECURITY 段**只讲 allowances**，对两个最危险状态——配置 EXPOSED（safety 关掉 / 没有任何 USD 上限 → agent 交易无界）和运行时逼近限额（日限额快花完 / 预算/仓位 cap 逼近 / drawdown 熔断已触发）——**完全盲**。本迭代把它们接进主仪表盘
 - 这是"针对最重要的东西优化"而非"加量"：没有新增 MCP 工具，只丰富既有 `health` 表面

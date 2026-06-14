@@ -25,6 +25,8 @@ import {
   runRebalanceTick,
   listRebalancePlans,
   getRebalancePlanById,
+  gatherRebalancePreview,
+  renderRebalancePreview,
   type RebalanceRow,
   type RebalanceStatus,
   type RebalanceTarget,
@@ -475,6 +477,7 @@ export async function rebalanceCommand(
 ) {
   switch (action) {
     case "create": await rebalanceCreateCommand(flags); break;
+    case "preview": await rebalancePreviewCommand(flags); break;
     case "list":   await rebalanceListCommand(flags); break;
     case "show":   await rebalanceShowCommand(flags, positional); break;
     case "edit":   await rebalanceEditCommand(flags, positional); break;
@@ -484,7 +487,60 @@ export async function rebalanceCommand(
     case "run":    await rebalanceRunCommand(flags); break;
     case "replay": await rebalanceReplayCommand(flags, positional); break;
     default:
-      throw subcommandError("rebalance", action, ["create", "list", "show", "edit", "pause", "resume", "cancel", "run", "replay"]);
+      throw subcommandError("rebalance", action, ["create", "preview", "list", "show", "edit", "pause", "resume", "cancel", "run", "replay"]);
+  }
+}
+
+// v56: ad-hoc "what's my drift from this target + what trades fix it"
+// WITHOUT deploying a plan. Read-only; reuses the engine's own
+// computeDrift + planRebalanceTrades against a live (or paper) snapshot.
+export async function rebalancePreviewCommand(flags: Record<string, string>) {
+  const config = loadConfig();
+  const chainName = flags["chain"] ?? config.activeChain;
+  const accountLabel = flags["account"] ?? config.activeAccount ?? "default";
+  const quoteToken = flags["quote-token"] ?? "USDC";
+
+  const targetsRaw = flags["targets"];
+  if (!targetsRaw) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      "--targets is required. Pass a JSON array, e.g.  --targets '[{\"token\":\"ETH\",\"targetPct\":60},{\"token\":\"USDC\",\"targetPct\":40}]'",
+    );
+  }
+  let targets: RebalanceTarget[];
+  try {
+    const parsed = JSON.parse(targetsRaw);
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    targets = parsed as RebalanceTarget[];
+  } catch (e) {
+    throw new ToolError(
+      "INVALID_PARAMS",
+      `--targets must be a JSON array of {token, targetPct} entries. Parse error: ${(e as Error).message}.`,
+    );
+  }
+
+  const minTradeUsd = parseFloatFlag(flags["min-trade-usd"], "--min-trade-usd", { min: 0 });
+  const driftThresholdPct = parseFloatFlag(flags["drift-threshold"], "--drift-threshold", { min: 0, max: 100 });
+  const logger = makeCliLogger(flags);
+  try {
+    const report = await gatherRebalancePreview({
+      targets,
+      chain: chainName,
+      account: accountLabel,
+      quoteToken,
+      config,
+      logger,
+      paper: flags["paper"] === "true",
+      minTradeUsd,
+      driftThresholdPct,
+    });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...report });
+    } else {
+      console.log(renderRebalancePreview(report));
+    }
+  } finally {
+    logger.close();
   }
 }
 

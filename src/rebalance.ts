@@ -307,6 +307,122 @@ export function planRebalanceTrades(
   return { steps: [...sells, ...buys], skipped, maxDriftPct: drift.maxDriftPct };
 }
 
+// ── ad-hoc preview (v56) ─────────────────────────────────────
+
+/**
+ * v56: ad-hoc "if I targeted this allocation, what's my drift RIGHT NOW
+ * and what trades correct it?" — without deploying an engine plan.
+ *
+ * Pre-v56 the drift + trade-plan math (computeDrift + planRebalanceTrades)
+ * only ran inside the engine tick for a DEPLOYED plan. An operator (or
+ * agent) exploring "should I rebalance, and to what?" had to commit a plan
+ * row + `rebalance run --dry-run` just to SEE the answer. This composes
+ * the same pure primitives against a live (or paper) portfolio snapshot
+ * into a one-shot report — read-only, no plan row, no engine.
+ *
+ * Deterministic given the snapshot: the only IO is the portfolio fetch
+ * (injectable seam). Reuses validateTargets so the same 2-target /
+ * sum-to-100 rules a deployed plan enforces apply here too.
+ */
+export interface RebalancePreviewReport {
+  chain: string;
+  account: string;
+  paper: boolean;
+  quoteToken: string;
+  totalUsd: number;
+  hasUnpriced: boolean;
+  maxDriftPct: number;
+  /** The drift threshold to contextualize "would a plan with this
+   *  threshold fire?". Null when the caller didn't supply one. */
+  driftThresholdPct: number | null;
+  /** maxDriftPct ≥ driftThresholdPct. Null when no threshold supplied. */
+  wouldFire: boolean | null;
+  minTradeUsd: number;
+  drift: DriftEntry[];
+  steps: RebalanceTradeStep[];
+  skipped: RebalancePlanResult["skipped"];
+  /** Sum of step amountUsd — total gross USD that would change hands. */
+  totalTradeUsd: number;
+  generatedAt: string;
+}
+
+export async function gatherRebalancePreview(args: {
+  targets: readonly RebalanceTarget[];
+  chain: string;
+  account: string;
+  quoteToken: string;
+  config: Config;
+  logger: Logger;
+  paper?: boolean;
+  minTradeUsd?: number;
+  driftThresholdPct?: number;
+  now?: Date;
+  /** Test/seam: portfolio fetcher. Defaults to the live on-chain (or
+   *  paper-book) snapshot the engine tick uses. */
+  fetchPortfolio?: (chain: string, account: string, config: Config, logger: Logger) => Promise<PortfolioSnapshot>;
+}): Promise<RebalancePreviewReport> {
+  const targets = validateTargets(args.targets);
+  const minTradeUsd = args.minTradeUsd ?? 0;
+  const fetcher =
+    args.fetchPortfolio ?? (args.paper ? defaultFetchPaperPortfolio : defaultFetchPortfolio);
+  const snapshot = await fetcher(args.chain, args.account, args.config, args.logger);
+  const drift = computeDrift(snapshot, targets);
+  const plan = planRebalanceTrades(drift, { quoteToken: args.quoteToken, minTradeUsd });
+  const totalTradeUsd = plan.steps.reduce((s, step) => s + step.amountUsd, 0);
+  const driftThresholdPct = args.driftThresholdPct ?? null;
+  return {
+    chain: args.chain,
+    account: args.account,
+    paper: args.paper ?? false,
+    quoteToken: args.quoteToken,
+    totalUsd: snapshot.totalUsd,
+    hasUnpriced: drift.hasUnpriced,
+    maxDriftPct: drift.maxDriftPct,
+    driftThresholdPct,
+    wouldFire: driftThresholdPct != null ? drift.maxDriftPct >= driftThresholdPct : null,
+    minTradeUsd,
+    drift: drift.entries,
+    steps: plan.steps,
+    skipped: plan.skipped,
+    totalTradeUsd,
+    generatedAt: (args.now ?? new Date()).toISOString(),
+  };
+}
+
+export function renderRebalancePreview(r: RebalancePreviewReport): string {
+  const lines: string[] = [];
+  lines.push(`Rebalance preview — account:${r.account} × ${r.chain}${r.paper ? " (paper)" : ""}`);
+  const fireBit =
+    r.wouldFire == null
+      ? ""
+      : `  ·  would fire (≥${r.driftThresholdPct}%): ${r.wouldFire ? "YES" : "no"}`;
+  lines.push(`  Portfolio $${r.totalUsd.toFixed(2)} · quote ${r.quoteToken} · max drift ${r.maxDriftPct.toFixed(1)}%${fireBit}`);
+  if (r.hasUnpriced) lines.push(`  ⚠ some targeted tokens are unpriced — drift is a partial view`);
+  lines.push(``);
+  lines.push(`  Drift:`);
+  for (const d of r.drift) {
+    const arrow = d.driftPct > 0 ? "over" : d.driftPct < 0 ? "under" : "on-target";
+    lines.push(
+      `    ${d.token.padEnd(10)} ${d.currentPct.toFixed(1)}% → ${d.targetPct.toFixed(1)}%  (${d.driftPct >= 0 ? "+" : ""}${d.driftPct.toFixed(1)}pp ${arrow}${d.deltaUsd >= 0.005 ? `, $${d.deltaUsd.toFixed(2)}` : ""})`,
+    );
+  }
+  lines.push(``);
+  if (r.steps.length === 0) {
+    lines.push(`  Trades: none (already within target${r.minTradeUsd > 0 ? ` / below $${r.minTradeUsd} min` : ""})`);
+  } else {
+    lines.push(`  Trades (execution order — sells first, $${r.totalTradeUsd.toFixed(2)} gross):`);
+    for (const s of r.steps) {
+      lines.push(`    ${s.direction === "sell" ? "▼" : "▲"} ${s.description}  (drift ${s.driftPct >= 0 ? "+" : ""}${s.driftPct.toFixed(1)}%)`);
+    }
+  }
+  if (r.skipped.length > 0) {
+    lines.push(``);
+    lines.push(`  Skipped (below $${r.minTradeUsd} min):`);
+    for (const s of r.skipped) lines.push(`    · ${s.description}`);
+  }
+  return lines.join("\n");
+}
+
 // ── creation ─────────────────────────────────────────────────
 
 export interface CreateRebalancePlanArgs {

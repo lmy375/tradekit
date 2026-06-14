@@ -467,6 +467,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "bulk_halt", "bulk_resume",
     // Portfolio rebalancing (rebalance create/list/show/pause/resume/cancel/run).
     "rebalance_create", "rebalance_list", "rebalance_show", "rebalance_edit", "rebalance_pause", "rebalance_resume", "rebalance_cancel", "rebalance_run",
+    // v56: ad-hoc drift + corrective-trade preview (no plan row).
+    "rebalance_preview",
     // security-tools.ts: allowances, audit_allowances, approve, revoke, revoke_all, check_token
     "allowances", "audit_allowances", "approve", "revoke", "revoke_all", "check_token",
     // Iter26: safety stack — drawdown breaker inspection + reset.

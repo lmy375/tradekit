@@ -1381,6 +1381,56 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
   // exceeds the configured threshold.
 
   server.tool(
+    "rebalance_preview",
+    "v56: ad-hoc rebalance ANALYSIS — 'if I targeted this allocation, what's my drift RIGHT NOW and what trades correct it?' — WITHOUT deploying a plan. Read-only: fetches the current (or paper) portfolio, runs the SAME computeDrift + planRebalanceTrades the engine tick uses, and returns { totalUsd, maxDriftPct, wouldFire (vs an optional driftThresholdPct), drift[] (per-target current% → target% + drift + USD delta), steps[] (corrective trades in execution order — sells before buys), skipped[] (legs below minTradeUsd), totalTradeUsd }. Use to DECIDE whether/what to rebalance before committing a rebalance_create plan, or to size a one-off manual rebalance. Targets must sum to 100% (same rule as rebalance_create). Deterministic given the portfolio snapshot; no plan row, no engine, no keystore. Errors: INVALID_PARAMS (targets don't sum to 100, <2 targets), UNKNOWN_CHAIN.",
+    {
+      targets: z
+        .array(
+          z.object({
+            token: z.string().describe("Token symbol (ETH/USDC/WBTC) or 0x address."),
+            targetPct: z.number().min(0).max(100).describe("Target weight % of portfolio. Must sum to 100."),
+          }),
+        )
+        .min(2)
+        .describe("Target weights. ≥2 entries; must sum to exactly 100% (±0.01)."),
+      chain: z.string().optional().describe("Chain (default: active chain)."),
+      account: z.string().optional().describe("Account label (default: active account)."),
+      quoteToken: z.string().optional().describe("Routing anchor (default: USDC). The token corrective trades route through; excluded from the trade list."),
+      minTradeUsd: z.number().nonnegative().optional().describe("Per-leg min USD; sub-threshold legs land in skipped[]. Default 0 (show every leg)."),
+      driftThresholdPct: z.number().min(0).max(100).optional().describe("Optional: contextualize wouldFire — true when maxDriftPct ≥ this (the threshold a deployed plan would use)."),
+      paper: z.boolean().optional().describe("Evaluate against the VIRTUAL paper book (paper_balances) instead of on-chain holdings. Default false."),
+    },
+    async (input) => {
+      try {
+        return ok(
+          await runTool("rebalance_preview", rt.opts, input, input.chain, async () => {
+            const config = rt.getConfig();
+            const chain = input.chain ?? config.activeChain;
+            const account = input.account ?? config.activeAccount ?? "default";
+            const { gatherRebalancePreview } = await import("../rebalance.js");
+            return {
+              ok: true,
+              ...(await gatherRebalancePreview({
+                targets: input.targets,
+                chain,
+                account,
+                quoteToken: input.quoteToken ?? "USDC",
+                config,
+                logger: rt.opts.logger,
+                paper: input.paper,
+                minTradeUsd: input.minTradeUsd,
+                driftThresholdPct: input.driftThresholdPct,
+              })),
+            };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
+  server.tool(
     "rebalance_create",
     "Create a portfolio rebalance plan: a declarative target-weight spec that the engine periodically evaluates and corrects toward. Each plan covers ONE chain + ONE account; multi-chain operators create one plan per chain. On each engine tick the plan fetches the portfolio, computes per-target drift, and (if max drift >= driftThresholdPct) fires the corrective trades through executeTrade — every safety guardrail (USD limits, slippage cap, gas budget, position limits) applies just like a manual swap. Trades route through quoteToken (defaults to chain USDC): over-weight tokens sell INTO it, then under-weight tokens BUY FROM it. Per-leg trades below minTradeUsd skip to avoid gas burn on micro-corrections. Targets MUST sum to exactly 100%. Common patterns: 'core' folio at 60/40 ETH/USDC; bracketed alt-coin sleeve; cash-reserve-floor (one target at 20% USDC). Errors: INVALID_PARAMS (targets don't sum to 100, duplicate tokens, bad cron, malformed dates, slippage out of range, maxRuns ≤ 0), UNKNOWN_CHAIN, UNKNOWN_TOKEN (a target token can't be resolved on this chain). Returns the persisted RebalanceRow with assigned id, status='active', next_run_at computed from the cron.",
     {

@@ -222,6 +222,15 @@ PORTFOLIO REBALANCING
         --paper true: drift is evaluated against the VIRTUAL book (paper balances), and
         corrective legs fill the virtual book — no chain reads, no keystore, no real
         trades. Seed with 'paper deposit' first or every tick is an empty-portfolio skip.
+  rebalance preview --targets '[{"token":"ETH","targetPct":60},{"token":"USDC","targetPct":40}]'
+                    [--chain X] [--account L] [--quote-token USDC] [--min-trade-usd N]
+                    [--drift-threshold N] [--paper true|false] [--json]
+        v56: ad-hoc "what's my drift from this allocation + what trades fix it" RIGHT NOW,
+        without deploying a plan. Read-only — fetches the live (or --paper virtual) portfolio
+        and runs the SAME drift + trade-plan math the engine tick uses. Shows per-target
+        current% → target% drift + the corrective trades (sells first), max drift, and (with
+        --drift-threshold) whether a deployed plan would fire. Use to DECIDE before
+        'rebalance create', or to size a one-off manual rebalance. MCP: rebalance_preview.
   rebalance list [--status all|active|paused|completed|cancelled] [--chain X] [--account L]
                  [--strategy TAG] [--limit N] [--json]
   rebalance show <id> [--json]                 Full detail incl. last-run telemetry
