@@ -33,6 +33,19 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 60 — 持有期 + 短/长期税务分类（holding period & short/long-term tax split）** ✅
+- **转向从未碰过的生产级关键支柱：会计/税务记录**（真金白银 + 合规依赖正确的已实现收益报告）。确定性、纯离线 → 本 loop 完全可验证
+- 缺口：`gains` 报告是**扁平的**（per-realization 记录 + 一个总额），既无 per-token 汇总，也无**持有期/短期 vs 长期分类**——而短/长期是报税最重要的区分（税率天差地别）
+- 给成本基准 walker 加了**加权平均取得日**追踪（`computePaperPnlMtm`，喂着 paper pnl / strategy report / promote check+outcome / gains 多个消费者——故**纯加法**，blast radius 限制在新字段，不碰 amount/cost/realized 数学）：
+  - `PosAcc.acquiredAtMs`：当前持仓的加权平均取得时刻，每次买入按数量混合、持仓归零时重置。与加权平均成本基准模型同构——一个混合成本/单位，就有一个混合取得日（这是该模型能给的**有原则的持有期估计**，非 lot-based FIFO/specific-lot）
+  - `RealizationRecord` 新增 `acquiredAt` / `holdingDays` / `term`（'short' ≤365d / 'long' >365d / 'untracked' 无追踪基准）；卖出时按 `LONG_TERM_DAYS=365`（持有**超过**一年为长期）分类
+- `GainsReport` 新增：`byTerm`（short/long/untracked 的 gain+proceeds+cost 子合计——头条税务分割）+ `byToken`（per-(chain,token) 汇总，按 gain 降序——报税人读的"按资产"小计而非扁平列表）
+- Surfaces：CLI `export gains` 的 CSV 加 `acquired_at`/`holding_days`/`term` 三列 + stderr 摘要显示短/长期分割 + 按资产汇总 + 持有期估计免责声明；MCP `gains_report` 自动随附 byTerm/byToken（纯加法）
+- 诚实披露：持有期是**加权平均估计**非 lot-based——明确写进 CSV 摘要 + MCP 描述 + 类型注释（该模型每仓位一个混合基准，故持有期也是混合的）
+- 测试覆盖：`gains.test.ts` +7（walker：>365d→long + acquiredAt + holdingDays / ≤365d→short / 多次买入按量混合取得日 / 持仓归零后重置取得时钟 / 无基准卖出→untracked；gatherRealizedGains：byTerm 短长分割 + byToken 按资产汇总）；修了既有 CSV fixture（补 3 个新字段）
+- 向后兼容：纯加法——RealizationRecord 新字段现有消费者忽略；walker 的混合数学只影响新 acquiredAtMs 字段，amount/cost/realized 逐字节不变（3262 测试全绿、零回归即证明）
+- v1 限制：持有期是加权平均估计非 lot-based（IRS 默认特定识别/FIFO；此模型给的是该法下的合理近似，已披露"非税务建议"）；长期阈值固定 365d（未来可配 holdingPeriodDays）；untracked 卖出（超卖无基准）单列不计入 short/long
+
 **Phase 59 — Logger 无文件模式 + 测试套件归零（quality, not breadth）** ✅
 - **刻意不加 feature**：连续 8 个 feature 迭代后，最有价值的不是第 9 个 feature，而是消除整个代码库里我每次跑全套都看到的、唯一客观可测的缺陷——全套测试每次都报的 **9 个未捕获异常**（`promoteCheck.test.ts` 的 `server.log` ENOENT race）。生产级框架的测试套件每次跑都漏 9 个 uncaught exception，是会侵蚀信任、掩盖新错误、可能让严格 CI 失败的真实瑕疵
 - 根因是真正的 **logger 正确性缺口**（不是测试小问题）：`createLogger` **无条件**打开 `createWriteStream(SERVER_LOG_PATH)`，没有任何方式拿到一个不碰文件的 logger。后果：每个为满足 price-fetcher 签名而在 gather 函数里创建的**临时 silent logger** 都开一个真实文件句柄——在测试里与临时 data dir 清理 race（那 9 个错误），生产里是"对已删文件的异步写"这一类潜在健壮性 bug，且只读/一次性工作也在污染 server.log

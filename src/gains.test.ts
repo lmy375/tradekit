@@ -187,6 +187,7 @@ describe("gainsToCsv", () => {
         soldAmount: 0.123456789, sellPriceQuote: 2800, avgCostQuote: 2500,
         proceedsQuote: 345.679, costBasisQuote: 308.642, gainQuote: 37.037,
         untrackedAmount: 0, untrackedProceedsQuote: 0, txHash: "0xabc",
+        acquiredAt: "2025-01-01T00:00:00.000Z", holdingDays: 424, term: "long",
       },
     ]);
     const lines = csv.trim().split("\n");
@@ -202,5 +203,98 @@ describe("yearWindow", () => {
     expect(w.sinceIso).toBe("2026-01-01T00:00:00.000Z");
     expect(w.untilIso).toBe("2026-12-31T23:59:59.999Z");
     expect(() => yearWindow(99)).toThrow(/calendar year/);
+  });
+});
+
+// ── v60: holding period + short/long-term classification ─────
+
+describe("walker holding-period + term", () => {
+  // Day offsets from a fixed UTC anchor → deterministic timestamps.
+  const day = (n: number) => new Date(Date.UTC(2026, 0, 1) + n * 86_400_000).toISOString();
+  const buy = (id: number, t: string, base: string, quote: string) =>
+    mkRow({ id, timestamp: t, direction: "buy", base_amount: base, quote_amount: quote });
+  const sell = (id: number, t: string, base: string, quote: string) =>
+    mkRow({ id, timestamp: t, direction: "sell", base_amount: base, quote_amount: quote });
+
+  it("classifies a >365d hold as long-term with the acquisition date + holding days", async () => {
+    const rows = [buy(1, day(0), "1", "2000"), sell(2, day(400), "1", "3000")];
+    const { realizations } = await computePaperPnlMtm(rows, async () => null);
+    const r = realizations[0];
+    expect(r.term).toBe("long");
+    expect(r.holdingDays).toBeCloseTo(400, 6);
+    expect(r.acquiredAt).toBe(day(0));
+  });
+
+  it("classifies a ≤365d hold as short-term", async () => {
+    const rows = [buy(1, day(0), "1", "2000"), sell(2, day(90), "1", "2500")];
+    const { realizations } = await computePaperPnlMtm(rows, async () => null);
+    expect(realizations[0].term).toBe("short");
+    expect(realizations[0].holdingDays).toBeCloseTo(90, 6);
+  });
+
+  it("blends the acquisition date weighted by amount across multiple buys", async () => {
+    // 1 ETH at day 0 + 1 ETH at day 100 → weighted-avg acquisition = day 50.
+    const rows = [buy(1, day(0), "1", "2000"), buy(2, day(100), "1", "2000"), sell(3, day(200), "1", "3000")];
+    const { realizations } = await computePaperPnlMtm(rows, async () => null);
+    expect(realizations[0].acquiredAt).toBe(day(50));
+    expect(realizations[0].holdingDays).toBeCloseTo(150, 6); // day200 − day50
+    expect(realizations[0].term).toBe("short");
+  });
+
+  it("resets the acquisition clock after the position goes flat", async () => {
+    // Buy+fully-sell, then a fresh buy much later + sell → the second sale's
+    // holding period must count from the SECOND buy, not the first.
+    const rows = [
+      buy(1, day(0), "1", "2000"),
+      sell(2, day(10), "1", "2100"),
+      buy(3, day(400), "1", "2000"),
+      sell(4, day(410), "1", "2200"),
+    ];
+    const { realizations } = await computePaperPnlMtm(rows, async () => null);
+    expect(realizations).toHaveLength(2);
+    expect(realizations[1].acquiredAt).toBe(day(400));
+    expect(realizations[1].holdingDays).toBeCloseTo(10, 6);
+    expect(realizations[1].term).toBe("short");
+  });
+
+  it("marks a sell with no tracked basis as 'untracked' (null acquisition)", async () => {
+    const rows = [sell(1, day(5), "1", "2500")]; // oversell from zero
+    const { realizations } = await computePaperPnlMtm(rows, async () => null);
+    expect(realizations[0].term).toBe("untracked");
+    expect(realizations[0].acquiredAt).toBeNull();
+    expect(realizations[0].holdingDays).toBeNull();
+  });
+});
+
+describe("gatherRealizedGains — byTerm split + byToken rollup", () => {
+  const day = (n: number) => new Date(Date.UTC(2026, 0, 1) + n * 86_400_000).toISOString();
+  const WBTC = "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599";
+
+  const pt = (over: { timestamp: string; direction: "buy" | "sell"; base_token: string; base_symbol: string; base_amount: string; quote_amount: string }) =>
+    recordPaperTrade({
+      source_type: "manual", source_id: null, chain: "base", account: "default",
+      quote_token: USDC, quote_symbol: "USDC", price: "0", slippage_bps: null, strategy: "tax-test", notes: null,
+      ...over,
+    });
+
+  it("splits gains into short/long subtotals and rolls up by token", async () => {
+    // WETH: long-term winner (held 400d). WBTC: short-term (held 30d).
+    pt({ timestamp: day(0), direction: "buy", base_token: WETH, base_symbol: "WETH", base_amount: "1", quote_amount: "2000" });
+    pt({ timestamp: day(400), direction: "sell", base_token: WETH, base_symbol: "WETH", base_amount: "1", quote_amount: "3000" });
+    pt({ timestamp: day(0), direction: "buy", base_token: WBTC, base_symbol: "WBTC", base_amount: "1", quote_amount: "40000" });
+    pt({ timestamp: day(30), direction: "sell", base_token: WBTC, base_symbol: "WBTC", base_amount: "1", quote_amount: "41000" });
+
+    const r = await gatherRealizedGains({ mode: "paper" });
+    expect(r.byTerm.long.gainQuote).toBeCloseTo(1000, 6); // WETH +1000
+    expect(r.byTerm.long.realizations).toBe(1);
+    expect(r.byTerm.short.gainQuote).toBeCloseTo(1000, 6); // WBTC +1000
+    expect(r.byTerm.short.realizations).toBe(1);
+
+    // by-token rollup, gain-descending (tie → stable); both present.
+    expect(r.byToken).toHaveLength(2);
+    const weth = r.byToken.find((t) => t.symbol === "WETH")!;
+    const wbtc = r.byToken.find((t) => t.symbol === "WBTC")!;
+    expect(weth.gainQuote).toBeCloseTo(1000, 6);
+    expect(wbtc.proceedsQuote).toBeCloseTo(41000, 6);
   });
 });

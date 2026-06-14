@@ -156,6 +156,15 @@ export interface RealizationRecord {
   untrackedAmount: number;
   untrackedProceedsQuote: number;
   txHash: string | null;
+  /** v60: weighted-average acquisition time (ISO) of the basis sold here.
+   *  Null when the sale had no tracked basis (pure untracked oversell). */
+  acquiredAt: string | null;
+  /** v60: sale time − acquiredAt, in days (fractional). Null when no
+   *  tracked basis. The holding period for the tracked `soldAmount`. */
+  holdingDays: number | null;
+  /** v60: 'long' when holdingDays > LONG_TERM_DAYS, 'short' when ≤, and
+   *  'untracked' when there's no tracked basis (no acquisition date). */
+  term: GainTerm;
 }
 
 export interface PaperPnlMtmReport {
@@ -178,7 +187,21 @@ interface PosAcc {
   lastTradeAt: string | null;
   untrackedSellBase: number;
   untrackedSellQuote: number;
+  /** v60: weighted-average acquisition time (epoch ms) of the CURRENTLY
+   *  held base — blended by amount on each buy, reset when the position
+   *  goes flat. Null until the first buy. Mirrors the weighted-average
+   *  cost-basis model: just as there's one blended cost per unit, there's
+   *  one blended acquisition date — the principled holding-period estimate
+   *  this model can give (it is NOT lot-based FIFO/specific-lot). */
+  acquiredAtMs: number | null;
 }
+
+/** v60: holding-period threshold (days) above which a realization is
+ *  long-term. US long-term capital gains require holding MORE than one
+ *  year; 365 is the documented cut (a leap-year sale at exactly 366 days
+ *  is unambiguously long, 365 or fewer is short). */
+export const LONG_TERM_DAYS = 365;
+export type GainTerm = "short" | "long" | "untracked";
 
 /** Dust guard: positions below this base amount are considered flat and
  *  skipped from pricing. Matches the 1e-9 epsilon style used elsewhere. */
@@ -251,6 +274,7 @@ export async function computePaperPnlMtm(
           lastTradeAt: null,
           untrackedSellBase: 0,
           untrackedSellQuote: 0,
+          acquiredAtMs: null,
         };
         positions.set(key, acc);
       }
@@ -259,6 +283,16 @@ export async function computePaperPnlMtm(
       if (!acc.lastTradeAt || r.timestamp > acc.lastTradeAt) acc.lastTradeAt = r.timestamp;
 
       if (r.direction === "buy") {
+        // v60: blend the weighted-average acquisition time by amount.
+        // When the position is flat (or first buy), this buy seeds it.
+        const buyMs = Date.parse(r.timestamp);
+        if (Number.isFinite(buyMs)) {
+          if (acc.acquiredAtMs == null || acc.amount <= FLAT_EPSILON) {
+            acc.acquiredAtMs = buyMs;
+          } else {
+            acc.acquiredAtMs = (acc.acquiredAtMs * acc.amount + buyMs * baseAmt) / (acc.amount + baseAmt);
+          }
+        }
         acc.amount += baseAmt;
         acc.cost += quoteAmt;
       } else {
@@ -268,6 +302,16 @@ export async function computePaperPnlMtm(
         const untracked = baseAmt - sold;
         const realizedDelta = (sellPricePerUnit - avgCost) * sold;
         acc.realized += realizedDelta;
+        // v60: holding period for the TRACKED portion, from the position's
+        // weighted-average acquisition date. Null when nothing tracked.
+        const hasTracked = sold > FLAT_EPSILON && acc.acquiredAtMs != null;
+        const sellMs = Date.parse(r.timestamp);
+        const holdingDays =
+          hasTracked && Number.isFinite(sellMs)
+            ? Math.max(0, (sellMs - acc.acquiredAtMs!) / 86_400_000)
+            : null;
+        const term: GainTerm =
+          holdingDays == null ? "untracked" : holdingDays > LONG_TERM_DAYS ? "long" : "short";
         if (sold > FLAT_EPSILON || untracked > FLAT_EPSILON) {
           allRealizations.push({
             at: r.timestamp,
@@ -284,6 +328,9 @@ export async function computePaperPnlMtm(
             untrackedAmount: untracked > FLAT_EPSILON ? untracked : 0,
             untrackedProceedsQuote: untracked > FLAT_EPSILON ? sellPricePerUnit * untracked : 0,
             txHash: (r as { tx_hash?: string | null }).tx_hash ?? null,
+            acquiredAt: hasTracked ? new Date(acc.acquiredAtMs!).toISOString() : null,
+            holdingDays,
+            term,
           });
         }
         if (sold > FLAT_EPSILON) {

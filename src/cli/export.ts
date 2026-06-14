@@ -10,6 +10,7 @@ import { writeFileSync } from "node:fs";
 import { ToolError } from "../errors.js";
 import { printJson, subcommandError } from "./helpers.js";
 import { gatherRealizedGains, gainsToCsv, yearWindow } from "../gains.js";
+import { LONG_TERM_DAYS } from "../paperPnl.js";
 
 export async function exportCommand(
   action: string | undefined,
@@ -71,13 +72,25 @@ export async function exportCommand(
       console.error("");
       console.error(`  ${report.records.length} realization(s)${sinceIso ? ` in ${sinceIso.slice(0, 10)} → ${(untilIso ?? "now").slice(0, 10)}` : ""} (${mode})`);
       console.error(`  total gain ${fmt(report.totalGainQuote)} · proceeds ${fmt(report.totalProceedsQuote)} · cost basis ${fmt(report.totalCostBasisQuote)}`);
+      // v60: short/long-term split — the headline tax distinction.
+      const t = report.byTerm;
+      console.error(
+        `  short-term gain ${fmt(t.short.gainQuote)} (${t.short.realizations}) · long-term gain ${fmt(t.long.gainQuote)} (${t.long.realizations})` +
+          (t.untracked.realizations > 0 ? ` · untracked ${t.untracked.realizations}` : ""),
+      );
+      if (report.byToken.length > 0) {
+        console.error(`  by asset:`);
+        for (const tok of report.byToken) {
+          console.error(`    ${(tok.symbol ?? tok.token).padEnd(8)} gain ${fmt(tok.gainQuote)} · proceeds ${fmt(tok.proceedsQuote)} (${tok.realizations} sale${tok.realizations === 1 ? "" : "s"})`);
+        }
+      }
       if (report.totalUntrackedProceedsQuote > 0) {
         console.error(`  ⚠ untracked-sell proceeds ${fmt(report.totalUntrackedProceedsQuote)} (no cost basis — NOT in the gain total)`);
       }
       if (report.skippedNonStableQuote > 0) {
         console.error(`  ⚠ ${report.skippedNonStableQuote} fill(s) skipped (non-stablecoin quote)`);
       }
-      console.error(`  method: WEIGHTED-AVERAGE cost basis · gas excluded · not tax advice`);
+      console.error(`  method: WEIGHTED-AVERAGE cost basis (holding period is a weighted-avg estimate, NOT lot-based FIFO; long-term = held > ${LONG_TERM_DAYS}d) · gas excluded · not tax advice`);
       return;
     }
     default:

@@ -29,6 +29,15 @@ import { recentTrades, listPaperTrades, type PaperTradeRow } from "./db.js";
 import { computePaperPnlMtm, type RealizationRecord } from "./paperPnl.js";
 import { ToolError } from "./errors.js";
 
+/** v60: gain/proceeds/cost subtotals for one slice (a term bucket or a
+ *  per-token rollup row). */
+export interface GainsSubtotal {
+  gainQuote: number;
+  proceedsQuote: number;
+  costBasisQuote: number;
+  realizations: number;
+}
+
 export interface GainsReport {
   mode: "real" | "paper";
   sinceIso: string | null;
@@ -40,6 +49,15 @@ export interface GainsReport {
   totalUntrackedProceedsQuote: number;
   /** Fills excluded because the quote token isn't a stablecoin. */
   skippedNonStableQuote: number;
+  /** v60: short-term (held ≤ LONG_TERM_DAYS) vs long-term (held longer)
+   *  split — the headline tax distinction. `untracked` collects sales with
+   *  no tracked acquisition date (oversold pre-history inventory). The
+   *  holding period is a WEIGHTED-AVERAGE estimate (not lot-based FIFO) —
+   *  disclosed, since this model carries one blended basis per position. */
+  byTerm: { short: GainsSubtotal; long: GainsSubtotal; untracked: GainsSubtotal };
+  /** v60: per-(chain,token) rollup, gain-descending — the "by asset"
+   *  subtotals a tax filer (or operator) reads instead of the flat list. */
+  byToken: Array<{ chain: string; token: string; symbol: string | null } & GainsSubtotal>;
 }
 
 export async function gatherRealizedGains(args: {
@@ -110,6 +128,31 @@ export async function gatherRealizedGains(args: {
   }
   const skipped = report.summaries.reduce((acc, s) => acc + (s.skippedNonStableQuote ?? 0), 0);
 
+  // v60: term split + per-token rollup over the windowed records.
+  const emptySub = (): GainsSubtotal => ({ gainQuote: 0, proceedsQuote: 0, costBasisQuote: 0, realizations: 0 });
+  const byTerm = { short: emptySub(), long: emptySub(), untracked: emptySub() };
+  const tokenMap = new Map<string, { chain: string; token: string; symbol: string | null } & GainsSubtotal>();
+  for (const r of records) {
+    const bucket = byTerm[r.term];
+    bucket.gainQuote += r.gainQuote;
+    bucket.proceedsQuote += r.proceedsQuote;
+    bucket.costBasisQuote += r.costBasisQuote;
+    bucket.realizations += 1;
+
+    const key = `${r.chain}:${r.token.toLowerCase()}`;
+    let tok = tokenMap.get(key);
+    if (!tok) {
+      tok = { chain: r.chain, token: r.token, symbol: r.symbol, ...emptySub() };
+      tokenMap.set(key, tok);
+    }
+    if (r.symbol && !tok.symbol) tok.symbol = r.symbol;
+    tok.gainQuote += r.gainQuote;
+    tok.proceedsQuote += r.proceedsQuote;
+    tok.costBasisQuote += r.costBasisQuote;
+    tok.realizations += 1;
+  }
+  const byToken = [...tokenMap.values()].sort((a, b) => b.gainQuote - a.gainQuote);
+
   return {
     mode: args.mode,
     sinceIso: args.sinceIso ?? null,
@@ -120,6 +163,8 @@ export async function gatherRealizedGains(args: {
     totalCostBasisQuote: totalCost,
     totalUntrackedProceedsQuote: totalUntracked,
     skippedNonStableQuote: skipped,
+    byTerm,
+    byToken,
   };
 }
 
@@ -136,6 +181,8 @@ export function gainsToCsv(records: readonly RealizationRecord[]): string {
     "amount_sold", "sell_price_quote", "avg_cost_quote",
     "proceeds_quote", "cost_basis_quote", "gain_quote",
     "untracked_amount", "untracked_proceeds_quote", "tx_hash",
+    // v60: holding-period columns for tax classification.
+    "acquired_at", "holding_days", "term",
   ].join(",");
   const lines = records.map((r) =>
     [
@@ -143,6 +190,7 @@ export function gainsToCsv(records: readonly RealizationRecord[]): string {
       r.soldAmount, r.sellPriceQuote, r.avgCostQuote,
       r.proceedsQuote, r.costBasisQuote, r.gainQuote,
       r.untrackedAmount, r.untrackedProceedsQuote, r.txHash ?? "",
+      r.acquiredAt ?? "", r.holdingDays ?? "", r.term,
     ].map(esc).join(","),
   );
   return [header, ...lines].join("\n") + "\n";
