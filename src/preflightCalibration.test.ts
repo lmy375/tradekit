@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import {
   correlatePreflightToTrades,
   summarizeCalibration,
+  aggregateSignalOutcomes,
   type PreflightLite,
   type TradeLite,
 } from "./preflightCalibration.js";
@@ -24,6 +25,56 @@ function run(over: Partial<PreflightLite> = {}): PreflightLite {
 function trade(over: Partial<TradeLite> = {}): TradeLite {
   return { timestamp: at(1), chain: "base", account: "default", direction: "buy", baseSymbol: "WETH", status: "success", realizedSlippageBps: 20, ...over };
 }
+
+describe("aggregateSignalOutcomes (v94 per-signal calibration)", () => {
+  // Build run↔trade matches directly: a run carrying `codes`, filled at `slip`.
+  const m = (codes: string[], slip: number | null, status = "success") => ({
+    run: run({ codes }),
+    trade: slip == null && status === "success" ? trade({ status, realizedSlippageBps: null }) : trade({ status, realizedSlippageBps: slip ?? undefined }),
+  });
+
+  it("flags a signal as predictive when its trades slip worse than baseline", () => {
+    const matches = [
+      // baseline pool also includes the no-signal trades at ~20bps.
+      m([], 20), m([], 20), m([], 20),
+      // the signal's trades slip ~60bps (worse) — predictive.
+      m(["market_timing_caution"], 60), m(["market_timing_caution"], 60), m(["market_timing_caution"], 60),
+    ];
+    const out = aggregateSignalOutcomes(matches);
+    const sig = out.find((s) => s.code === "market_timing_caution")!;
+    expect(sig.filled).toBe(3);
+    expect(sig.vsBaselineBps!).toBeGreaterThan(5);
+    expect(sig.predictive).toBe(true);
+  });
+
+  it("flags a signal as NOT separating (possible noise) when it slips ~baseline", () => {
+    const matches = [
+      m([], 30), m([], 30), m([], 30),
+      m(["concentration_high"], 31), m(["concentration_high"], 31), m(["concentration_high"], 31),
+    ];
+    const sig = aggregateSignalOutcomes(matches).find((s) => s.code === "concentration_high")!;
+    expect(sig.predictive).toBe(false);
+  });
+
+  it("predictive is null with too few filled samples", () => {
+    const matches = [m([], 20), m([], 20), m(["mev_exposed"], 80)]; // only 1 filled w/ the signal
+    const sig = aggregateSignalOutcomes(matches).find((s) => s.code === "mev_exposed")!;
+    expect(sig.filled).toBe(1);
+    expect(sig.predictive).toBeNull();
+  });
+
+  it("ignores runs with no matched trade + ranks most-predictive first", () => {
+    const matches = [
+      { run: run({ codes: ["a"] }), trade: null }, // unmatched — ignored
+      m([], 10), m([], 10), m([], 10),
+      m(["a"], 90), m(["a"], 90), m(["a"], 90), // big delta
+      m(["b"], 40), m(["b"], 40), m(["b"], 40), // smaller delta
+    ];
+    const out = aggregateSignalOutcomes(matches);
+    expect(out[0].code).toBe("a"); // ranked by vsBaselineBps desc
+    expect(out.find((s) => s.code === "a")!.matched).toBe(3); // the null-trade run didn't count
+  });
+});
 
 describe("correlatePreflightToTrades", () => {
   it("matches a run to the nearest subsequent same-key trade", () => {

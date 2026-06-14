@@ -1099,6 +1099,17 @@ export async function tradePreflightCalibrationCommand(flags: Record<string, str
   }
   console.log("");
   console.log(`  → ${report.summary}`);
+  // v94: per-signal calibration — which caution-type signals actually predict
+  // worse execution (vs the all-filled baseline)?
+  if (report.bySignal.length > 0) {
+    console.log("");
+    console.log("  Per-signal (does the flag predict worse execution?):");
+    for (const s of report.bySignal) {
+      const verdict = s.predictive === true ? "✓ predictive" : s.predictive === false ? "✗ not separating (noise?)" : "— too few";
+      const delta = s.vsBaselineBps != null ? `${s.vsBaselineBps >= 0 ? "+" : ""}${s.vsBaselineBps.toFixed(0)}bps vs baseline` : "—";
+      console.log(`    ${s.code.padEnd(24)} ${String(s.filled).padStart(3)} filled · ${delta.padStart(18)} · ${verdict}`);
+    }
+  }
   console.log("");
   console.log("  Note: decisions↔trades are correlated by proximity (same pair/dir, nearest");
   console.log("  trade within the window), not a hard link — an aggregate read, not per-trade truth.");

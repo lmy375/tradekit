@@ -30,6 +30,11 @@ export interface PreflightLite {
   direction: string;
   baseSymbol: string | null;
   verdict: string;
+  /** v94: the warn/critical reason codes this run carried (e.g.
+   *  "market_timing_caution", "concentration_high"). Drives per-signal
+   *  calibration — does a signal actually predict worse outcomes? Optional so
+   *  pre-v94 callers stay valid. */
+  codes?: string[];
 }
 
 export interface TradeLite {
@@ -55,14 +60,81 @@ export interface VerdictOutcome {
   medianSlippageBps: number | null;
 }
 
+export interface SignalOutcome {
+  /** The warn/critical preflight reason code, e.g. "market_timing_caution". */
+  code: string;
+  /** Matched runs (correlated to a trade) that carried this signal. */
+  matched: number;
+  filled: number;
+  medianSlippageBps: number | null;
+  /** signal median − the all-filled baseline median (positive = the signal's
+   *  trades slip WORSE, i.e. the signal is predictive). Null when unmeasurable. */
+  vsBaselineBps: number | null;
+  /** true = predictive (worse than baseline by a margin, enough samples);
+   *  false = not separating outcomes (possible noise); null = too few samples. */
+  predictive: boolean | null;
+}
+
 export interface PreflightCalibrationReport {
   windowMinutes: number;
   totalRuns: number;
   totalMatched: number;
   byVerdict: VerdictOutcome[];
+  /** v94: per-signal calibration — does each caution-type signal predict worse
+   *  outcomes? Ranked by vsBaselineBps desc (most-predictive first). */
+  bySignal: SignalOutcome[];
   /** Plain-language read of whether the verdicts separate outcomes. */
   summary: string;
   generatedAt: string;
+}
+
+/** Min filled samples before a signal's predictiveness is judged (else null). */
+const SIGNAL_MIN_SAMPLES = 3;
+/** A signal's trades must slip ≥ this many bps worse than baseline to count as predictive. */
+const SIGNAL_PREDICTIVE_MARGIN_BPS = 5;
+
+/**
+ * Pure: from the run↔trade matches, measure whether each warn/critical SIGNAL
+ * (reason code a run carried) predicts worse execution than the overall filled
+ * baseline. Reuses the v75 correlation; the per-signal lens is the v94 add — it
+ * validates which of the accreted pre-trade signals (timing, concentration,
+ * MEV, …) actually earn their keep vs. fire as noise.
+ */
+export function aggregateSignalOutcomes(
+  matches: ReadonlyArray<{ run: PreflightLite; trade: TradeLite | null }>,
+): SignalOutcome[] {
+  // Baseline: median slippage across ALL filled correlated trades.
+  const baseSlips: number[] = [];
+  for (const m of matches) {
+    if (m.trade?.status === "success" && m.trade.realizedSlippageBps != null && Number.isFinite(m.trade.realizedSlippageBps)) {
+      baseSlips.push(m.trade.realizedSlippageBps);
+    }
+  }
+  const baseline = median(baseSlips);
+
+  const acc = new Map<string, { matched: number; filled: number; slips: number[] }>();
+  for (const m of matches) {
+    if (!m.trade) continue;
+    for (const code of m.run.codes ?? []) {
+      const e = acc.get(code) ?? { matched: 0, filled: 0, slips: [] };
+      e.matched += 1;
+      if (m.trade.status === "success") {
+        e.filled += 1;
+        if (m.trade.realizedSlippageBps != null && Number.isFinite(m.trade.realizedSlippageBps)) e.slips.push(m.trade.realizedSlippageBps);
+      }
+      acc.set(code, e);
+    }
+  }
+
+  return [...acc.entries()]
+    .map(([code, e]) => {
+      const med = median(e.slips);
+      const vsBaselineBps = med != null && baseline != null ? med - baseline : null;
+      const predictive =
+        e.filled < SIGNAL_MIN_SAMPLES || vsBaselineBps == null ? null : vsBaselineBps >= SIGNAL_PREDICTIVE_MARGIN_BPS;
+      return { code, matched: e.matched, filled: e.filled, medianSlippageBps: med, vsBaselineBps, predictive };
+    })
+    .sort((a, b) => (b.vsBaselineBps ?? -Infinity) - (a.vsBaselineBps ?? -Infinity));
 }
 
 const VERDICT_ORDER = ["go", "caution", "no_go"];
@@ -205,6 +277,7 @@ export function gatherPreflightCalibration(args: {
     direction: r.direction,
     baseSymbol: r.base_symbol,
     verdict: r.verdict,
+    codes: parseSignalCodes(r.reasons_json),
   }));
   // Trades from a touch before the window opens through now (a run near the
   // window's start can match a trade just after it).
@@ -219,13 +292,25 @@ export function gatherPreflightCalibration(args: {
     realizedSlippageBps: t.realized_slippage_bps ?? null,
   }));
 
-  const { byVerdict } = correlatePreflightToTrades(runs, trades, windowMinutes * 60_000);
+  const { byVerdict, matches } = correlatePreflightToTrades(runs, trades, windowMinutes * 60_000);
   return {
     windowMinutes,
     totalRuns: runs.length,
     totalMatched: byVerdict.reduce((s, v) => s + v.matched, 0),
     byVerdict,
+    bySignal: aggregateSignalOutcomes(matches),
     summary: summarizeCalibration(byVerdict),
     generatedAt: (args.now ?? new Date()).toISOString(),
   };
+}
+
+/** Extract the warn/critical reason codes from a journaled run's reasons_json
+ *  (the signals worth calibrating; "_ok"/info reasons aren't signals). */
+function parseSignalCodes(reasonsJson: string): string[] {
+  try {
+    const reasons = JSON.parse(reasonsJson) as Array<{ code?: string; severity?: string }>;
+    return reasons.filter((r) => r.severity === "warn" || r.severity === "critical").map((r) => r.code ?? "").filter(Boolean);
+  } catch {
+    return [];
+  }
 }

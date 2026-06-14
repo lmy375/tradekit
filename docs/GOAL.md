@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 94 — 逐信号校准：每个预交易告警真的预测更差的成交吗？（per-signal calibration — does each advisory flag earn its keep, or fire as noise?）** ✅
+- **让护栏诚实面对自己**：preflight 这些月累积了一堆 warn/critical 告警码（market_timing_caution / concentration_high / drawdown_approaching / mev_exposed…），每个都让 agent 更谨慎。但**从没人验证过它们到底准不准**——某个告警一响，随后的成交真的更差了吗？还是它只是噪声、徒增"caution"verdict、教 agent 把真信号也一起忽略？v75 校准只看 verdict 层（go vs caution 整体），看不到单个信号
+- 为什么是最重要的：信号可信度是整个 preflight 决策系统的根。一个常响却不预测任何坏处的告警，比没有更糟——它制造警报疲劳，稀释真正重要的告警。把"我们累积的每个建议信号"对着**实际成交结果**验证，是让 agent 的谨慎有的放矢、而非机械堆砌护栏。这正好收尾 detect→journal→correlate→**validate** 这条可观测性弧（v74 记录、v75 关联 verdict、v94 关联到逐信号）
+- 实现（复用 v74 journal 的 reasons_json + v75 关联基建，纯函数）：`aggregateSignalOutcomes(matches)`——对每个告警码，算其携带交易的成交滑点中位数 vs **全体已成交基线**中位数；`vsBaselineBps = 信号中位数 − 基线`；`predictive`：filled≥3 且 vsBaseline≥+5bps → true（确实预测更差），<5bps → false（不分离，疑似噪声），样本不足 → null。按 vsBaselineBps 降序排（最该信任的在前）。`parseSignalCodes` 从 reasons_json 抽 warn/critical 码；`PreflightLite.codes` 承载
+- CLI `trade preflight calibration` 新增"Per-signal（这个告警预测更差成交吗？）"块：逐码显示 filled 数、±bps vs 基线、✓ predictive / ✗ not separating (noise?) / — too few；MCP `preflight_calibration` 工具返回新增 `bySignal[]`（agent 可自省哪些信号值得信、哪些该剪枝）
+- 测试覆盖：`preflightCalibration.test.ts` +4——信号滑点>基线→predictive / ≈基线→not separating / 样本不足→null / 忽略未匹配 run + 按预测力降序排；3493 测试全绿（+4）
+- 向后兼容：纯加法——新纯函数、CLI 多一个渲染块（空 journal 时不显示）、MCP 响应多一字段；不改既有 verdict 校准逻辑
+
 **Phase 93 — 一键加固（safety harden — make the safe path the easy path）** ✅
 - **让"安全"成为容易的默认，而非加新护栏**：整套护栏（断路器/集中度/转账白名单/无限授权块/USD 限额…）全是 opt-in——粗心的运营商会让 agent 全敞口跑。`safety review` 检测缺口+给逐条修复命令，但运营商得跑 ~8 条、还得自己定值。本期一步补齐：结构性护栏给安全默认值、scale-specific 的 USD 限额从 flag 取（或标为待补）
 - 为什么是最重要的：托管真钱给自主 agent，最大的真实风险或许是**运营商根本没开护栏**。我建了所有护栏（v70-v92），现在让它们一键打开。降低运营商失误=直接服务"安全自主交易"这一最重要的东西。这是整个安全弧的收尾（detect→action：review 检测，harden 行动）
