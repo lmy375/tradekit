@@ -182,4 +182,28 @@ describe("gatherOpenPositions — withProtection", () => {
     const r = await gather(3000);
     expect(r.positions[0].protection).toBeUndefined();
   });
+
+  // v119: detect→respond — an exposed position yields a ready protect action.
+  it("emits an order_create trailing-stop action for an UNPROTECTED position", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gatherProt([]); // no protective orders → unprotected
+    expect(r.recommendedActions).toHaveLength(1);
+    const a = r.recommendedActions![0];
+    expect(a.tool).toBe("order_create");
+    expect(a.params).toMatchObject({ side: "sell", trigger: "trailing", base: WETH });
+    expect(Number(a.params!.baseAmount)).toBeCloseTo(1, 4); // covers the uncovered amount
+    expect(Number(a.params!.trailPct)).toBeGreaterThan(0);
+  });
+
+  it("no action for a fully-protected position", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gatherProt([ord({ trigger_type: "trailing", trail_pct: 5, base_amount: "max" })]);
+    expect(r.recommendedActions).toEqual([]);
+  });
+
+  it("recommendedActions absent entirely when withProtection is off", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gather(3000);
+    expect(r.recommendedActions).toBeUndefined();
+  });
 });

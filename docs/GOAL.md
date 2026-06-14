@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 119 — 持仓审阅 detect→respond：裸奔持仓直接给出一键保护命令（open_positions emits ready protect actions for exposed positions — detect→respond for position protection）** ✅
+- **补上 v110 的响应半边**：v110 让 open_positions 显示每仓保护状态（DETECT——"这个赢家裸奔着"）。但只检测、不响应——agent 看到 UNPROTECTED 后，还得自己拼一个 order_create（side/trigger/base/amount）。这正是 v98 detect→respond 模式要消除的缝隙
+- 为什么重要：持仓管理是 agent 核心循环。审阅持仓时看到裸奔仓，应当一步拿到现成的保护命令，而非手搓订单参数（易错：数量/触发类型）。这把 v110 的检测接进行动，和 promote-outcome（v98）同款 recommendedActions 标准
+- 实现（复用 v98 模式 + v110 的逐仓保护数据，零执行路径改动）：OpenPositionsReport 加顶层 recommendedActions（仅 withProtection 时）——对每个 unprotected/partial 仓，一条 `order_create` 追踪止损（side=sell、trigger=trailing、base=该仓代币、baseAmount=未覆盖量、trailPct=15 默认），reason 点名暴露金额。CLI render 打印可直接运行的 order create 命令；MCP open_positions 描述同步
+- 测试覆盖：+3——裸奔仓→一条 order_create 动作（覆盖未保护量、正确 base/trigger）/ 全保护→空动作 / withProtection off→无 recommendedActions 字段；3607 测试全绿（+3）
+- 向后兼容：纯加法——recommendedActions optional 仅 withProtection 时出现；复用 v110 数据 + v98 模式；不改保护/下单逻辑
+
 **Phase 118 — risk_size 一步出全括号入场：按风险定仓 + 1R 止损 + N-R 止盈（risk_size emits a fully-bracketed entry — size by R, stop at 1R, take-profit at N-R, in one call）** ✅
 - **风险管理弧的收顶（v105→v105.1→v117→v118）**：v105 按风险定仓、v105.1 让 risk_size 出可执行的带止损 buy、v117 给 buy 加了括号原语。缺的最后一环：risk_size 自己算出止盈、把完整括号 buy 一步交付。之前 agent 得手动算 takeProfitPct = N × 止损距离再穿进 buy——正是 v105.1 要消除的那类易错缝隙（v105.1 消了"尺寸+止损"穿线，本期消"止盈"穿线）
 - 为什么重要：这让"进入一个完全风险纪律的括号仓"成为**一次 risk_size 调用**——自主交易的基石工作流。agent 说"冒 \$50 风险、5% 追踪止损、目标 2R"→ risk_size 回一条现成 buy：按风险定 \$1000、5% 止损、+10% 止盈（2×止损距离）OCO 括号。尺寸来自风险预算（被安全天花板夹）、止损=风险距离、止盈=N×风险 → realized 风险/收益都对齐计划

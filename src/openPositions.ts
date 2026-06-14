@@ -99,6 +99,11 @@ export interface OpenPositionsReport {
   unpricedCount: number;
   /** Short-term positions within APPROACHING_LONG_TERM_DAYS of long-term. */
   approachingLongTerm: number;
+  /** v119: detect→respond — when withProtection surfaces UNPROTECTED / PARTIAL
+   *  positions, a ready `order_create` trailing-stop action per exposed
+   *  position (covering the uncovered amount), so the agent acts in one step
+   *  instead of hand-building the order. Absent unless withProtection. */
+  recommendedActions?: import("./errors.js").NextAction[];
 }
 
 export async function gatherOpenPositions(args: {
@@ -289,6 +294,29 @@ export async function gatherOpenPositions(args: {
     }
   }
 
+  // v119: detect→respond — for each UNPROTECTED / PARTIAL position, a ready
+  // trailing-stop order_create covering the uncovered amount (the v98 pattern
+  // applied to position protection). Only when protection was assessed.
+  let recommendedActions: import("./errors.js").NextAction[] | undefined;
+  if (args.withProtection) {
+    const TRAIL = 15; // DEFAULT_PROTECT_TRAIL_PCT — a sane default the operator can adjust
+    recommendedActions = positions
+      .filter((p) => p.protection != null && p.protection.status !== "protected" && p.protection.unprotectedAmount > 0)
+      .map((p) => ({
+        tool: "order_create",
+        params: {
+          side: "sell",
+          trigger: "trailing",
+          trailPct: TRAIL,
+          base: p.token,
+          baseAmount: p.protection!.unprotectedAmount.toPrecision(8),
+        },
+        reason:
+          `${p.symbol ?? p.token.slice(0, 8)} is ${p.protection!.status.toUpperCase()}` +
+          `${p.valueQuote != null ? ` ($${p.valueQuote.toFixed(2)} exposed)` : ""} — attach a ${TRAIL}% trailing stop on the uncovered ${p.protection!.unprotectedAmount.toPrecision(6)} to cap the downside (adjust trailPct to taste).`,
+      }));
+  }
+
   return {
     mode: args.mode,
     generatedAt: now.toISOString(),
@@ -298,6 +326,7 @@ export async function gatherOpenPositions(args: {
     totalUnrealizedQuote: totalUnrealized,
     unpricedCount: unpriced,
     approachingLongTerm: approaching,
+    ...(recommendedActions != null ? { recommendedActions } : {}),
   };
 }
 
@@ -350,6 +379,15 @@ export function renderOpenPositions(r: OpenPositionsReport): string {
       lines.push(`           protection: ${badge}${stopDesc}`);
     } else if (p.protection === null) {
       lines.push(`           protection: 🔴 UNPROTECTED`);
+    }
+  }
+  // v119: ready protect commands for the exposed positions.
+  if (r.recommendedActions && r.recommendedActions.length > 0) {
+    lines.push(``);
+    lines.push(`  Protect the exposed (${r.recommendedActions.length}):`);
+    for (const a of r.recommendedActions) {
+      const p = a.params ?? {};
+      lines.push(`   → tradekit order create --side sell --trigger trailing --trail-pct ${p.trailPct} --base ${p.base} --base-amount ${p.baseAmount}`);
     }
   }
   return lines.join("\n");
