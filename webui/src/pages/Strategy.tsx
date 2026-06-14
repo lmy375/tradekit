@@ -28,9 +28,11 @@ import {
   getGains,
   getStrategies,
   getStrategyReport,
+  getStrategyCompare,
   type GainsResp,
   type PageProps,
   type StrategyReportResp,
+  type StrategyCompareResp,
   type StrategyTag,
 } from "../api";
 
@@ -88,6 +90,7 @@ export function Strategy(_props: PageProps) {
   const [windowSel, setWindowSel] = useState("30d");
   const [mode, setMode] = useState("auto");
   const [report, setReport] = useState<StrategyReportResp["report"] | null>(null);
+  const [compare, setCompare] = useState<StrategyCompareResp | null>(null);
   const [gains, setGains] = useState<GainsResp | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -123,6 +126,14 @@ export function Strategy(_props: PageProps) {
   useEffect(() => {
     load();
   }, [load]);
+
+  // v87: ranked cross-strategy comparison (capital allocation). Deterministic,
+  // best-effort — a failure leaves the per-tag detail untouched.
+  useEffect(() => {
+    getStrategyCompare(mode === "paper" ? "paper" : "real")
+      .then(setCompare)
+      .catch(() => setCompare(null));
+  }, [mode]);
 
   if (error && !report) return <Text c="red">Failed to load: {error}</Text>;
   if (tags == null) return <Group justify="center" p="xl"><Loader size="sm" /></Group>;
@@ -173,6 +184,60 @@ export function Strategy(_props: PageProps) {
         </div>
         {loading && <Loader size="xs" mb={6} />}
       </Group>
+
+      {/* v87: ranked cross-strategy comparison — which strategies win/lose, for
+          capital allocation. Click a row to drill into its detail below. */}
+      {compare && compare.strategies.length > 0 && (
+        <Card withBorder padding="sm">
+          <Group justify="space-between" mb={6}>
+            <Title order={6}>Performance comparison</Title>
+            <Text size="xs" c="dimmed">{compare.summary}</Text>
+          </Group>
+          <Table verticalSpacing={2} highlightOnHover withRowBorders={false}>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th><Text size="xs" c="dimmed">#</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">strategy</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">realized $</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">win rate</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">closes</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">trades</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed">volume $</Text></Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {compare.strategies.map((s, i) => {
+                const bleeding = compare.bleeding.includes(s.strategy);
+                return (
+                  <Table.Tr
+                    key={s.strategy}
+                    onClick={() => setTag(s.strategy)}
+                    style={{ cursor: "pointer", background: s.strategy === tag ? "var(--mantine-color-dark-6)" : undefined }}
+                  >
+                    <Table.Td><Text size="xs" c="dimmed">{i + 1}</Text></Table.Td>
+                    <Table.Td>
+                      <Group gap={4}>
+                        <Text size="xs" ff="monospace">{s.strategy}</Text>
+                        {bleeding && <Badge size="xs" color="red" variant="light">bleeding</Badge>}
+                      </Group>
+                    </Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace" c={s.realizedUsd >= 0 ? "teal" : "red.4"}>{s.realizedUsd >= 0 ? "+" : "−"}${Math.abs(s.realizedUsd).toFixed(2)}</Text></Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace">{s.winRatePct != null ? `${s.winRatePct.toFixed(0)}% (${s.wins}/${s.wins + s.losses})` : "—"}</Text></Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace">{s.closes}</Text></Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace">{s.tradeCount}</Text></Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace">${s.volumeUsd.toFixed(0)}</Text></Table.Td>
+                  </Table.Tr>
+                );
+              })}
+            </Table.Tbody>
+          </Table>
+          {compare.unpricedTrades > 0 && (
+            <Text size="xs" c="dimmed" mt={4}>
+              {compare.unpricedTrades} non-stablecoin-quoted trade(s) excluded from P&L.
+            </Text>
+          )}
+        </Card>
+      )}
 
       {report && id && (
         <Card withBorder padding="sm">

@@ -420,6 +420,31 @@ export interface StrategyTag {
 export const getStrategies = () =>
   api.get<{ ok: true; count: number; strategies: StrategyTag[] }>("/api/strategies");
 
+export interface StrategyPerformance {
+  strategy: string;
+  realizedUsd: number;
+  tradeCount: number;
+  closes: number;
+  wins: number;
+  losses: number;
+  winRatePct: number | null;
+  volumeUsd: number;
+  avgRealizedPerClose: number | null;
+  lastTradeAt: string | null;
+}
+export interface StrategyCompareResp {
+  ok: true;
+  strategies: StrategyPerformance[];
+  totalRealizedUsd: number;
+  best: StrategyPerformance | null;
+  worst: StrategyPerformance | null;
+  bleeding: string[];
+  unpricedTrades: number;
+  summary: string;
+}
+export const getStrategyCompare = (mode: string) =>
+  api.get<StrategyCompareResp>(`/api/strategy-compare?mode=${encodeURIComponent(mode)}`);
+
 export interface StrategyReportResp {
   ok: true;
   report: {

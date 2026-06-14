@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 87 — 策略对比上 Web（strategy comparison on the dashboard — capital-allocation parity for the web operator）** ✅
+- **继续收 Web 落后差，补有效性支柱的关键视图（增强既有页而非加 tab）**：v86 把风险上了 Web；本期把 v83 策略业绩排名上 Web。既有 Strategy tab 只是**单策略深挖**（下拉选一个看详情）——用 Web 的运营商无法一眼看到"哪些策略赚钱/流血"做资本配置。本期在既有 Strategy 页**顶部加排名对比表**，不新增 tab（避免 tab 膨胀）
+- 为什么有价值：资本配置是多策略 agent 的核心有效性决策。Web 运营商此前只能逐个钻取，看不到横向排名。补上 = 仪表盘有了"加码谁、砍掉谁"的一眼视图
+- **干净可测**：策略对比是**确定性**的（DB-only、stablecoin-$1 模型、无 RPC）——所以 Web API 完全可单测（不像 risk 需 RPC 降级）。`GET /api/strategy-compare?mode=` 在可测的 `registerAutomationRoutes` 里 → `gatherStrategyComparison`
+- 实现：(1) 路由 `/api/strategy-compare`（mode/days 参数）；(2) api.ts `getStrategyCompare`/`StrategyCompareResp`；(3) **增强既有 Strategy.tsx**——顶部加排名表（#、策略、realized $ 红绿、win rate、closes、trades、volume、bleeding 徽章），**行可点**→设为选中策略钻取下方详情（对比表兼作选择器）；随页面 mode（real/paper）刷新
+- 测试覆盖：`webAutomation.test.ts` +1（seed paper winner(+600)/loser(-300) → `/api/strategy-compare?mode=paper` 按 realized 降序排名 + bleeding 含 loser + totalRealizedUsd——确定性全验证，无 RPC 降级）；webui `tsc -b` + `vite build` 全过
+- 向后兼容：纯加法——新路由、api.ts 新方法、Strategy 页新增对比区（既有深挖不变）；3448 测试全绿（+1）
+- v1 限制：对比 realized-only（与 v83 一致——非稳定币计价交易排除，脚注明示）；Web mode auto→real 映射（对比需 real/paper，auto 取 real）；行点击设选中 tag（轻量钻取，非独立路由）
+
 **Phase 86 — 风险态势上 Web（risk posture on the dashboard — bring the most important operator signal to the laggard interface）** ✅
 - **补齐三大界面里落后最多的那个，针对最重要的信号**：CLI/MCP/Web 三大一等界面，Web 自 v68（safety 页）以来落后了 ~17 个能力（concentration/protection/risk posture/strategy compare/calibration…全没上 Web）。用 Web 看盘的运营商，对**最重要的信号——风险**完全盲。本期把 v78 统一风险裁决搬上仪表盘
 - 为什么是最重要的：安全做满后，运营商信任的核心是"现在安不安全"。这个答案（risk posture）此前只在 CLI `risk`。用 Web 的运营商日常看不到。把它放进仪表盘 = 最重要的信号到达最该看的地方

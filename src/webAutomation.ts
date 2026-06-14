@@ -748,6 +748,27 @@ export function registerAutomationRoutes(app: Express): void {
     }),
   );
 
+  // ── strategy comparison (v87) ─────────────────────────────
+  // Web parity for the v83 capital-allocation view — rank strategies by
+  // realized P&L + win rate so an operator sees which to scale / cut at a
+  // glance (the existing Strategy tab is a per-tag deep-dive; this is the
+  // cross-strategy ranking). Deterministic (DB-only, stablecoin-$1 model) — no
+  // RPC, fully testable.
+  app.get(
+    "/api/strategy-compare",
+    wrap(async (req, res) => {
+      const mode = qStr(req, "mode") === "paper" ? "paper" : "real";
+      const daysRaw = qStr(req, "days");
+      const days = daysRaw != null ? Number(daysRaw) : undefined;
+      const sinceIso =
+        days != null && Number.isFinite(days) && days > 0
+          ? new Date(Date.now() - days * 86_400_000).toISOString()
+          : undefined;
+      const { gatherStrategyComparison } = await import("./strategyCompare.js");
+      res.json({ ok: true, ...gatherStrategyComparison({ mode, sinceIso }) });
+    }),
+  );
+
   // ── risk posture (v86) ────────────────────────────────────
   // Web parity for the v78 unified RUNTIME risk verdict — the single "is my
   // book in danger right now?" answer (exposure headroom + concentration +

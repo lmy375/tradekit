@@ -773,6 +773,32 @@ describe("/api/safety", () => {
   });
 });
 
+describe("/api/strategy-compare", () => {
+  function paper(strategy: string, dir: "buy" | "sell", amount: string, quote: string, day: number) {
+    recordPaperTrade({
+      timestamp: `2026-06-${String(day).padStart(2, "0")}T00:00:00Z`, source_type: "manual", source_id: null,
+      chain: "base", account: "default", direction: dir, base_token: WETH, base_symbol: "WETH",
+      base_amount: amount, quote_token: USDC, quote_symbol: "USDC", quote_amount: quote, price: "0",
+      slippage_bps: null, strategy, notes: null,
+    });
+  }
+
+  it("ranks strategies by realized P&L and flags bleeders", async () => {
+    paper("winner", "buy", "1", "2000", 1);
+    paper("winner", "sell", "1", "2600", 2); // +600
+    paper("loser", "buy", "1", "2000", 1);
+    paper("loser", "sell", "1", "1700", 2); // -300
+    const r = await get("/api/strategy-compare?mode=paper");
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    const strategies = r.body.strategies as Array<{ strategy: string; realizedUsd: number; winRatePct: number | null }>;
+    expect(strategies.map((s) => s.strategy)).toEqual(["winner", "loser"]); // realized desc
+    expect(strategies[0].realizedUsd).toBeCloseTo(600, 6);
+    expect(r.body.bleeding).toEqual(["loser"]);
+    expect(typeof r.body.totalRealizedUsd).toBe("number");
+  });
+});
+
 describe("/api/risk", () => {
   it("returns the unified runtime risk verdict + ranked concerns", async () => {
     const r = await get("/api/risk");
