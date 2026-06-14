@@ -133,6 +133,24 @@ describe("info-level omissions each produce one gap with a fix", () => {
   });
 });
 
+describe("concentration limit (v72)", () => {
+  it("is a gap (info) when unset; the guardrail reads off", () => {
+    const r = review({ perTxUsdLimit: 10, tokenBlacklist: { base: ["0x1"] } });
+    expect(rail(r, "maxConcentration").state).toBe("off");
+    const g = gap(r, "concentration");
+    expect(g).not.toBeNull();
+    expect(g!.severity).toBe("info");
+    expect(g!.finding).toMatch(/cross-strategy blind spot/);
+  });
+
+  it("is active + no gap once configured", () => {
+    const r = review({ perTxUsdLimit: 10, maxConcentrationPct: 50 });
+    expect(rail(r, "maxConcentration").state).toBe("active");
+    expect(rail(r, "maxConcentration").detail).toMatch(/50%/);
+    expect(gap(r, "concentration")).toBeNull();
+  });
+});
+
 describe("safetyPromoteBlocker — the v52 promote gate", () => {
   it("blocks on a critical gap (no USD ceiling), naming the finding + fix", () => {
     const blocker = safetyPromoteBlocker(review());

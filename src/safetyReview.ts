@@ -295,6 +295,24 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
     state: stratBudgets > 0 ? "active" : "off",
     detail: stratBudgets > 0 ? `${stratBudgets} rule(s)` : "off",
   });
+  // v72: portfolio concentration — the cross-strategy aggregate the per-
+  // strategy caps above structurally miss.
+  const concLimit = s.maxConcentrationPct;
+  g({
+    key: "maxConcentration",
+    label: "Concentration limit",
+    category: "exposure",
+    state: concLimit != null ? "active" : "off",
+    detail: concLimit != null ? `flag any single token > ${concLimit}% of the book` : "off",
+  });
+  if (concLimit == null) {
+    gap(
+      "info",
+      "concentration",
+      "no portfolio concentration limit — several strategies can each stay within their per-strategy caps while the book drifts into one token (the cross-strategy blind spot)",
+      "set safety.maxConcentrationPct (e.g. 50) to flag single-token over-concentration in `portfolio` / `safety review`",
+    );
+  }
   if (posLimits === 0 && posCaps === 0 && stratBudgets === 0) {
     gap(
       "info",

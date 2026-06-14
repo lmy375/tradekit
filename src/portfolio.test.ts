@@ -8,6 +8,7 @@ import type { Address } from "viem";
 import {
   aggregateTokens,
   computeConcentration,
+  assessConcentrationRisk,
   type AccountChainSnapshot,
 } from "./portfolio.js";
 
@@ -226,5 +227,63 @@ describe("computeConcentration (iter605)", () => {
     const { tokens } = aggregateTokens(snapshots);
     const c = computeConcentration(tokens);
     expect(c.top1).toBe(100); // 100% of the priced portfolio
+  });
+});
+
+describe("assessConcentrationRisk (v72)", () => {
+  // A 70/20/10 book: WETH dominant, USDC, then a small token.
+  const book = () => {
+    const snapshots = [
+      snap("alice", "base", [
+        { symbol: "WETH", token: WETH_BASE, amount: "1", decimals: 18, usd: 7000 },
+        { symbol: "USDC", token: USDC_BASE, amount: "2000", decimals: 6, usd: 2000 },
+        { symbol: "TKN", token: "0x000000000000000000000000000000000000000a" as Address, amount: "1", decimals: 18, usd: 1000 },
+      ]),
+    ];
+    return aggregateTokens(snapshots).tokens;
+  };
+
+  it("verdict 'warn' + names the breaching token when over the limit", () => {
+    const r = assessConcentrationRisk(book(), 50); // WETH is 70% > 50%
+    expect(r.verdict).toBe("warn");
+    expect(r.thresholdPct).toBe(50);
+    expect(r.breaches).toHaveLength(1);
+    expect(r.breaches[0].symbol).toBe("WETH");
+    expect(r.breaches[0].percentOfPortfolio).toBeCloseTo(70, 6);
+    expect(r.breaches[0].overByPct).toBeCloseTo(20, 6);
+    expect(r.summary).toMatch(/CONCENTRATED/);
+  });
+
+  it("verdict 'ok' when every token is under the limit", () => {
+    const r = assessConcentrationRisk(book(), 80); // WETH 70% < 80%
+    expect(r.verdict).toBe("ok");
+    expect(r.breaches).toHaveLength(0);
+    expect(r.largestSymbol).toBe("WETH");
+    expect(r.largestPct).toBeCloseTo(70, 6);
+  });
+
+  it("verdict 'unconfigured' (visible gap) when no threshold is set", () => {
+    const r = assessConcentrationRisk(book(), null);
+    expect(r.verdict).toBe("unconfigured");
+    expect(r.thresholdPct).toBeNull();
+    expect(r.largestPct).toBeCloseTo(70, 6); // still surfaces the largest holding
+    expect(r.summary).toMatch(/No concentration limit/);
+  });
+
+  it("flags MULTIPLE breaches, ordered by weight (descending)", () => {
+    const snapshots = [
+      snap("alice", "base", [
+        { symbol: "A", token: "0x000000000000000000000000000000000000000a" as Address, amount: "1", decimals: 18, usd: 6000 },
+        { symbol: "B", token: "0x000000000000000000000000000000000000000b" as Address, amount: "1", decimals: 18, usd: 4000 },
+      ]),
+    ];
+    const r = assessConcentrationRisk(aggregateTokens(snapshots).tokens, 30); // 60% + 40%, both > 30%
+    expect(r.verdict).toBe("warn");
+    expect(r.breaches.map((b) => b.symbol)).toEqual(["A", "B"]);
+  });
+
+  it("empty / unpriced book degrades to no breaches", () => {
+    expect(assessConcentrationRisk([], 50).verdict).toBe("ok");
+    expect(assessConcentrationRisk([], 50).largestPct).toBeNull();
   });
 });

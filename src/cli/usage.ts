@@ -74,6 +74,11 @@ CHAIN & CONFIG
         token): buys past the cap reject with POSITION_CAP_EXCEEDED; sells
         always pass (they reduce exposure and free room). Same weighted-avg
         model as all P&L surfaces; enforced in real AND paper paths.
+        v72 maxConcentration: safety.maxConcentrationPct = 50 — flag when any
+        single token exceeds 50% of total priced portfolio value. The CROSS-
+        strategy aggregate per-(strategy,token) caps miss; surfaced as a verdict
+        in 'portfolio' (concentrationRisk) + 'safety review'. Not a hard gate
+        (concentration needs valuation) — a risk flag where the operator looks.
   config history [--limit N] [--json]
         v36: every config save records a deduped snapshot (source-tagged:
         which command changed it). The file that controls live safety caps

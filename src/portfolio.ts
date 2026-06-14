@@ -110,6 +110,10 @@ export interface PortfolioReport {
   /** Top N concentration: cumulative % of portfolio in the top entries.
    *  Useful as a risk signal — "top 1 is 82% → highly concentrated". */
   concentration: { top1: number; top3: number; top5: number };
+  /** v72: concentration assessed against the configured single-token limit
+   *  (safety.maxConcentrationPct) — the guardrail verdict, not just the raw
+   *  metric. verdict 'unconfigured' when no limit is set. */
+  concentrationRisk: ConcentrationRisk;
   /** Iter807: worst-bucket severity. "warn" on any per-(account, chain)
    *  scan failures; "ok" otherwise. Symmetric with iter801/804/806 severity
    *  fields across multi-chain reports. */
@@ -291,6 +295,72 @@ export function computeConcentration(
   return { top1: cum(1), top3: cum(3), top5: cum(5) };
 }
 
+export interface ConcentrationRisk {
+  /** Configured single-token threshold (% of priced portfolio). Null when
+   *  unset — the operator hasn't opted into a concentration limit. */
+  thresholdPct: number | null;
+  /** ok = every token under the threshold; warn = ≥1 at/over it;
+   *  unconfigured = no threshold to judge against (a visible gap). */
+  verdict: "ok" | "warn" | "unconfigured";
+  /** Largest single priced position's % of portfolio. Null when nothing priced. */
+  largestPct: number | null;
+  largestSymbol: string | null;
+  /** Tokens at/over the threshold, descending by %. Empty unless verdict=warn. */
+  breaches: Array<{ symbol: string; percentOfPortfolio: number; overByPct: number }>;
+  summary: string;
+}
+
+/**
+ * v72: assess portfolio concentration against a configured single-token cap.
+ * This is the CROSS-STRATEGY aggregate that per-(strategy,token) position caps
+ * structurally miss — several strategies can each stay within their cap while
+ * the whole book drifts into one token. Pure; operates on the same priced
+ * TokenAggregate roll-up computeConcentration uses.
+ */
+export function assessConcentrationRisk(
+  tokens: TokenAggregate[],
+  thresholdPct: number | null | undefined,
+): ConcentrationRisk {
+  const priced = tokens
+    .filter((t): t is TokenAggregate & { percentOfPortfolio: number } =>
+      typeof t.percentOfPortfolio === "number",
+    )
+    .sort((a, b) => b.percentOfPortfolio - a.percentOfPortfolio);
+  const largest = priced[0] ?? null;
+  const largestPct = largest ? largest.percentOfPortfolio : null;
+  const largestSymbol = largest ? largest.symbol : null;
+
+  if (thresholdPct == null) {
+    return {
+      thresholdPct: null,
+      verdict: "unconfigured",
+      largestPct,
+      largestSymbol,
+      breaches: [],
+      summary:
+        largest != null
+          ? `No concentration limit set — top holding ${largestSymbol} is ${largestPct!.toFixed(1)}% of the book (set safety.maxConcentrationPct to get a guardrail).`
+          : `No concentration limit set; no priced holdings to assess.`,
+    };
+  }
+
+  const breaches = priced
+    .filter((t) => t.percentOfPortfolio >= thresholdPct)
+    .map((t) => ({
+      symbol: t.symbol,
+      percentOfPortfolio: t.percentOfPortfolio,
+      overByPct: t.percentOfPortfolio - thresholdPct,
+    }));
+  const verdict: "ok" | "warn" = breaches.length > 0 ? "warn" : "ok";
+  const summary =
+    verdict === "warn"
+      ? `CONCENTRATED: ${breaches.map((b) => `${b.symbol} ${b.percentOfPortfolio.toFixed(1)}%`).join(", ")} over the ${thresholdPct}% single-token limit.`
+      : largest != null
+        ? `OK — top holding ${largestSymbol} is ${largestPct!.toFixed(1)}% (under the ${thresholdPct}% limit).`
+        : `OK — no priced holdings.`;
+  return { thresholdPct, verdict, largestPct, largestSymbol, breaches, summary };
+}
+
 // ── orchestration ─────────────────────────────────────────
 
 /**
@@ -353,6 +423,7 @@ export async function aggregatePortfolio(args: {
 
   const { tokens, totalUsd, unpricedPositionCount } = aggregateTokens(snapshots);
   const concentration = computeConcentration(tokens);
+  const concentrationRisk = assessConcentrationRisk(tokens, args.config.safety.maxConcentrationPct);
 
   const chainsScanned: string[] = [];
   for (const snap of snapshots) {
@@ -374,8 +445,10 @@ export async function aggregatePortfolio(args: {
     unpricedPositionCount,
     tokens,
     concentration,
-    // Iter807: severity from per-(account, chain) failure count.
-    severity: errors.length > 0 ? "warn" : "ok",
+    concentrationRisk,
+    // Iter807: severity from per-(account, chain) failure count. v72: also
+    // warn when a configured concentration limit is breached.
+    severity: errors.length > 0 || concentrationRisk.verdict === "warn" ? "warn" : "ok",
     // Iter833: per-failed-(account, chain) dispatch list. Each entry points
     // agents at a scoped holdings inspection — diagnose which chain's RPC
     // is degraded.

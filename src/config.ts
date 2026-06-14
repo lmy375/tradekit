@@ -184,6 +184,14 @@ const safetySchema = z
     enabled: z.boolean().default(true),
     perTxUsdLimit: z.number().positive().optional(),
     dailyUsdLimit: z.number().positive().optional(),
+    /** v71/72: portfolio concentration flag. Warn when any single token
+     *  exceeds this % of the total priced portfolio value. This is the
+     *  CROSS-STRATEGY aggregate that per-(strategy,token) position caps miss —
+     *  several strategies can each stay within their cap while the book drifts
+     *  to 90% in one volatile token. Surfaced in `portfolio` + `safety review`
+     *  (not a hard pre-trade gate — concentration needs portfolio valuation).
+     *  e.g. 50 = flag when one token is >50% of the book. */
+    maxConcentrationPct: z.number().min(1).max(100).optional(),
     maxSlippageBps: z.number().int().min(1).max(5000).default(500),
     tokenWhitelist: z.record(z.string(), z.array(addressSchema)).optional(),
     tokenBlacklist: z.record(z.string(), z.array(addressSchema)).optional(),

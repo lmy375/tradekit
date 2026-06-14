@@ -41,6 +41,7 @@ function makeReport(
       percentOfPortfolio: totalUsd > 0 && t.totalUsd != null ? (t.totalUsd / totalUsd) * 100 : undefined,
     })),
     concentration: { top1: 0, top3: 0, top5: 0 },
+    concentrationRisk: { thresholdPct: null, verdict: "unconfigured", largestPct: null, largestSymbol: null, breaches: [], summary: "" },
     severity: "ok",
     recommendedActions: [],
   };

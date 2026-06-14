@@ -283,6 +283,13 @@ export async function portfolioCommand(flags: Record<string, string>) {
     console.log(`    Top 1:  ${report.concentration.top1.toFixed(1)}%`);
     console.log(`    Top 3:  ${report.concentration.top3.toFixed(1)}%`);
     console.log(`    Top 5:  ${report.concentration.top5.toFixed(1)}%`);
+    // v72: concentration guardrail verdict (vs safety.maxConcentrationPct).
+    const cr = report.concentrationRisk;
+    if (cr.verdict === "warn") {
+      console.log(`    ⚠ ${cr.summary}`);
+    } else if (cr.verdict === "ok") {
+      console.log(`    🟢 within the ${cr.thresholdPct}% single-token limit`);
+    }
     console.log("");
     console.log("  Top holdings:");
     console.log("    Symbol       USD          %        Last         Per-chain");

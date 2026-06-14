@@ -40,6 +40,7 @@ function makePortfolio(overrides: Partial<PortfolioReport> = {}): PortfolioRepor
       { symbol: "USDC", tokenKey: "0xusdc", perChain: [{ chain: "base", address: "0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" as Address, amount: "2000", usd: 2000 }], totalUsd: 2000, percentOfPortfolio: 20 },
     ],
     concentration: { top1: 80, top3: 100, top5: 100 },
+    concentrationRisk: { thresholdPct: null, verdict: "unconfigured", largestPct: 80, largestSymbol: "WETH", breaches: [], summary: "" },
     severity: "ok",
     recommendedActions: [],
     ...overrides,
