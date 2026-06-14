@@ -656,6 +656,31 @@ export async function playbookPromoteCommand(flags: Record<string, string>, posi
     }
   }
 
+  // v52 safety preflight: the funding preflight asks "can the wallet
+  // PAY for this?"; this asks "is the wallet GUARDED while it does?".
+  // Symmetric stance — advisory by default (prints the posture),
+  // --require-safe aborts on a CRITICAL guardrail gap (safety off / no
+  // USD ceiling), --skip-preflight disables both.
+  if (to === "real" && flags["skip-preflight"] !== "true") {
+    const { reviewSafety, safetyPromoteBlocker } = await import("../safetyReview.js");
+    const { loadConfig } = await import("../config.js");
+    const posture = reviewSafety(loadConfig());
+    if (flags["json"] !== "true") {
+      if (posture.verdict === "hardened") {
+        console.log(`  Safety posture: ✓ hardened — no critical or warn guardrail gaps.`);
+      } else {
+        console.log(`  Safety posture: ${posture.verdict === "exposed" ? "⛔ EXPOSED" : "⚠ MODERATE"} (run \`tradekit safety review\` for the full audit + fixes)`);
+        for (const g of posture.gaps.filter((x) => x.severity !== "info")) {
+          console.log(`    ${g.severity === "critical" ? "✗" : "⚠"} ${g.finding}`);
+        }
+      }
+    }
+    if (flags["require-safe"] === "true") {
+      const blocker = safetyPromoteBlocker(posture);
+      if (blocker) throw new ToolError("SAFEGUARD_TRIGGERED", `Promote aborted — ${blocker}`);
+    }
+  }
+
   const { promotePlaybook } = await import("../playbooks.js");
   const result = promotePlaybook({ playbookId: id, to });
 

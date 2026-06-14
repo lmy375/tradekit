@@ -12,7 +12,7 @@
 
 import { describe, it, expect } from "vitest";
 import { configSchema, type Config } from "./config.js";
-import { reviewSafety, renderSafetyReview, LOOSE_SLIPPAGE_BPS } from "./safetyReview.js";
+import { reviewSafety, renderSafetyReview, safetyPromoteBlocker, LOOSE_SLIPPAGE_BPS } from "./safetyReview.js";
 
 const NOW = new Date("2026-06-14T12:00:00Z");
 const base = configSchema.parse({});
@@ -130,6 +130,31 @@ describe("info-level omissions each produce one gap with a fix", () => {
       expect(x!.severity).toBe("info");
       expect(x!.fix.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("safetyPromoteBlocker — the v52 promote gate", () => {
+  it("blocks on a critical gap (no USD ceiling), naming the finding + fix", () => {
+    const blocker = safetyPromoteBlocker(review());
+    expect(blocker).not.toBeNull();
+    expect(blocker).toMatch(/not adequately guarded/);
+    expect(blocker).toMatch(/USD ceiling/);
+    expect(blocker).toMatch(/fix:/);
+  });
+
+  it("blocks when safety is disabled", () => {
+    expect(safetyPromoteBlocker(review({ enabled: false }))).toMatch(/bypassed/);
+  });
+
+  it("does NOT block on warn-only posture (loose slippage, infinite approvals)", () => {
+    const r = review({ perTxUsdLimit: 100, maxSlippageBps: LOOSE_SLIPPAGE_BPS, allowInfiniteApprovals: true, tokenBlacklist: { base: ["0x1"] } });
+    expect(r.verdict).toBe("moderate");
+    expect(safetyPromoteBlocker(r)).toBeNull();
+  });
+
+  it("does NOT block a hardened wallet", () => {
+    const r = review({ perTxUsdLimit: 100, tokenBlacklist: { base: ["0x1"] } });
+    expect(safetyPromoteBlocker(r)).toBeNull();
   });
 });
 

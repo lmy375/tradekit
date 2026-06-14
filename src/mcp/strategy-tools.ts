@@ -335,18 +335,19 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
   // ── playbook_promote ───────────────────────────────────────
   server.tool(
     "playbook_promote",
-    "Flip a deployed playbook between paper and real trading IN PLACE — the dry-run loop's graduation step. Every live primitive (active orders; active+paused schedules/rebalance plans) routes through the same edit machinery as order_edit/schedule_edit/rebalance_edit, so trailing HWM water marks, run counters, and drift telemetry ALL survive: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real. Symmetric: to='paper' demotes a live strategy back to the sandbox without losing state. Rows already in the target mode (or terminal) are reported in skipped[] with reasons; alreadyInTarget=true means nothing flipped. v36: promotes to real run an as-if-real funding PREFLIGHT (the runway machinery with paper primitives bucketed as real — spend tokens AND gas vs the actual wallet); the result's preflight.warnings list findings worst-first and requireFunded=true aborts with INSUFFICIENT_BALANCE when the wallet cannot fund even one fire. Preflight is advisory by default and best-effort (a dead RPC warns, never blocks; skipPreflight disables). Destructive direction (to real fires actual trades from the next engine tick) requires `yes: true`. Errors: INVALID_PARAMS (id not found, not deployed, no owned primitives, yes missing).",
+    "Flip a deployed playbook between paper and real trading IN PLACE — the dry-run loop's graduation step. Every live primitive (active orders; active+paused schedules/rebalance plans) routes through the same edit machinery as order_edit/schedule_edit/rebalance_edit, so trailing HWM water marks, run counters, and drift telemetry ALL survive: a trailing stop that tracked a $3,500 HWM in paper keeps protecting from $3,500 the moment it's real. Symmetric: to='paper' demotes a live strategy back to the sandbox without losing state. Rows already in the target mode (or terminal) are reported in skipped[] with reasons; alreadyInTarget=true means nothing flipped. v36: promotes to real run an as-if-real funding PREFLIGHT (the runway machinery with paper primitives bucketed as real — spend tokens AND gas vs the actual wallet); the result's preflight.warnings list findings worst-first and requireFunded=true aborts with INSUFFICIENT_BALANCE when the wallet cannot fund even one fire. Preflight is advisory by default and best-effort (a dead RPC warns, never blocks; skipPreflight disables). v52: promotes to real ALSO attach a `safety` posture (the safety_review audit) — funding asks 'can the wallet PAY?', safety asks 'is it GUARDED?'; requireSafe=true aborts with SAFEGUARD_TRIGGERED on a CRITICAL guardrail gap (safety disabled, or no per-tx AND no daily USD ceiling — unbounded real trading). Destructive direction (to real fires actual trades from the next engine tick) requires `yes: true`. Errors: INVALID_PARAMS (id not found, not deployed, no owned primitives, yes missing).",
     {
       id: z.number().int().positive().describe("Deployed playbook id."),
       to: z.enum(["real", "paper"]).default("real").describe("Target mode. Default real (graduate the dry-run)."),
       yes: z.literal(true).describe("Confirmation — promotion to real fires actual trades from the next tick; must be `true`."),
       requireFunded: z.boolean().optional().describe("v36: abort (INSUFFICIENT_BALANCE) when the preflight finds the REAL wallet cannot fund even one fire (spend token or gas). Strongly recommended for agent-driven promotes."),
-      skipPreflight: z.boolean().optional().describe("Skip the as-if-real funding preflight entirely (RPC-less environments). The result then has preflight: null."),
+      requireSafe: z.boolean().optional().describe("v52: abort (SAFEGUARD_TRIGGERED) when the wallet's safety posture has a CRITICAL guardrail gap (safety disabled, or no per-tx AND no daily USD ceiling) — i.e. firing real trades would be unbounded. Strongly recommended for agent-driven promotes; the result always includes the `safety` posture regardless."),
+      skipPreflight: z.boolean().optional().describe("Skip BOTH the funding preflight AND the safety-posture preflight entirely (RPC-less environments). The result then has preflight: null and safety: null."),
     },
-    async ({ id, to, yes, requireFunded, skipPreflight }) => {
+    async ({ id, to, yes, requireFunded, requireSafe, skipPreflight }) => {
       try {
         return ok(
-          await runTool("playbook_promote", rt.opts, { id, to, yes, requireFunded, skipPreflight }, undefined, async () => {
+          await runTool("playbook_promote", rt.opts, { id, to, yes, requireFunded, requireSafe, skipPreflight }, undefined, async () => {
             if (yes !== true) {
               throw new ToolError("INVALID_PARAMS", `Confirmation flag required: pass yes=true.`);
             }
@@ -365,8 +366,20 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
                 if (blocker) throw new ToolError("INSUFFICIENT_BALANCE", blocker);
               }
             }
+            // v52 safety preflight: funding asks "can it PAY?"; this asks
+            // "is it GUARDED?". Always attached for the agent to inspect;
+            // requireSafe gates on a CRITICAL guardrail gap.
+            let safety: import("../safetyReview.js").SafetyPostureReport | null = null;
+            if (to === "real" && skipPreflight !== true) {
+              const { reviewSafety, safetyPromoteBlocker } = await import("../safetyReview.js");
+              safety = reviewSafety(rt.getConfig());
+              if (requireSafe === true) {
+                const blocker = safetyPromoteBlocker(safety);
+                if (blocker) throw new ToolError("SAFEGUARD_TRIGGERED", `Promote aborted — ${blocker}`);
+              }
+            }
             const result = promotePlaybook({ playbookId: id, to });
-            return { ok: true, ...result, preflight };
+            return { ok: true, ...result, preflight, safety };
           }),
         );
       } catch (e) {

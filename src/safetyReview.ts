@@ -367,6 +367,26 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
   };
 }
 
+/**
+ * v52: the promote-time gate. Returns a blocker message when the
+ * posture has at least one CRITICAL gap (safety disabled, or no USD
+ * ceiling at all) — the absences that make firing real trades reckless.
+ * Returns null when the wallet is adequately guarded (no critical gap).
+ *
+ * Mirrors playbooks.preflightBlocker: advisory callers ignore it; a
+ * `--require-safe` / requireSafe caller throws SAFEGUARD_TRIGGERED on a
+ * non-null return. WARN/INFO gaps never block — they are surfaced for
+ * the operator to weigh, not enforced.
+ */
+export function safetyPromoteBlocker(report: SafetyPostureReport): string | null {
+  const critical = report.gaps.filter((g) => g.severity === "critical");
+  if (critical.length === 0) return null;
+  return (
+    `wallet not adequately guarded for real trading:\n` +
+    critical.map((g) => `  ✗ ${g.finding}\n    fix: ${g.fix}`).join("\n")
+  );
+}
+
 // ── rendering ────────────────────────────────────────────────
 
 export function renderSafetyReview(r: SafetyPostureReport): string {

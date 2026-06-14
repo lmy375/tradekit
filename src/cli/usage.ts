@@ -732,7 +732,7 @@ PLAYBOOKS (declarative strategy bundles)
         Read-only preview of what 'playbook replace' would change. Classifies each primitive
         as unchanged / modified / added / removed; lists field-level changes for modified
         plus the apply mode (edit-in-place vs cancel+recreate). Useful in CI for spec PRs.
-  playbook promote <id> [--to real|paper] [--yes] [--require-funded] [--skip-preflight] [--json]
+  playbook promote <id> [--to real|paper] [--yes] [--require-funded] [--require-safe] [--skip-preflight] [--json]
         v36 preflight: promotes to REAL first ask the funding runway "could the
         real wallet fund this?" — paper primitives bucketed as-if-real, spend
         tokens AND gas vs the actual on-chain balances. Findings print worst-
@@ -740,6 +740,13 @@ PLAYBOOKS (declarative strategy bundles)
         Advisory by default; --require-funded aborts on a cannot-fund-one-fire
         finding (a dead RPC warns, never blocks); --skip-preflight for
         RPC-less environments.
+        v52 safety preflight: funding asks "can it PAY?"; this asks "is it
+        GUARDED?". Prints the wallet's safety posture (hardened/moderate/
+        exposed) + any critical/warn guardrail gaps before flipping to real.
+        Advisory by default; --require-safe aborts (SAFEGUARD_TRIGGERED) on a
+        CRITICAL gap — safety disabled, or no per-tx AND no daily USD ceiling
+        (firing real trades would be unbounded). --skip-preflight disables
+        both preflights. See 'tradekit safety review' for the full audit.
         Flip every live primitive between paper and real IN PLACE — trailing HWM,
         run counters, drift telemetry all survive (vs destroy+redeploy, which
         resets them). The dry-run loop's graduation step; --to paper demotes a

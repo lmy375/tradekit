@@ -33,6 +33,19 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 52 — 晋升安全预检（promote safety preflight — "before this fires real trades, is the wallet GUARDED?"）** ✅
+- 让 v51 的安全态势在**真正动钱的那一刻**起作用，而不是一个运营商得记得去跑的工具：`promote --to real` 是钱真正上场的时刻，它已有一套 v36 **funding preflight**（advisory 默认、`--require-funded` 强制、`--skip-preflight` 绕过），但只问"钱包**付得起**吗？"——完全不问"钱包在交易时**有没有被护栏看住**？"。一个策略可以拿到 funding ✓ 同时 agent 的钱包根本没有 USD 上限、infinite approvals 还开着
+- 对称补全：在 funding preflight 旁边加一个 **safety preflight**——同样的形态（advisory 默认、打印态势、`--require-safe` 在 CRITICAL 护栏缺口上中止、`--skip-preflight` 同时关掉两个预检）
+- 新 helper `safetyReview.safetyPromoteBlocker(report)`（镜像 `playbooks.preflightBlocker`）：当态势含至少一个 **CRITICAL** 缺口（safety 整个关掉，或 perTx **且** daily USD 上限都没有 → 真实交易无上限）返回 blocker 文案（点名 finding + fix）；否则返回 null。**WARN/INFO 永不阻断**——它们被打印给运营商权衡，不强制
+- 集成点（funding 问"能付吗"，safety 问"被看住吗"，两者并排）：
+  - CLI `playbook promote`：funding preflight 之后跑 `reviewSafety(loadConfig())`，打印 `Safety posture: ✓ hardened` 或 `⛔ EXPOSED / ⚠ MODERATE` + critical/warn 缺口；`--require-safe` 在 blocker 上抛 `SAFEGUARD_TRIGGERED`
+  - MCP `playbook_promote`：新增 `requireSafe` 参数；结果**始终**附带 `safety` 态势（agent 可检视），`requireSafe=true` 在 CRITICAL 缺口上抛 `SAFEGUARD_TRIGGERED`。`skipPreflight` 现在同时关掉 funding + safety 两个预检
+- 错误码复用 `SAFEGUARD_TRIGGERED`（既有安全栈语义——"一个 safeguard 阻止了这次 promote"），与 funding 的 `INSUFFICIENT_BALANCE` 对称
+- 现在 go-live 的三个问题都在 promote 这一步被回答：strategy 质量（v49 promote-check）+ 钱包付得起（v36 funding）+ 钱包被看住（v52 safety）
+- 测试覆盖：`safetyReview.test.ts` +4 case（`safetyPromoteBlocker`：critical 无 USD 上限阻断含 fix / safety 关掉阻断 / warn-only 不阻断 / hardened 不阻断）；`strategy-tools.test.ts` +1 case（`playbook_promote` schema 暴露 `requireSafe` + 描述提及 SAFEGUARD/safety）。全 handler 路径**故意不驱动**（它会跑 funding preflight 触发 RPC，与 MCP 测试避网原则冲突）——gate 行为由纯 `safetyPromoteBlocker` 全覆盖
+- 向后兼容：纯加法——无 schema migration、无现有行为改动（两个预检都 advisory 默认，不传 `--require-safe`/`requireSafe` 行为与升级前完全一致）；`--skip-preflight` 语义从"跳过 funding"扩展为"跳过两个预检"（既有用户拿到更多而非更少）
+- v1 限制：安全态势是**全局/账户级** config，不是 per-playbook——promote 的是某个策略，但约束它的护栏是全局钱包配置，所以这里展示的是"你即将让这个策略动真钱，你的钱包整体被看住了吗"（语义正确但不区分策略）；blocker 只在 CRITICAL 触发，WARN（loose slippage / infinite approvals / 无 token 安全）靠运营商看打印的态势自行判断；CLI 交互流的 require-safe 阻断未做端到端测试（同 funding preflight 一样，纯逻辑层覆盖）
+
 **Phase 51 — 安全态势审计（safety posture review — "what protects me, and what's wide open?"）** ✅
 - 关闭整个安全栈的**易读性**缺口：经过 ~50 个迭代，safety 栈累积到 **19 层独立护栏**（per-tx/daily USD 上限、slippage 上限、token 白/黑名单、honeypot 自动探测、infinite-approval 阻断、approval USD 上限、gas 预算、交易限频、portfolio 权重限制、净敞口上限、per-strategy 预算、drawdown 熔断、human approval gate）。每层都单独文档化，但运营商把 AI agent 托付真钱前的**第一个问题**——"此刻究竟有什么在保护我，哪些危险口子是敞开的？"——**没有单一答案**。回答它意味着读十几个嵌套 config key，**并且**得知道哪些缺失是无害的（gas 预算关着）vs 灾难性的（根本没有 USD 上限）。这个判断以前只活在维护者脑子里
 - 新模块 `safetyReview.ts`（~360 行）：纯函数 `reviewSafety(config)`，两半结构

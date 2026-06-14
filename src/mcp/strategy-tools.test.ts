@@ -129,6 +129,18 @@ describe("registerStrategyTools — tool registration", () => {
     expect(names.length).toBe(17);
   });
 
+  // v52: the promote safety-gate param is wired (behavior is covered by
+  // the pure safetyPromoteBlocker tests in safetyReview.test.ts; the
+  // full handler runs a funding preflight that would hit RPC, so it is
+  // intentionally not driven here).
+  it("playbook_promote exposes the requireSafe gate param", () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const promote = registered.get("playbook_promote")!;
+    expect(Object.keys(promote.schema)).toContain("requireSafe");
+    expect(promote.description).toMatch(/SAFEGUARD_TRIGGERED|safety/);
+  });
+
   it("every tool has a non-empty description", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
