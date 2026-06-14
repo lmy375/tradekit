@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 115 — edge 进 promote 就绪检查：晋升真钱前先看"边际优势稳不稳"，而非只看"总账没亏"（profit-factor edge in promote-check — readiness now assesses robustness of edge, not just positive total P&L）** ✅
+- **把 v114 的 edge 信号接进信任管道的前向闸**：promote-check（v49，纸面→真钱就绪度）检查运行天数/成交数/回撤/friction + "总 P&L > 0"。但**总 P&L 可能靠运气**（一笔大赢主导）——一个 profit factor 勉强 > 1、靠一两笔幸运交易的策略，能通过 promote-check（总账正、成交够）被晋升上真钱。就绪检查不看"边际优势稳不稳"
+- 为什么是 v114 的关键延伸：promote 是产品最重要的闸（真钱起点）。"总账没亏"远弱于"有稳健 edge"。profit factor < 1.2（足够多平仓时）立刻暴露"看着不亏、实则脆弱"的策略——正是晋升前最该知道的。且复用 v114 的 edge 计算（gatherStrategyComparison paper 模式，单一源、零 RPC、确定性）
+- 实现（复用 v114 + v49 caution 模型）：PromoteCheckReport 加 `edge`（closes/winRate/profitFactor/payoffRatio/expectancy，纸面已平仓 round-trip）。verdict 加 caution：profitFactor < 1.2 且 closes ≥ 5（样本足够）→ "weak edge" caution（advisory，同其他质量旗标——不是硬 floor，运营商可有 thesis 仍晋升；--require-ready 仍只 gate 运行/成交硬 floor）。render 加 edge 行；MCP playbook_promote_check 描述同步
+- 测试覆盖：+4——弱 PF（1.125<1.2）足够平仓→caution + edge 填充 / 全赢无亏→PF null 不误报 / 弱 PF 但平仓太少→不 caution（样本不足）/ 仅买入未平仓→edge null；3596 测试全绿（+4，既有"clean→ready"测试不受影响：仅买入→edge null）
+- 向后兼容：纯加法——edge 字段 + 一条 caution；仅买入/无平仓的既有测试 edge=null 不触发；复用 v114 计算不改排名；caution 不阻断（硬 floor 仍是运行/成交）
+
 **Phase 114 — 策略"有没有 edge"的量化：profit factor / payoff / 期望值（trading-edge metrics — profit factor, payoff ratio, avg win/loss, expectancy answer "does this strategy actually have an edge?"）** ✅
 - **补上"胜率高 ≠ 赚钱"的盲区**：strategyCompare 报已实现 P&L + 胜率，但**胜率单独看会骗人**——一个 70% 胜率、却"小赢大亏"的策略整体是亏的。框架缺的是判断 edge 的标准交易指标：**profit factor**（毛盈/毛亏，>1 才有利可图、量级=安全垫）、**payoff ratio**（avg win / avg loss 的盈亏比）、avg win/avg loss、expectancy（每笔期望 $）。这些才回答"这策略到底有没有 edge、该不该加仓"
 - 为什么是有效性支柱最重要的一块：交易产品的核心是帮 agent/运营商判断策略是否真有边际优势。胜率 + 总 P&L 不够——一段时间的总 P&L 可能被一两笔运气主导。profit factor < 1 立刻暴露"胜率好看但在流血"的策略，是资金分配（v83 的初衷）真正需要的信号。且全部可从既有已平仓数据算出，无需新记录

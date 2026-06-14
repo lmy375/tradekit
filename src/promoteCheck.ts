@@ -40,6 +40,12 @@ export const MIN_FILLS = 5;
 /** Caution thresholds. */
 export const MAX_DRAWDOWN_CAUTION_PCT = 30;
 export const FRICTION_SHARE_CAUTION_PCT = 50;
+/** v115: a profit factor below this (with enough closes to be meaningful) is a
+ *  weak/fragile edge — the paper P&L isn't robustly positive. */
+export const WEAK_PROFIT_FACTOR_CAUTION = 1.2;
+/** Minimum closed round-trips before the profit-factor edge signal is trusted
+ *  (too few closes → one trade dominates the ratio). */
+export const MIN_CLOSES_FOR_EDGE = 5;
 
 export type PromoteVerdict = "ready" | "caution" | "not_ready";
 
@@ -63,6 +69,18 @@ export interface PromoteCheckReport {
     totalQuote: number;
     /** Paper PnL scaled to a 30-day month at the observed runtime. */
     monthlyPnlUsd: number;
+  } | null;
+  /** v115: trading EDGE on the paper run's CLOSED round-trips (v114 metrics).
+   *  total P&L can be positive on luck (one big winner); profit factor + payoff
+   *  + expectancy say whether the edge is ROBUST enough to risk real money.
+   *  Null when nothing has closed. */
+  edge: {
+    closes: number;
+    winRatePct: number | null;
+    profitFactor: number | null;
+    payoffRatio: number | null;
+    /** avg realized $ per closed round-trip (per-trade expectancy). */
+    expectancyUsd: number | null;
   } | null;
   risk: {
     scope: string;
@@ -145,6 +163,25 @@ export async function gatherPromoteCheck(args: {
     }
   }
 
+  // ── v115: edge on the closed round-trips (v114 metrics, paper scope) ──
+  // Reuses gatherStrategyComparison (single source — same reducer) so the
+  // readiness edge can't disagree with `strategies compare`. Deterministic, no RPC.
+  let edge: PromoteCheckReport["edge"] = null;
+  if (fills.length > 0) {
+    const { gatherStrategyComparison } = await import("./strategyCompare.js");
+    const cmp = gatherStrategyComparison({ mode: "paper", account: account ?? undefined, strategy: tag });
+    const s = cmp.strategies.find((x) => x.strategy === tag);
+    if (s && s.closes > 0) {
+      edge = {
+        closes: s.closes,
+        winRatePct: s.winRatePct,
+        profitFactor: s.profitFactor,
+        payoffRatio: s.payoffRatio,
+        expectancyUsd: s.avgRealizedPerClose,
+      };
+    }
+  }
+
   // ── risk from the v48 paper equity scope (book-level) ──
   let risk: PromoteCheckReport["risk"] = null;
   {
@@ -215,6 +252,21 @@ export async function gatherPromoteCheck(args: {
   if (paperAssumedMedianBps != null && slip != null && paperAssumedMedianBps < slip.avgAbsSlippageBps) {
     flag("caution", `paper assumed ${paperAssumedMedianBps.toFixed(1)}bps slippage but your real fills on ${chain} average ${slip.avgAbsSlippageBps.toFixed(1)}bps — the paper run was optimistic`);
   }
+  // v115: weak EDGE — total P&L can be positive on luck (one big winner); a low
+  // profit factor (with enough closes to be meaningful) means the edge is
+  // fragile. Catches what the "PnL > 0" check above misses.
+  if (
+    edge != null &&
+    edge.closes >= MIN_CLOSES_FOR_EDGE &&
+    edge.profitFactor != null &&
+    edge.profitFactor < WEAK_PROFIT_FACTOR_CAUTION
+  ) {
+    flag(
+      "caution",
+      `weak edge: profit factor ${edge.profitFactor.toFixed(2)} < ${WEAK_PROFIT_FACTOR_CAUTION} over ${edge.closes} closes` +
+        `${edge.payoffRatio != null ? ` (payoff ${edge.payoffRatio.toFixed(2)}×)` : ""} — the paper P&L isn't robustly positive; promoting risks paying real friction for a thin/lucky margin`,
+    );
+  }
 
   return {
     playbookId: args.playbookId,
@@ -225,6 +277,7 @@ export async function gatherPromoteCheck(args: {
     generatedAt: now.toISOString(),
     runtime: { deployedAt: row.deployed_at, days, fills: fills.length, lastFillAt, fillsPerWeek },
     performance,
+    edge,
     risk,
     frictionReality: {
       paperAssumedMedianBps,
@@ -275,6 +328,10 @@ export function renderPromoteCheck(r: PromoteCheckReport): string {
   lines.push(`  Paper runtime:  ${r.runtime.days.toFixed(1)}d since ${r.runtime.deployedAt.slice(0, 10)} · ${r.runtime.fills} fills (${r.runtime.fillsPerWeek.toFixed(1)}/week)${r.runtime.lastFillAt ? ` · last ${r.runtime.lastFillAt.slice(0, 10)}` : ""}`);
   if (r.performance) {
     lines.push(`  Paper PnL:      realized ${r.performance.realizedQuote.toFixed(2)} + MTM ${r.performance.unrealizedQuote.toFixed(2)} = ${r.performance.totalQuote.toFixed(2)} quote (~$${r.performance.monthlyPnlUsd.toFixed(2)}/month at this cadence)`);
+  }
+  if (r.edge) {
+    const pf = r.edge.profitFactor != null ? r.edge.profitFactor.toFixed(2) : (r.edge.closes > 0 ? "∞ (no losses)" : "—");
+    lines.push(`  Paper edge:     profit factor ${pf} · payoff ${r.edge.payoffRatio != null ? `${r.edge.payoffRatio.toFixed(2)}×` : "—"} · expectancy ${r.edge.expectancyUsd != null ? `${r.edge.expectancyUsd >= 0 ? "+" : "−"}$${Math.abs(r.edge.expectancyUsd).toFixed(2)}/trade` : "—"} over ${r.edge.closes} closes`);
   }
   if (r.risk) {
     lines.push(`  Paper risk:     max DD −${r.risk.maxDrawdownPct.toFixed(1)}% (−$${r.risk.maxDrawdownUsd.toFixed(2)}) · vol ${r.risk.volatilityPctAnnual != null ? `${r.risk.volatilityPctAnnual.toFixed(1)}%/yr` : "—"} · sharpe ${r.risk.sharpe != null ? r.risk.sharpe.toFixed(2) : "—"}`);

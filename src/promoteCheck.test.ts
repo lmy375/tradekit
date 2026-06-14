@@ -24,7 +24,7 @@ vi.mock("./paperPnl.js", async (importOriginal) => {
   };
 });
 
-const { gatherPromoteCheck, renderPromoteCheck, promoteReadinessBlocker, MIN_RUNTIME_DAYS, MIN_FILLS } =
+const { gatherPromoteCheck, renderPromoteCheck, promoteReadinessBlocker, MIN_RUNTIME_DAYS, MIN_FILLS, WEAK_PROFIT_FACTOR_CAUTION } =
   await import("./promoteCheck.js");
 const { openDb, closeDb, insertPlaybook, updatePlaybookStatus, recordPaperTrade, insertTrade, insertPortfolioSnapshot } =
   await import("./db.js");
@@ -90,6 +90,24 @@ function seedRealSlippage(bps: number, count = 10): void {
       gas_used: null, gas_price_wei: null, gas_cost_native: "0.001",
       aggregator: "kyberswap", fee_tier: null, notes: null,
       strategy: null, realized_slippage_bps: bps,
+    });
+  }
+}
+
+// v115: a matched 0.05-base round-trip (buy then sell) → one CLOSE realizing
+// (sellQuote − buyQuote). Monotonic timestamps keep each pair self-contained so
+// the walker realizes exactly that pair's P&L (position returns to 0 each time).
+let rtMs = 0;
+function seedRoundTrip(id: number, buyQuote: number, sellQuote: number): void {
+  const buyTs = new Date(NOW.getTime() - 9 * 86_400_000 + rtMs).toISOString(); rtMs += 1000;
+  const sellTs = new Date(NOW.getTime() - 9 * 86_400_000 + rtMs).toISOString(); rtMs += 1000;
+  for (const [dir, q, ts] of [["buy", buyQuote, buyTs], ["sell", sellQuote, sellTs]] as const) {
+    recordPaperTrade({
+      timestamp: ts, source_type: "schedule", source_id: 1,
+      chain: "base", account: "default", direction: dir,
+      base_token: WETH, base_symbol: "WETH", base_amount: "0.05",
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: String(q),
+      price: String(q / 0.05), slippage_bps: 30, strategy: `playbook:${id}`, notes: null,
     });
   }
 }
@@ -248,5 +266,53 @@ describe("promoteReadinessBlocker (the --require-ready gate)", () => {
     const r = await check(id);
     expect(r.verdict).toBe("caution");
     expect(promoteReadinessBlocker(r)).toBeNull();
+  });
+});
+
+// v115: the EDGE assessment — total P&L can be positive on luck; profit factor
+// catches a thin/fragile edge the "PnL > 0" check misses.
+describe("edge / profit-factor caution (v115)", () => {
+  it("weak profit factor over enough closes → caution, edge populated", async () => {
+    const id = mkPlaybook(14);
+    seedPaperSnapshots([1000, 1010, 1020]);
+    // 3 wins (+15 each) + 2 losses (−20 each): grossWin 45, grossLoss 40 →
+    // PF 1.125 < 1.2; total +5 (positive, so not the PnL-≤0 caution). 5 closes.
+    seedRoundTrip(id, 100, 115); seedRoundTrip(id, 100, 115); seedRoundTrip(id, 100, 115);
+    seedRoundTrip(id, 100, 80); seedRoundTrip(id, 100, 80);
+    const r = await check(id);
+    expect(r.edge).not.toBeNull();
+    expect(r.edge!.closes).toBe(5);
+    expect(r.edge!.profitFactor!).toBeCloseTo(45 / 40, 4);
+    expect(r.edge!.profitFactor! < WEAK_PROFIT_FACTOR_CAUTION).toBe(true);
+    expect(r.verdict).toBe("caution");
+    expect(r.reasons.some((x) => /weak edge: profit factor/.test(x))).toBe(true);
+  });
+
+  it("strong edge (no losses) → no weak-edge caution, profitFactor null", async () => {
+    const id = mkPlaybook(14);
+    seedPaperSnapshots([1000, 1020, 1040]);
+    for (let i = 0; i < 5; i++) seedRoundTrip(id, 100, 130); // all winners
+    const r = await check(id);
+    expect(r.edge!.closes).toBe(5);
+    expect(r.edge!.profitFactor).toBeNull(); // no losses → undefined ratio
+    expect(r.reasons.some((x) => /weak edge/.test(x))).toBe(false);
+  });
+
+  it("weak profit factor but too FEW closes → no caution (sample too small)", async () => {
+    const id = mkPlaybook(14);
+    seedPaperSnapshots([1000, 1010, 1020]);
+    // 1 win + 1 loss = 2 closes < MIN_CLOSES_FOR_EDGE — PF weak but untrusted.
+    seedRoundTrip(id, 100, 110); seedRoundTrip(id, 100, 60);
+    const r = await check(id);
+    expect(r.edge!.closes).toBe(2);
+    expect(r.reasons.some((x) => /weak edge/.test(x))).toBe(false);
+  });
+
+  it("edge is null when nothing has closed (buys only)", async () => {
+    const id = mkPlaybook(14);
+    seedFills(id, 6);
+    seedPaperSnapshots([1000, 1010, 1020]);
+    const r = await check(id);
+    expect(r.edge).toBeNull();
   });
 });
