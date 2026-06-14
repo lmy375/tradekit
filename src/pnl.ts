@@ -1,6 +1,7 @@
 import type { TradeRow } from "./db.js";
 import { allTrades } from "./db.js";
 import { applyBuy, applySell } from "./costBasis.js";
+import { isStablecoin } from "./stablecoins.js";
 import { getCurrentPrice } from "./price.js";
 import { getBuiltinProfile } from "./chains.js";
 import type { Logger } from "./logger.js";
@@ -346,10 +347,6 @@ export function isInWindow(timestamp: string, window: PnLWindow): boolean {
   return true;
 }
 
-function isStablecoin(symbol: string | null | undefined): boolean {
-  if (!symbol) return false;
-  return /^(USDC|USDT|DAI|BUSD|FRAX|USDP|TUSD|USDC\.e)$/i.test(symbol);
-}
 
 /**
  * Iter639: canonical pair key for PnL bucketing. Same semantics as

@@ -50,13 +50,9 @@ import type { Logger } from "./logger.js";
 import { resolveProfile } from "./config.js";
 import { summarizePaperPnl, type PaperPnlSummary } from "./paperTrade.js";
 import { FLAT_EPSILON, applyBuy, applySell } from "./costBasis.js";
+import { isStablecoin } from "./stablecoins.js";
 
 /** Same conservative allow-list as pnl.ts / pairStats.ts / aggregatorStats.ts. */
-function isStablecoin(symbol: string | null | undefined): boolean {
-  if (!symbol) return false;
-  const s = symbol.toUpperCase();
-  return s === "USDC" || s === "USDT" || s === "DAI" || s === "USDBC" || s === "USDC.E" || s === "FRAX" || s === "LUSD" || s === "GUSD" || s === "USDS";
-}
 
 /** Price oracle callback: USD-per-unit for (chain, token address), or null
  *  when unpriceable. Injected so the cost-basis math stays deterministic

@@ -23,6 +23,7 @@
 // the round-trip view is the most useful first cut.
 
 import type { TradeRow } from "./db.js";
+import { isStablecoin } from "./stablecoins.js";
 import { failureReasonHistogram } from "./db.js";
 import type { AnalyzedTrade } from "./tradeAnalysis.js";
 import { percentile } from "./aggregatorStats.js";
@@ -107,11 +108,6 @@ export interface PairStatsReport {
   recommendedActions: import("./errors.js").NextAction[];
 }
 
-/** Same stablecoin recognizer aggregatorStats.ts uses. */
-function isStablecoin(symbol: string | null | undefined): boolean {
-  if (!symbol) return false;
-  return /^(USDC|USDT|DAI|BUSD|FRAX|USDP|TUSD|USDC\.e)$/i.test(symbol);
-}
 
 /**
  * Iter634: canonicalize a trade row to a pair key. We use the SYMBOL pair

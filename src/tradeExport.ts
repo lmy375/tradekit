@@ -25,6 +25,7 @@
 
 import type { TradeRow } from "./db.js";
 import { applyBuy, applySell } from "./costBasis.js";
+import { isStablecoin } from "./stablecoins.js";
 
 export interface EnrichedTradeRow extends TradeRow {
   /**
@@ -52,11 +53,6 @@ export interface EnrichedTradeRow extends TradeRow {
   gas_usd: number | null;
 }
 
-/** Same isStablecoin shape pnl.ts uses — local copy avoids cross-import. */
-function isStablecoin(symbol: string | null | undefined): boolean {
-  if (!symbol) return false;
-  return /^(USDC|USDT|DAI|BUSD|FRAX|USDP|TUSD|USDC\.e)$/i.test(symbol);
-}
 
 /**
  * Iter616: per-row enrichment. Walks chronologically, maintains per-token

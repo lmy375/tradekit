@@ -11,15 +11,9 @@ import { ToolError } from "./errors.js";
 import { ROUTER_BY_ADDRESS } from "./routers.js";
 import type { ChainProfile } from "./chains.js";
 import { sanitizeForLogLine, type Logger } from "./logger.js";
-
-/** Stablecoin symbols we treat as the "quote" side when classifying a swap. */
-const STABLE_SYMBOLS = new Set([
-  "USDC", "USDC.E", "USDT", "DAI", "BUSD", "FRAX", "TUSD", "USDP", "USDBC",
-]);
-
-function isStable(symbol: string | undefined): boolean {
-  return symbol ? STABLE_SYMBOLS.has(symbol.toUpperCase()) : false;
-}
+// v85: the "which side is the stablecoin quote" check shares the one canonical
+// registry — so import classification can't disagree with the P&L surfaces.
+import { isStablecoin as isStable } from "./stablecoins.js";
 
 export interface ImportResult {
   /** "inserted" if a new row was added, "duplicate" if already in trades by tx_hash. */

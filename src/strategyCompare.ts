@@ -21,12 +21,7 @@
 import { applyBuy, applySell, type CostBasisState } from "./costBasis.js";
 import { recentTrades, listPaperTrades } from "./db.js";
 import { ToolError } from "./errors.js";
-
-/** Same stablecoin set the rest of the codebase uses — a quote priced at $1. */
-const STABLES = new Set(["USDC", "USDT", "DAI", "USDC.E", "USDBC", "FRAX", "LUSD", "TUSD", "USDP", "GUSD"]);
-function isStablecoin(symbol: string | null | undefined): boolean {
-  return symbol != null && STABLES.has(symbol.toUpperCase());
-}
+import { isStablecoin } from "./stablecoins.js";
 
 export interface StrategyTradeLite {
   strategy: string | null;

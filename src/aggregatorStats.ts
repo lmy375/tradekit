@@ -19,6 +19,7 @@
 // "bad day" exposure. Operators care about both.
 
 import type { TradeRow } from "./db.js";
+import { isStablecoin } from "./stablecoins.js";
 import { failureReasonHistogram } from "./db.js";
 import type { AnalyzedTrade } from "./tradeAnalysis.js";
 import { resolveAggregatorOrder, type ProviderName } from "./aggregator.js";
@@ -146,11 +147,6 @@ export function percentile(sortedAsc: readonly number[], pct: number): number | 
   return sortedAsc[lo] * (1 - frac) + sortedAsc[hi] * frac;
 }
 
-/** Same stablecoin recognizer as pnl.ts — local copy to avoid cross-import. */
-function isStablecoin(symbol: string | null | undefined): boolean {
-  if (!symbol) return false;
-  return /^(USDC|USDT|DAI|BUSD|FRAX|USDP|TUSD|USDC\.e)$/i.test(symbol);
-}
 
 /**
  * Iter623: estimate USD volume contributed by a single trade row. Same

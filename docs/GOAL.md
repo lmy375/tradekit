@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 85 — 稳定币注册表合一（one stablecoin registry — the surfaces can no longer disagree on what a dollar is）** ✅
+- **修复一个 LIVE 的跨面不一致，硬化最重要的数字（而非加 feature）**：稳定币计价的 quote 按 $1 估值，是所有 P&L/税务/分类面确定性定价的基石。但**七个文件各有一份 `isStablecoin`，且集合彼此不同**——pnl/tradeExport/aggregatorStats/pairStats/importTrade 认 BUSD/USDP/TUSD，paperPnl 认 USDBC/LUSD/GUSD/USDS。后果：**同一笔 LUSD 计价交易在 paper 账本按 $1 计、在真实 PnL 和税务导出里却被当非稳定币跳过**；BUSD 计价的反之。和成本基准漂移（v71/v82）同类的跨面不一致——但这个是**当前就存在的活 bug**，不是潜在风险
+- 为什么是最重要的：安全做满后，"可信、一致的数字"是产品根基。同一笔交易在不同面给出不同 PnL/税务结果，是最坏的信任 bug（每个面单独看自洽，跨面对不上）。这是 v71/v82 成本基准合一的同类收尾——这次是 quote 定价
+- 实现（提取为唯一定义 + 取并集）：新 `stablecoins.ts` 是唯一的 `isStablecoin` + `STABLECOIN_SYMBOLS`——**七份旧集合的并集**（全是货真价实的 USD 稳定币：USDC/USDC.E/USDT/DAI/BUSD/FRAX/USDP/TUSD/USDBC/LUSD/GUSD/USDS），所以没有任何面丢失覆盖。七个文件（pnl/paperPnl/tradeExport/aggregatorStats/pairStats/strategyCompare/importTrade）全部删本地拷贝、改 import 共享定义
+- 现状：稳定币识别从**七份分歧拷贝**收敛到**一处定义**——按构造不可能再分歧。importTrade 的"哪边是稳定币 quote"分类也共享同一集合，与 PnL 面一致
+- 测试覆盖：新 `stablecoins.test.ts` 6——核心稳定币识别 / **并集里每个曾被部分面识别的符号现在全识别**（BUSD/USDP/TUSD/USDBC/LUSD/GUSD/USDS/USDC.E——明确钉住修复的分歧）/ 大小写不敏感（USDC.e）/ 拒绝非稳定币+空值 / 集合 ≥12 防意外缩水 / **回归守卫**：扫描 src，断言除 stablecoins.ts 外无文件再定义 isStablecoin/STABLE_SYMBOLS（防 copy-paste 重新引入分歧）；既有 8 个相关套件 261 case 全部不变通过（USDC 在所有旧集合里→行为对已测用例不变）
+- 向后兼容：纯提取——零行为变化（已测用例全过）；修复未测稳定币（LUSD/BUSD 等）的跨面分歧；3446 测试全绿（+6，无回归）
+- 影响面：稳定币识别现源自一处——pnl、gains、tradeExport（税务）、paperPnl（纸面）、aggregatorStats、pairStats、strategyCompare、importTrade（分类）全部同源
+
 **Phase 84 — 策略止损熔断（per-strategy realized-loss circuit breaker — stop a strategy that bleeds while mechanically "succeeding"）** ✅
 - **检测→行动：v83 找出流血策略，本期自动止血**：v83 按 realized P&L 排名、标出 bleeders，但**没有任何东西阻止**流血策略继续交易。既有熔断只管**操作性失败**（tx revert）和**组合回撤**（mark-to-market）——但一个策略可以**每笔都成功成交、却在已平仓交易上持续亏钱**，无人拦截。这是最阴险的资本流失：机械上"工作正常"，账上却在失血
 - 为什么是最重要的：安全=不亏钱。一个"成功"但亏钱的策略是真实且无声的资本流失，此前**无任何护栏**。这是安全×有效性的交集——自主 agent 最该有的"别再挖坑"保护，也是 v83 的自然闭环（检测 bleeder → 自动止血）
