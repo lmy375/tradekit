@@ -316,6 +316,23 @@ export interface EngineSection {
   /** Active downside-exit SELL orders (trailing stop / stop-loss). Inert when
    *  the engine is down → the position they guard is UNPROTECTED. */
   protectiveOrders: number;
+  /** v123: protective SELL orders (trailing / price_below) that flipped to
+   *  `failed` WITHIN the digest window — each is a position that LOST its stop
+   *  while the engine was ALIVE (the sell reverted, hit a slippage cap, ran out
+   *  of balance, tripped a safeguard). A distinct exposure from the inert-stop
+   *  case above: there the engine is down; here it tried to fire and couldn't.
+   *  Either way a position is riding unprotected. Window-scoped (unlike the
+   *  standing liveness fields), so 0 in the prior-window comparison. */
+  protectiveFailuresInWindow: number;
+  /** The failed protective orders themselves (most-recent first, capped) — id,
+   *  what it guarded, and why it died — so the digest names what to re-arm. */
+  recentProtectiveFailures: Array<{
+    id: number;
+    chain: string;
+    symbol: string | null;
+    errorCode: string | null;
+    at: string;
+  }>;
 }
 
 /** v47.5: agent trade-approval queue activity. pendingNow is the
@@ -467,23 +484,42 @@ function gatherPosture(config: Config): PostureSection | null {
 // scariest inert case). Staleness threshold matches the doctor's 6h to avoid a
 // second, divergent definition of "engine down". Best-effort → null on failure.
 const ENGINE_STALE_SECONDS = 6 * 3600;
-function gatherEngine(): EngineSection | null {
+/** A protective order is a downside-exit SELL: a trailing stop or a hard
+ *  stop-loss (price_below). Those exist to cap a position's loss. */
+function isProtectiveOrder(o: OrderRow): boolean {
+  return o.side === "sell" && (o.trigger_type === "trailing" || o.trigger_type === "price_below");
+}
+/** Cap on the failed-protective list carried in the section (verdict keys off
+ *  the count regardless). */
+const MAX_PROTECTIVE_FAILURES_LISTED = 5;
+function gatherEngine(windowStartIso?: string): EngineSection | null {
   try {
     const active = listOrders({ status: "active" });
     const livePrimitives = active.length + listSchedules({ status: "active" }).length + listRebalancePlans({ status: "active" }).length;
-    // A protective order is a downside-exit SELL: a trailing stop or a hard
-    // stop-loss (price_below). Those exist to cap a position's loss — if the
-    // engine can't fire them, the position is unprotected.
-    const protectiveOrders = active.filter(
-      (o) => o.side === "sell" && (o.trigger_type === "trailing" || o.trigger_type === "price_below"),
-    ).length;
+    // If the engine can't fire a protective order, the position is unprotected.
+    const protectiveOrders = active.filter(isProtectiveOrder).length;
+    // v123: protective orders that FAILED in the window. markOrderFailed stamps
+    // updated_at at the terminal failure and the row never changes again, so
+    // updated_at ≈ failure time — window them by it. Each is a position that
+    // lost its stop while the engine was alive.
+    const failedProtective = listOrders({ status: "failed" })
+      .filter((o) => isProtectiveOrder(o) && (windowStartIso == null || o.updated_at >= windowStartIso))
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    const recentProtectiveFailures = failedProtective.slice(0, MAX_PROTECTIVE_FAILURES_LISTED).map((o) => ({
+      id: o.id ?? 0,
+      chain: o.chain,
+      symbol: o.base_symbol,
+      errorCode: o.last_error_code,
+      at: o.updated_at,
+    }));
+    const protectiveFailuresInWindow = failedProtective.length;
     const status = readEngineStatus();
     if (!status) {
-      return { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives, protectiveOrders };
+      return { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives, protectiveOrders, protectiveFailuresInWindow, recentProtectiveFailures };
     }
     const ageSec = Math.floor((Date.now() - Date.parse(status.updatedAt)) / 1000);
     const stale = status.stopping || ageSec > ENGINE_STALE_SECONDS;
-    return { everRan: true, stale, lastTickAgoSec: ageSec, livePrimitives, protectiveOrders };
+    return { everRan: true, stale, lastTickAgoSec: ageSec, livePrimitives, protectiveOrders, protectiveFailuresInWindow, recentProtectiveFailures };
   } catch {
     return null; // engine status unavailable — the digest never fails on it
   }
@@ -604,7 +640,7 @@ function gatherWindow(args: {
   const intents = gatherIntents({ since: windowStart, now: new Date(args.nowMs) });
   const posture = gatherPosture(args.config);
   const strategy = gatherStrategyPerf({ since: windowStart });
-  const engine = gatherEngine();
+  const engine = gatherEngine(windowStart);
 
   const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture, strategy, engine });
 
@@ -1247,6 +1283,27 @@ export function classifyVerdict(args: {
       );
       attention = true;
     }
+  }
+
+  // v123: a protective stop that TERMINALLY FAILED in the window is a concrete
+  // exposure even when the engine is alive — it tried to fire and couldn't (the
+  // sell reverted / hit a slippage cap / ran out of balance / tripped a
+  // safeguard), so that position lost its stop and is riding unprotected RIGHT
+  // NOW. Same severity as inert stops (critical) — the difference is only the
+  // cause. Independent of staleness: the engine being up doesn't re-arm a dead
+  // stop. Names the failed order(s) so the response is "re-arm protection on X".
+  if (args.engine && args.engine.protectiveFailuresInWindow > 0) {
+    const e = args.engine;
+    const named = e.recentProtectiveFailures
+      .map((f) => `#${f.id} ${f.symbol ?? "?"}${f.errorCode ? ` (${f.errorCode})` : ""}`)
+      .join(", ");
+    const more = e.protectiveFailuresInWindow > e.recentProtectiveFailures.length
+      ? ` +${e.protectiveFailuresInWindow - e.recentProtectiveFailures.length} more`
+      : "";
+    reasons.push(
+      `${e.protectiveFailuresInWindow} protective stop${e.protectiveFailuresInWindow === 1 ? "" : "s"} FAILED to fire (${named}${more}) — the guarded position(s) lost protection and ride UNPROTECTED now; re-check exposure (open_positions) and re-arm a stop`,
+    );
+    critical = true;
   }
 
   let verdict: HealthVerdict = "healthy";

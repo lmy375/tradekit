@@ -33,6 +33,12 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 123 — 失效的保护止损也要进周期摘要：抓"止损试图触发却失败"这一具体暴露（failed protective stops surface in the digest — catch "the stop tried to fire and couldn't", not just "the engine is down"）** ✅
+- **背景/盲点**：自主交易最可怕的静默失败是"仓位在裸奔、却没人知道"。digest（agent/operator 的周期健康摘要）的 engine 区（v103）已经抓住其中一种成因——**引擎挂了** → 所有保护止损变成惰性 → 仓位裸奔 → critical。但它漏了**另一种、更具体的**成因：引擎**活着**、止损**触发了**、但那笔卖单**终态失败**（revert / 撞滑点上限 / 余额不足 / 触发了某个 safeguard）。这时那个特定仓位**此刻就已经失去保护**，而 digest 此前只会显示一条泛泛的 "Order #X failed"，完全没有点出"你现在在裸奔"这个后果
+- 为什么重要：这是产品最重要的东西（安全）里**最关键的失败模式**。失效的保护止损是经典的灾难场景——价格跳空击穿止损、卖单 revert，于是你抱着一个还在扩大的亏损仓、却没有任何保护。post-hoc 检测（open_positions withProtection）要 agent 主动去查才发现；digest 是周期性主动推送的安全摘要，是在"失败发生"到"下次手动查仓"之间**唯一**能兜住这个信号的地方
+- 实现：EngineSection 新增 `protectiveFailuresInWindow` + `recentProtectiveFailures[]`（id/chain/symbol/errorCode/at）。gatherEngine 接收窗口起点，扫 `listOrders({status:"failed"})` 里 side=sell 且 trigger_type ∈ {trailing, price_below}、且 updated_at 落在窗口内的单（markOrderFailed 会在终态失败时盖上 updated_at 且此后不再变，故 updated_at≈失败时刻）。verdict 新增分支：窗口内有保护止损失败 → **critical**（与惰性止损同级；区别只在成因——引擎活着也不会把死掉的止损复活），并点名失败的单，让响应直接是"open_positions 复查暴露 → 重新挂止损"。CLI digest 渲染加 Protection 行；MCP digest 描述同步；cron `--strict` 因 verdict=critical 自动退出 1。web 的 safety 是"引擎能否触发"的前瞻检查、与"止损已失败"是不同关注点，不动
+- 测试覆盖：+5——classifyVerdict：引擎活着但有保护止损失败→critical 且 reason 点名 (#42 WETH (TX_REVERTED))、多笔失败时 "+N more" 截断计数；端到端 gatherDigest：挂一笔 price_below 卖单→markOrderFailed→engine 区计数+recentProtectiveFailures+critical、非保护单(price_above)失败不计入、窗口前失败被排除；3624 测试全绿（+5）
+
 **Phase 122 — 反向信任关口也看 edge：让 promote-outcome 抓住"形状塌了"而非只看"均值掉了"（edge-shape degradation in the backward trust gate — catch a collapsing profit factor, not just a falling average）** ✅
 - **背景/不对称**：信任管道有前后两个关口。前向 promote-check（v115）已经用 profit factor 把关——纸面 edge 不够稳就不让上真钱。但**反向** promote-outcome（v50，判断"上了真钱后到底兑现了纸面承诺没有"）只比 per-fill 已实现均值、滑点、节奏，**对 edge 形状一无所知**。一个策略实盘 profit factor 从 3.0 塌到 1.1（赢亏垫子崩了、离亏损只差一笔坏单），只要 per-fill 均值还勉强为正，今天就能蒙混过关——而 promote-outcome 的全部存在意义（其文档原话）就是抓"纸面光鲜、实盘暗自流血"
 - 为什么重要：这是整个信任管道**最关键的防线**（防真钱流血），而它此前漏掉了 edge 退化这个最干净的"edge 没扛住真实执行"信号。per-fill 均值会被一两笔幸运实盘单托住；profit factor 才反映赢亏的**稳健度**。补上它，让前向/反向两个关口在 edge 维度对称

@@ -92,6 +92,18 @@ function renderText(r: DigestReport): string {
       lines.push(`  Engine:           ⚠ ${down} — ${e.livePrimitives} live primitive(s) not firing — tradekit engine run`);
     }
   }
+  // v123: protective stop(s) that FAILED to fire in the window — a concrete
+  // exposure independent of engine liveness (the stop tried and couldn't).
+  if (r.engine && r.engine.protectiveFailuresInWindow > 0) {
+    const e = r.engine;
+    const named = e.recentProtectiveFailures
+      .map((f) => `#${f.id} ${f.symbol ?? "?"}${f.errorCode ? ` (${f.errorCode})` : ""}`)
+      .join(", ");
+    const more = e.protectiveFailuresInWindow > e.recentProtectiveFailures.length
+      ? ` +${e.protectiveFailuresInWindow - e.recentProtectiveFailures.length}`
+      : "";
+    lines.push(`  Protection:       🔴 ${e.protectiveFailuresInWindow} stop(s) FAILED — ${named}${more} · position(s) UNPROTECTED — re-check open_positions & re-arm`);
+  }
   lines.push(``);
   lines.push(renderAlertsText(r.alerts));
   lines.push(``);

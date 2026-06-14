@@ -252,6 +252,48 @@ describe("gatherDigest — fires section", () => {
   });
 });
 
+// ── v123: protective-failure exposure (end-to-end through gatherDigest) ──
+describe("gatherDigest — protective-failure exposure", () => {
+  const now = new Date("2026-05-30T12:00:00Z");
+  function seedProtectiveSell(): number {
+    return insertOrder({
+      side: "sell", trigger_type: "price_below", target_price_usd: 1800, trail_pct: null,
+      chain: "base", account: "default",
+      base_token: "0x4200000000000000000000000000000000000006", base_symbol: "WETH",
+      quote_token: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", quote_symbol: "USDC",
+      base_amount: "1", quote_amount: null, slippage_bps: null, auto_slippage: false,
+      expires_at: null, strategy: null, note: null, group_id: null,
+    });
+  }
+
+  it("a protective stop that FAILED in-window → engine section flags it + CRITICAL", async () => {
+    const id = seedProtectiveSell();
+    markOrderFailed(id, "TX_REVERTED", "stop sell reverted");
+    const r = await gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.engine!.protectiveFailuresInWindow).toBe(1);
+    expect(r.engine!.recentProtectiveFailures[0]).toMatchObject({ id, symbol: "WETH", errorCode: "TX_REVERTED" });
+    expect(r.verdict).toBe("critical");
+    expect(r.verdictReasons.some((x) => /FAILED to fire/.test(x))).toBe(true);
+  });
+
+  it("a non-protective (price_above) failed sell is NOT counted as protection loss", async () => {
+    const id = seedOrderInWindow({ side: "sell" }); // trigger_type price_above
+    markOrderFailed(id, "TX_REVERTED", "boom");
+    const r = await gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.engine!.protectiveFailuresInWindow).toBe(0);
+    expect(r.verdictReasons.some((x) => /FAILED to fire/.test(x))).toBe(false);
+  });
+
+  it("a protective failure BEFORE the window is excluded", async () => {
+    const id = seedProtectiveSell();
+    markOrderFailed(id, "TX_REVERTED", "old");
+    const db = openDb();
+    db.prepare(`UPDATE orders SET updated_at = ? WHERE id = ?`).run("2026-05-28T00:00:00Z", id);
+    const r = await gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.engine!.protectiveFailuresInWindow).toBe(0);
+  });
+});
+
 // ── safety section ───────────────────────────────────────────
 
 describe("gatherDigest — safety section", () => {
@@ -791,7 +833,7 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
   it("engine DOWN with a protective stop live → CRITICAL (position unprotected)", async () => {
     const r = classifyVerdict({
       ...base,
-      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 1, protectiveOrders: 1 },
+      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 1, protectiveOrders: 1, protectiveFailuresInWindow: 0, recentProtectiveFailures: [] },
     });
     expect(r.verdict).toBe("critical");
     expect(r.verdictReasons.some((x) => /UNPROTECTED/.test(x))).toBe(true);
@@ -800,7 +842,7 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
   it("engine DOWN with only non-protective primitives → attention (not firing)", async () => {
     const r = classifyVerdict({
       ...base,
-      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 3, protectiveOrders: 0 },
+      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 3, protectiveOrders: 0, protectiveFailuresInWindow: 0, recentProtectiveFailures: [] },
     });
     expect(r.verdict).toBe("attention");
     expect(r.verdictReasons.some((x) => /not firing/.test(x))).toBe(true);
@@ -809,7 +851,7 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
   it("engine DOWN but NO live primitives → healthy (engine is optional)", async () => {
     const r = classifyVerdict({
       ...base,
-      engine: { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives: 0, protectiveOrders: 0 },
+      engine: { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives: 0, protectiveOrders: 0, protectiveFailuresInWindow: 0, recentProtectiveFailures: [] },
     });
     expect(r.verdict).toBe("healthy");
   });
@@ -817,9 +859,38 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
   it("engine ALIVE → no escalation even with live primitives", async () => {
     const r = classifyVerdict({
       ...base,
-      engine: { everRan: true, stale: false, lastTickAgoSec: 12, livePrimitives: 5, protectiveOrders: 2 },
+      engine: { everRan: true, stale: false, lastTickAgoSec: 12, livePrimitives: 5, protectiveOrders: 2, protectiveFailuresInWindow: 0, recentProtectiveFailures: [] },
     });
     expect(r.verdict).toBe("healthy");
+  });
+
+  // v123: a protective stop that FAILED to fire → CRITICAL even when the engine
+  // is alive (it tried and couldn't; the position lost protection).
+  it("protective stop FAILED in window → CRITICAL even with engine ALIVE", async () => {
+    const r = classifyVerdict({
+      ...base,
+      engine: {
+        everRan: true, stale: false, lastTickAgoSec: 12, livePrimitives: 1, protectiveOrders: 0,
+        protectiveFailuresInWindow: 1,
+        recentProtectiveFailures: [{ id: 42, chain: "base", symbol: "WETH", errorCode: "TX_REVERTED", at: "2026-06-14T10:00:00Z" }],
+      },
+    });
+    expect(r.verdict).toBe("critical");
+    expect(r.verdictReasons.some((x) => /FAILED to fire.*#42 WETH \(TX_REVERTED\).*UNPROTECTED/.test(x))).toBe(true);
+  });
+
+  it("names a capped subset and counts the rest when many stops failed", async () => {
+    const failures = Array.from({ length: 7 }, (_, i) => ({ id: i + 1, chain: "base", symbol: "WETH", errorCode: "TX_REVERTED", at: "2026-06-14T10:00:00Z" }));
+    const r = classifyVerdict({
+      ...base,
+      engine: {
+        everRan: true, stale: false, lastTickAgoSec: 12, livePrimitives: 5, protectiveOrders: 0,
+        protectiveFailuresInWindow: 7,
+        recentProtectiveFailures: failures.slice(0, 5),
+      },
+    });
+    expect(r.verdict).toBe("critical");
+    expect(r.verdictReasons.some((x) => /\+2 more/.test(x))).toBe(true);
   });
 });
 
