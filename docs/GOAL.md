@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 109 — 策略对比/止损熔断用 value_usd：非稳定币报价策略不再"零亏损"地逃过熔断（strategy comparison + loss breaker use value_usd — a non-stablecoin-quoted strategy can no longer read $0 realized and dodge the v84 breaker）** ✅
+- **修复一个有安全后果的 value_usd 缺口**：strategyCompare（"stablecoin-$1 模型"）此前对**非稳定币报价的交易直接跳过**（无法无 RPC 定价）→ 该策略 realizedUsd 恒为 \$0。但它喂着 v84 **止损熔断**（安全强制）、v99 headroom、v88 digest——于是一个 WETH 报价、正在亏钱的策略，熔断**永远不触发**（看到 \$0 亏损）、headroom 显示满额、digest 不报 bleeding。安全护栏对这类策略静默失效
+- 为什么重要：止损熔断是按策略的真金白银自动护栏。它对一整类策略（非稳定币报价）失灵，是 v104/v107 同类的 value_usd 缺口——但这次直接削弱了**强制执行**。v104 刚把 value_usd（交易时刻精确美元，无 RPC、已持久化）备好，正好让 strategyCompare 既精确又仍然零 RPC
+- 实现（外科手术，复用 value_usd + 同源 reducer）：computeStrategyComparison 的 tradeUsd 改为：有 value_usd→用它（非稳定币报价策略现在能被定价了，之前被跳过）；否则稳定币→\$1×amount（原模型）；否则非稳定币无 value_usd→仍 unpriced（回退不变）。StrategyTradeLite + toLite 加 value_usd 字段，real 模式经 recentTrades→toLite 自动带上（paper 无该列→回退，本就假定价）
+- 测试覆盖：+3——WETH 报价策略经 value_usd 定价（realized −\$200、进 bleeding，之前 unpriced=\$0）/ 非稳定币无 value_usd 仍 unpriced（回退不变）/ value_usd 优先于 stablecoin-\$1 假设；3580 测试全绿（+3）
+- 向后兼容：纯改进——既有"排除非稳定币报价"测试仍通过（那些行无 value_usd）；real 模式自动获益；paper 模式回退不变；不改 reducer/熔断逻辑
+
 **Phase 108 — value_usd 覆盖到回填/导入路径：所有交易来源的 P&L/税务/预算一致精确（backfill the trade-time USD value on imported / `trades sync` rows — close the value_usd story across ALL trade sources）** ✅
 - **补上 value_usd 弧的最后一块：导入/回填的交易**：v104 给实盘交易加了 value_usd，v107 让 P&L/税务用它（消除非稳定币报价的现价失真）。但 `trade import` / `trades sync`（链上回填外部/手动交易）建的行**没有 value_usd**——于是导入的历史交易在 P&L/税务/预算里仍走旧的现价近似。对**税务**尤其要命：运营商导入历史用来报税，非稳定币报价的成本基础按今天的价算就是错的
 - 为什么重要：税务/P&L 是报税、决策依赖的最核心数字，必须对所有交易来源一致。`trades sync` 全程经 importTradeFromTx（一个修复同时覆盖 import + sync 两条回填路径）。这是 v104→v107 弧的收尾——让"交易时刻精确美元"覆盖 live + import + sync 全部来源，而非只有 live

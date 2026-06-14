@@ -32,6 +32,10 @@ export interface StrategyTradeLite {
   base_amount: string;
   quote_amount: string;
   quote_symbol: string | null;
+  /** v109: trade-time USD value (v104). When present, used as the trade's USD
+   *  instead of the stablecoin-$1 assumption — so non-stablecoin-quoted
+   *  strategies are valued correctly (and the v84 loss breaker actually trips). */
+  value_usd?: number | null;
   timestamp: string;
 }
 
@@ -100,13 +104,21 @@ export function computeStrategyComparison(
     const base = parseFloat(r.base_amount);
     const quote = parseFloat(r.quote_amount);
     if (!Number.isFinite(base) || !Number.isFinite(quote) || base <= 0 || quote <= 0) continue;
-    // Deterministic USD: only stablecoin-quoted trades are priced (same model
-    // as the tax export). Others can't be valued without a price fetch.
-    if (!isStablecoin(r.quote_symbol)) {
+    // Deterministic USD, no RPC. v109: prefer the persisted trade-time value
+    // (v104 value_usd) — this is what lets a NON-stablecoin-quoted strategy be
+    // valued at all (previously skipped → realized $0 → the v84 loss breaker
+    // never tripped on it). Stablecoin quote with no value_usd → $1/unit (the
+    // original model). A non-stablecoin quote with no value_usd stays unpriced.
+    const valueUsd = r.value_usd != null && Number.isFinite(r.value_usd) && r.value_usd > 0 ? r.value_usd : null;
+    let tradeUsd: number;
+    if (valueUsd != null) {
+      tradeUsd = valueUsd;
+    } else if (isStablecoin(r.quote_symbol)) {
+      tradeUsd = quote; // stablecoin quote ≈ $1/unit
+    } else {
       unpricedTrades += 1;
       continue;
     }
-    const tradeUsd = quote; // stablecoin quote ≈ $1/unit
 
     const key = r.strategy?.trim() || "(none)";
     let acc = byStrategy.get(key);
@@ -255,6 +267,7 @@ function toLite(t: {
   base_amount: string;
   quote_amount: string;
   quote_symbol: string | null;
+  value_usd?: number | null;
   timestamp: string;
 }): StrategyTradeLite {
   return {
@@ -266,6 +279,7 @@ function toLite(t: {
     base_amount: t.base_amount,
     quote_amount: t.quote_amount,
     quote_symbol: t.quote_symbol,
+    value_usd: t.value_usd ?? null,
     timestamp: t.timestamp,
   };
 }

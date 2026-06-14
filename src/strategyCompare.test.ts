@@ -67,6 +67,38 @@ describe("computeStrategyComparison", () => {
     expect(r.strategies[0].closes).toBe(0);
   });
 
+  // v109: value_usd lets non-stablecoin-quoted strategies be valued — so the
+  // v84 loss breaker actually trips on them instead of seeing a phantom $0.
+  it("prices a WETH-quoted strategy via value_usd (was unpriced → realized $0)", () => {
+    const r = computeStrategyComparison([
+      // buy 1 base for 0.5 WETH worth $1000; sell 1 base for 0.5 WETH worth $800 → −200
+      fill({ strategy: "weth-strat", direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1000 }),
+      fill({ strategy: "weth-strat", direction: "sell", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 800 }),
+    ]);
+    expect(r.unpricedTrades).toBe(0); // value_usd makes both priceable
+    const s = r.strategies[0];
+    expect(s.tradeCount).toBe(2);
+    expect(s.realizedUsd).toBeCloseTo(-200, 6); // 800 − 1000
+    expect(r.bleeding).toEqual(["weth-strat"]); // now visible as a bleeder
+  });
+
+  it("a non-stablecoin quote WITHOUT value_usd stays unpriced (fallback unchanged)", () => {
+    const r = computeStrategyComparison([
+      fill({ strategy: "a", direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH" }), // no value_usd
+    ]);
+    expect(r.unpricedTrades).toBe(1);
+  });
+
+  it("value_usd is preferred over the stablecoin-$1 assumption when both apply", () => {
+    // A USDC trade whose recorded value_usd differs from quote_amount (e.g. a
+    // depegged/odd row) — value_usd wins (it's the exact recorded dollars).
+    const r = computeStrategyComparison([
+      fill({ strategy: "a", direction: "buy", base_amount: "1", quote_amount: "2000", quote_symbol: "USDC", value_usd: 1900 }),
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2000", quote_symbol: "USDC", value_usd: 2100 }),
+    ]);
+    expect(r.strategies[0].realizedUsd).toBeCloseTo(200, 6); // 2100 − 1900, not 0
+  });
+
   it("untagged trades bucket under (none)", () => {
     const r = computeStrategyComparison([
       fill({ strategy: null, direction: "buy", base_amount: "1", quote_amount: "2000" }),
