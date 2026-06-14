@@ -539,7 +539,7 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
   // ── config ────────────────────────────────────────────────
   server.tool(
     "config",
-    "Read or update the tradekit config file. action=show (default — returns the whole config, REDACTED on MCP so API keys never leak into agent context) | get (path required — returns { path, value, set }) | set (path + value required — value is JSON-encoded) | push (path + value, appends to an array field e.g. safety.contractWhitelist.base) | drop (path + value, removes matching item from array). Matches the `tradekit config <action>` CLI. Errors: INVALID_PARAMS (missing path/value for actions that need them, invalid action name, bad JSON in value, schema-rejected value). Note: push/drop on non-array paths throws; set replaces the whole value.",
+    "Read or update the tradekit config file. action=show (default — returns the whole config, REDACTED on MCP so API keys never leak into agent context) | get (path required — returns { path, value, set }) | set (path + value required — value is JSON-encoded) | push (path + value, appends to an array field e.g. safety.contractWhitelist.base) | drop (path + value, removes matching item from array). Matches the `tradekit config <action>` CLI. v89 SECURITY: writes (set/push/drop) to `safety.*` are BLOCKED over MCP with SAFETY_CONFIG_LOCKED — the guardrails (limits, breakers, token/contract whitelists, AND the human approval gate safety.tradeApproval) are operator-owned and change only from the CLI, so an agent can't weaken its own protections then trade freely (same CLI-only boundary as backup/panic). You can still READ safety config (show/get) and DRY-RUN a change via config_preflight to recommend it to the operator. Errors: SAFETY_CONFIG_LOCKED (write to safety.*), INVALID_PARAMS (missing path/value for actions that need them, invalid action name, bad JSON in value, schema-rejected value). Note: push/drop on non-array paths throws; set replaces the whole value.",
     {
       action: z.enum(["show", "get", "set", "push", "drop"]).optional(),
       path: z.string().optional().describe("Dotted path, e.g. \"safety.perTxUsdLimit\""),
@@ -548,6 +548,20 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
     async ({ action, path, value }) => {
       try {
         const a = action ?? "show";
+        // v89: safety guardrails are OPERATOR-owned. Block any write to
+        // safety.* (every limit / breaker / whitelist + the human approval
+        // gate safety.tradeApproval) over MCP — a prompt-injected agent must
+        // not be able to disable the drawdown breaker or loosen slippage and
+        // then trade freely. Same CLI-only boundary as backup/panic. Reads
+        // (show/get) + config_preflight (dry-run) stay open so the agent can
+        // still ANALYZE a change and recommend it to the operator.
+        if ((a === "set" || a === "push" || a === "drop") && path != null && (path === "safety" || path.startsWith("safety."))) {
+          throw new ToolError(
+            "SAFETY_CONFIG_LOCKED",
+            `Refusing to ${a} "${path}" over MCP — safety guardrails (limits, breakers, whitelists, the approval gate) are operator-owned and change only from the CLI (\`tradekit config ${a} ${path} …\`), so an agent can't weaken its own protections. Use config_preflight to dry-run the change and recommend it to the operator.`,
+            { details: { action: a, path }, nextActions: [{ tool: "config_preflight", reason: "Analyze the proposed safety change; the operator applies it via the CLI." }] },
+          );
+        }
         const config = loadConfig();
         // Always redact in MCP: an LLM agent has no legitimate workflow that needs the
         // raw 0x/1inch keys (the SERVER makes those calls). Returning them just risks

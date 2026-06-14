@@ -62,6 +62,11 @@ export type ErrorCode =
   // (resize, wait for the window to roll, or raise the cap).
   | "STRATEGY_BUDGET_EXCEEDED"
   | "POSITION_CAP_EXCEEDED"
+  // v89: the agent tried to mutate operator-owned safety config (safety.* —
+  // limits, breakers, whitelists, the human approval gate) over MCP. Blocked so
+  // a prompt-injected agent can't weaken its OWN guardrails then trade freely.
+  // safety config is changed from the CLI only (same boundary as backup/panic).
+  | "SAFETY_CONFIG_LOCKED"
   // v84: per-strategy realized-LOSS circuit breaker (safety.maxStrategyLossUsd).
   // The strategy's realized P&L on CLOSED trades has fallen below
   // -maxStrategyLossUsd — it's mechanically executing but bleeding capital, so
@@ -420,6 +425,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "POSITION_CAP_EXCEEDED":
     case "STRATEGY_LOSS_BREAKER_TRIPPED":
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
+    case "SAFETY_CONFIG_LOCKED":
     case "ENGINE_LOCKED":
       return 403;
     case "TX_NOT_FOUND":

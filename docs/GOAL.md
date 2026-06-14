@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 89 — 护栏自保护（safety config is operator-owned — an agent can't weaken its OWN guardrails over MCP）** ✅
+- **堵住一个真实的安全完整性漏洞，而非加 feature**：整套安全栈保护**交易**，但**护栏配置本身**此前可被 agent 经 MCP `config set` 改写。攻击路径：被提示注入的 agent → `config set safety.maxSlippageBps 5000` / 关掉 drawdown breaker / 从黑名单 drop 一个币 / **关掉人工审批门 safety.tradeApproval** → 然后在松掉的护栏内自由交易。护栏只和 agent 的自律一样强——等于没有
+- 为什么是最重要的：自主 agent（尤其被注入的）托管真钱，安全的根基是护栏**不可被被保护方自己削弱**。产品已有 backup/panic/审批 CLI-only 边界防注入 agent 导出密钥/拉总闸——但**护栏配置**这个最该保护的东西却敞着。这是和那些同类的信任边界，补上最后一块
+- 实现（镜像 backup/panic 的 CLI-only 边界）：MCP `config` 工具的写操作（set/push/drop）若目标 `safety` 或 `safety.*` → 抛 `SAFETY_CONFIG_LOCKED`。覆盖所有护栏（limits/breakers/白黑名单/concentration/strategy-loss）**以及人工审批门**（safety.tradeApproval 就在 safety.* 下）。读（show/get）+ `config_preflight`（dry-run 分析）保持开放——agent 仍能**分析**并向运营商**建议**改动，只是不能**应用**
+- 关键边界：**CLI 路径不变**（运营商有 shell、负责设护栏）——块只在 MCP handler。运营商设护栏、agent 在内操作，正确的职责分离（同 backup/panic）
+- 测试覆盖：新 `admin-tools.test.ts` 9（真 MCP config handler）——set safety/safety.maxSlippageBps/drawdown.enabled/tradeApproval.enabled 全→SAFETY_CONFIG_LOCKED / push 白名单→锁 / drop 黑名单→锁 / 读 safety（get+show）放行 / 写非-safety 路径（defaultSlippageBps）放行 / 前缀匹配非子串（activeChain 不误锁）；CLI 烟雾验证 `config set safety.maxSlippageBps 300` 仍成功（人工路径开）；SAFETY_CONFIG_LOCKED 入 ErrorCode（403）
+- 向后兼容：纯加法——MCP 写 safety.* 此前"能但危险"，现在拒（行为收紧但是安全修复，非破坏既有合法流程——无合法 agent 流程会改 safety 配置）；3461 测试全绿（+9）
+- v1 限制：仅锁 `safety.*`（含审批门——最高危面）；mev/webhooks 等次级护栏未锁（v1 聚焦核心，可后续扩）；硬块无 opt-out（安全默认——要 agent 管护栏是 footgun）
+
 **Phase 88 — 策略业绩进 digest（strategy performance in the cron digest — surface bleeders PROACTIVELY）** ✅
 - **把有效性信号变主动，而非又一个 pull 面**：v83 比较、v84 熔断**检测/拦截**流血策略，但运营商得记得去查。digest 是 cron 主动简报通道——本期把策略业绩 roll-up 进 digest，运营商定时收到"策略 X 在流血"，不必 poll
 - 为什么有价值：自主 agent 跑数周，运营商要的是**被告知**坏消息而非主动找。digest 是那个通道。一个机械上"正常"（每笔成交）却在亏钱的策略，此前在 digest 里完全不可见——本期补上，且让它**贡献 digest verdict**（流血→attention）
