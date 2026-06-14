@@ -25,7 +25,7 @@
  */
 
 import type { BacktestFire, PriceSeries, SymbolBalance } from "./backtest.js";
-import { applyBuy, applySell } from "./costBasis.js";
+import { applyBuy, applySell, computeEdge, type EdgeMetrics } from "./costBasis.js";
 
 export interface EquityPoint {
   ts: string;
@@ -64,36 +64,24 @@ export interface BacktestMetrics {
   edge: TradeEdge | null;
 }
 
-/** v120: trade-level edge metrics — mirrors the live strategy-comparison (v114)
- *  + promote-check (v115) shapes so edge reads consistently at EVERY trust gate
- *  (backtest → paper-compare → promote → live). */
-export interface TradeEdge {
-  closes: number;
-  wins: number;
-  losses: number;
-  winRatePct: number | null;
-  avgWinUsd: number | null;
-  avgLossUsd: number | null;
-  /** grossWin / grossLoss. > 1 = profitable edge. Null when no losses. */
-  profitFactor: number | null;
-  /** avgWin / avgLoss. Null until both a win and a loss exist. */
-  payoffRatio: number | null;
-  /** realized $ ÷ closes — per-trade expectancy. */
-  expectancyUsd: number | null;
-}
-
-const EDGE_FLAT_USD = 1e-6;
+/** v120: trade-level edge metrics on the backtest. v121: this IS the shared
+ *  EdgeMetrics (costBasis.computeEdge) the live strategy-comparison + promote-
+ *  check also use — so edge reads identically at EVERY trust gate (backtest →
+ *  paper-compare → promote → live) by construction, not by hand-matching. */
+export type TradeEdge = EdgeMetrics;
 
 /**
  * v120: walk the simulated fires through the SAME cost-basis reducer the live
- * P&L surfaces use (costBasis.ts) to derive trade-level edge. The backtest
+ * P&L surfaces use (costBasis.ts), collect the realized $ of each closed
+ * round-trip, then derive edge via the shared computeEdge (v121). The backtest
  * prices quote ≈ USD (the equity curve adds `quote` as USD), so a buy's cost is
  * the USD spent (−quoteDelta) and a sell's proceeds are the USD received
  * (+quoteDelta) — realized P&L per closed round-trip, no divergence from v114.
+ * Null when nothing closed (BacktestMetrics.edge stays null then).
  */
 export function tradeEdgeFromFires(fires: readonly BacktestFire[]): TradeEdge | null {
   const pos = { amount: 0, cost: 0 };
-  let closes = 0, wins = 0, losses = 0, grossWin = 0, grossLoss = 0, realizedTotal = 0;
+  const realizedCloses: number[] = [];
   const sorted = [...fires]
     .filter((f) => f.action === "fill")
     .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
@@ -105,27 +93,11 @@ export function tradeEdgeFromFires(fires: readonly BacktestFire[]): TradeEdge | 
       const sellAmt = -f.baseDelta;
       const sellPricePerUnit = sellAmt > 0 ? f.quoteDelta / sellAmt : 0;
       const { avgCost, sold } = applySell(pos, sellAmt);
-      if (sold > 0) {
-        const realized = (sellPricePerUnit - avgCost) * sold;
-        realizedTotal += realized;
-        closes += 1;
-        if (realized > EDGE_FLAT_USD) { wins += 1; grossWin += realized; }
-        else if (realized < -EDGE_FLAT_USD) { losses += 1; grossLoss += -realized; }
-      }
+      if (sold > 0) realizedCloses.push((sellPricePerUnit - avgCost) * sold);
     }
   }
-  if (closes === 0) return null;
-  return {
-    closes,
-    wins,
-    losses,
-    winRatePct: wins + losses > 0 ? (wins / (wins + losses)) * 100 : null,
-    avgWinUsd: wins > 0 ? grossWin / wins : null,
-    avgLossUsd: losses > 0 ? grossLoss / losses : null,
-    profitFactor: grossLoss > EDGE_FLAT_USD ? grossWin / grossLoss : null,
-    payoffRatio: wins > 0 && losses > 0 ? (grossWin / wins) / (grossLoss / losses) : null,
-    expectancyUsd: realizedTotal / closes,
-  };
+  if (realizedCloses.length === 0) return null;
+  return computeEdge(realizedCloses);
 }
 
 const CURVE_MAX_POINTS = 100;

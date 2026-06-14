@@ -18,7 +18,7 @@
  * Pure core (computeStrategyComparison) + a thin trade-loading gatherer.
  */
 
-import { applyBuy, applySell, type CostBasisState } from "./costBasis.js";
+import { applyBuy, applySell, computeEdge, EDGE_FLAT_USD, type CostBasisState } from "./costBasis.js";
 import { recentTrades, listPaperTrades } from "./db.js";
 import { ToolError } from "./errors.js";
 import { isStablecoin } from "./stablecoins.js";
@@ -85,9 +85,6 @@ export interface StrategyComparisonReport {
   generatedAt: string;
 }
 
-/** Below this |USD| a realized result is treated as flat (neither win nor loss). */
-const FLAT_PNL_EPSILON = 1e-6;
-
 /**
  * Pure: walk trades grouped by strategy through the shared cost-basis reducer,
  * accumulating realized P&L + win/loss + volume per strategy, then rank.
@@ -101,15 +98,12 @@ export function computeStrategyComparison(
   const sorted = [...rows].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
   interface Acc {
-    realized: number;
     tradeCount: number;
-    closes: number;
-    wins: number;
-    losses: number;
-    /** v114: gross winning $ and gross losing $ (abs) across closes — the
-     *  basis for profit factor / avg win / avg loss / payoff ratio. */
-    grossWin: number;
-    grossLoss: number;
+    /** v121: realized $ of each CLOSED round-trip (incl flat). The edge
+     *  metrics (win rate / profit factor / payoff / expectancy) are derived
+     *  from this once, via the shared computeEdge — so the live comparison and
+     *  the backtest can't disagree on "does this have an edge?". */
+    realizedCloses: number[];
     volume: number;
     lastTradeAt: string | null;
     positions: Map<string, CostBasisState>;
@@ -140,7 +134,7 @@ export function computeStrategyComparison(
     const key = r.strategy?.trim() || "(none)";
     let acc = byStrategy.get(key);
     if (!acc) {
-      acc = { realized: 0, tradeCount: 0, closes: 0, wins: 0, losses: 0, grossWin: 0, grossLoss: 0, volume: 0, lastTradeAt: null, positions: new Map() };
+      acc = { tradeCount: 0, realizedCloses: [], volume: 0, lastTradeAt: null, positions: new Map() };
       byStrategy.set(key, acc);
     }
     acc.tradeCount += 1;
@@ -160,40 +154,38 @@ export function computeStrategyComparison(
       const sellPricePerUnit = tradeUsd / base;
       const { avgCost, sold } = applySell(pos, base);
       if (sold > 0) {
-        const realized = (sellPricePerUnit - avgCost) * sold;
-        acc.realized += realized;
-        acc.closes += 1;
-        if (realized > FLAT_PNL_EPSILON) { acc.wins += 1; acc.grossWin += realized; }
-        else if (realized < -FLAT_PNL_EPSILON) { acc.losses += 1; acc.grossLoss += -realized; }
+        acc.realizedCloses.push((sellPricePerUnit - avgCost) * sold);
       }
     }
   }
 
   const strategies: StrategyPerformance[] = [...byStrategy.entries()]
-    .map(([strategy, a]) => ({
-      strategy,
-      realizedUsd: a.realized,
-      tradeCount: a.tradeCount,
-      closes: a.closes,
-      wins: a.wins,
-      losses: a.losses,
-      winRatePct: a.wins + a.losses > 0 ? (a.wins / (a.wins + a.losses)) * 100 : null,
-      volumeUsd: a.volume,
-      avgRealizedPerClose: a.closes > 0 ? a.realized / a.closes : null,
-      avgWinUsd: a.wins > 0 ? a.grossWin / a.wins : null,
-      avgLossUsd: a.losses > 0 ? a.grossLoss / a.losses : null,
-      // Undefined when there are no losses (∞) — report null rather than a
-      // misleading huge number; a glance at wins/losses tells the rest.
-      profitFactor: a.grossLoss > FLAT_PNL_EPSILON ? a.grossWin / a.grossLoss : null,
-      payoffRatio: a.wins > 0 && a.losses > 0 ? (a.grossWin / a.wins) / (a.grossLoss / a.losses) : null,
-      lastTradeAt: a.lastTradeAt,
-    }))
+    .map(([strategy, a]) => {
+      // v121: one shared derivation — same math the backtest edge uses.
+      const edge = computeEdge(a.realizedCloses);
+      return {
+        strategy,
+        realizedUsd: edge.realizedUsd,
+        tradeCount: a.tradeCount,
+        closes: edge.closes,
+        wins: edge.wins,
+        losses: edge.losses,
+        winRatePct: edge.winRatePct,
+        volumeUsd: a.volume,
+        avgRealizedPerClose: edge.expectancyUsd,
+        avgWinUsd: edge.avgWinUsd,
+        avgLossUsd: edge.avgLossUsd,
+        profitFactor: edge.profitFactor,
+        payoffRatio: edge.payoffRatio,
+        lastTradeAt: a.lastTradeAt,
+      };
+    })
     .sort((x, y) => y.realizedUsd - x.realizedUsd);
 
   const totalRealizedUsd = strategies.reduce((s, x) => s + x.realizedUsd, 0);
   const best = strategies[0] ?? null;
   const worst = strategies.length > 0 ? strategies[strategies.length - 1] : null;
-  const bleeding = strategies.filter((s) => s.realizedUsd < -FLAT_PNL_EPSILON).map((s) => s.strategy);
+  const bleeding = strategies.filter((s) => s.realizedUsd < -EDGE_FLAT_USD).map((s) => s.strategy);
 
   const summary =
     strategies.length === 0

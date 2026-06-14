@@ -71,3 +71,89 @@ export function applySell(state: CostBasisState, baseAmount: number): SellOutcom
   state.cost = Math.max(0, state.cost - costRemoved);
   return { avgCost, sold, untracked, costRemoved };
 }
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Trade EDGE (v121) — the ONE derivation of "does this strategy have an edge?"
+ *
+ * The edge arc (v114 live strategy-compare → v115 promote-check → v120
+ * backtest) put profit factor / payoff / expectancy at every trust gate. But
+ * the DERIVATION (classify each closed round-trip as win/loss by an epsilon,
+ * accumulate gross win/loss, divide into the ratios) was written twice —
+ * inline in computeStrategyComparison and again in tradeEdgeFromFires — each
+ * hand-matched to the other. That match is the same structural debt this
+ * module was created to kill for cost basis (above): a later change to the
+ * flat-epsilon, the no-losses null rule, or the payoff guard in one site would
+ * silently drift from the other, and "edge reads identically at every gate"
+ * (the whole point of the arc) would quietly stop being true.
+ *
+ * So the win/loss math lives here, defined once. Callers do their own
+ * cost-basis walk (each prices trades differently — value_usd vs quote≈USD)
+ * and hand this the realized $ of each CLOSED round-trip; the edge can't
+ * diverge across surfaces by construction. Pure, no IO.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** Below this |USD| a realized round-trip is treated as flat — neither win nor
+ *  loss. Shared so every edge surface uses the same flatness threshold. */
+export const EDGE_FLAT_USD = 1e-6;
+
+export interface EdgeMetrics {
+  /** Closed round-trips fed in (includes flat ones — they're still closes). */
+  closes: number;
+  wins: number;
+  losses: number;
+  /** wins / (wins + losses) × 100. Null when nothing decisive closed. */
+  winRatePct: number | null;
+  /** Sum of all realized $ across closes (the bottom line). */
+  realizedUsd: number;
+  /** Gross winning $ and gross losing $ (abs) — the profit-factor basis. */
+  grossWinUsd: number;
+  grossLossUsd: number;
+  avgWinUsd: number | null;
+  avgLossUsd: number | null;
+  /** grossWin / grossLoss. > 1 = profitable edge. Null when there are no
+   *  losses (undefined ratio — a glance at wins/losses tells the rest). */
+  profitFactor: number | null;
+  /** avgWin / avgLoss — the win/loss size asymmetry. Null until both exist. */
+  payoffRatio: number | null;
+  /** realized $ ÷ closes — per-trade expectancy. Null when no closes. */
+  expectancyUsd: number | null;
+}
+
+/**
+ * Derive trade-edge metrics from the realized P&L (USD) of each CLOSED
+ * round-trip. Always returns a value (a zero/empty book reads as 0 closes,
+ * null ratios) so callers can map it straight onto their public shape.
+ */
+export function computeEdge(realizedPerClose: readonly number[]): EdgeMetrics {
+  let wins = 0;
+  let losses = 0;
+  let grossWin = 0;
+  let grossLoss = 0;
+  let realizedUsd = 0;
+  for (const r of realizedPerClose) {
+    if (!Number.isFinite(r)) continue;
+    realizedUsd += r;
+    if (r > EDGE_FLAT_USD) {
+      wins += 1;
+      grossWin += r;
+    } else if (r < -EDGE_FLAT_USD) {
+      losses += 1;
+      grossLoss += -r;
+    }
+  }
+  const closes = realizedPerClose.length;
+  return {
+    closes,
+    wins,
+    losses,
+    winRatePct: wins + losses > 0 ? (wins / (wins + losses)) * 100 : null,
+    realizedUsd,
+    grossWinUsd: grossWin,
+    grossLossUsd: grossLoss,
+    avgWinUsd: wins > 0 ? grossWin / wins : null,
+    avgLossUsd: losses > 0 ? grossLoss / losses : null,
+    profitFactor: grossLoss > EDGE_FLAT_USD ? grossWin / grossLoss : null,
+    payoffRatio: wins > 0 && losses > 0 ? grossWin / wins / (grossLoss / losses) : null,
+    expectancyUsd: closes > 0 ? realizedUsd / closes : null,
+  };
+}

@@ -12,10 +12,13 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { applyBuy, applySell, FLAT_EPSILON, type CostBasisState } from "./costBasis.js";
+import { applyBuy, applySell, computeEdge, FLAT_EPSILON, type CostBasisState } from "./costBasis.js";
 import { computePaperPnlMtm, type PaperPriceFetcher } from "./paperPnl.js";
 import { netPosition, type FillRowLite } from "./positionCaps.js";
 import { enrichTradesForExport, quoteUsdAtTradeForExport } from "./tradeExport.js";
+import { computeStrategyComparison, type StrategyTradeLite } from "./strategyCompare.js";
+import { tradeEdgeFromFires } from "./backtestMetrics.js";
+import type { BacktestFire } from "./backtest.js";
 import type { PaperTradeRow, TradeRow } from "./db.js";
 
 // ── unit: the shared reducer ───────────────────────────────
@@ -230,4 +233,93 @@ describe("coherence: tax export ≡ MTM walker realized PnL (shared cost-basis c
       expect(exportRealized).toBeCloseTo(walker, 6);
     });
   }
+});
+
+// ── unit: the shared edge derivation (v121) ─────────────────
+describe("computeEdge", () => {
+  it("derives profit factor / payoff / expectancy / win rate from realized closes", () => {
+    const e = computeEdge([500, 200, -200]); // 2 wins (+700), 1 loss (-200)
+    expect(e.closes).toBe(3);
+    expect(e.wins).toBe(2);
+    expect(e.losses).toBe(1);
+    expect(e.winRatePct).toBeCloseTo(200 / 3, 4);
+    expect(e.realizedUsd).toBeCloseTo(500, 6);
+    expect(e.grossWinUsd).toBeCloseTo(700, 6);
+    expect(e.grossLossUsd).toBeCloseTo(200, 6);
+    expect(e.avgWinUsd).toBeCloseTo(350, 6);
+    expect(e.avgLossUsd).toBeCloseTo(200, 6);
+    expect(e.profitFactor).toBeCloseTo(3.5, 6);
+    expect(e.payoffRatio).toBeCloseTo(1.75, 6);
+    expect(e.expectancyUsd).toBeCloseTo(500 / 3, 6);
+  });
+
+  it("no losses → profitFactor & payoff null; flat closes count but don't decide", () => {
+    const allWins = computeEdge([100, 50]);
+    expect(allWins.profitFactor).toBeNull();
+    expect(allWins.payoffRatio).toBeNull();
+    expect(allWins.avgLossUsd).toBeNull();
+    // A sub-epsilon close is still a close, but neither a win nor a loss.
+    const withFlat = computeEdge([100, 1e-9, -40]);
+    expect(withFlat.closes).toBe(3);
+    expect(withFlat.wins).toBe(1);
+    expect(withFlat.losses).toBe(1);
+    expect(withFlat.winRatePct).toBeCloseTo(50, 6);
+  });
+
+  it("empty → 0 closes, all ratios null (maps onto a no-trades strategy)", () => {
+    const e = computeEdge([]);
+    expect(e.closes).toBe(0);
+    expect(e.realizedUsd).toBe(0);
+    expect(e.winRatePct).toBeNull();
+    expect(e.profitFactor).toBeNull();
+    expect(e.payoffRatio).toBeNull();
+    expect(e.expectancyUsd).toBeNull();
+  });
+});
+
+// ── coherence: live strategy-compare ≡ backtest edge (shared computeEdge, v121) ──
+// The whole point of the edge arc is that "does this strategy have an edge?"
+// reads identically at every trust gate. This pins it: the SAME round-trips,
+// fed through the live comparison (StrategyTradeLite → cost-basis walk) and the
+// backtest (BacktestFire → cost-basis walk), must yield identical edge metrics.
+describe("coherence: strategy-compare edge ≡ backtest edge (same round-trips)", () => {
+  // Each entry: buy `base` for `usd`, later sell the same base for `usd`.
+  const ROUND_TRIPS: Array<{ base: number; buyUsd: number; sellUsd: number }> = [
+    { base: 1, buyUsd: 2000, sellUsd: 2500 }, // +500 win
+    { base: 2, buyUsd: 3000, sellUsd: 3300 }, // +300 win
+    { base: 1, buyUsd: 2000, sellUsd: 1750 }, // -250 loss
+    { base: 0.5, buyUsd: 900, sellUsd: 900 }, // flat
+  ];
+
+  it("identical profit factor / payoff / win rate / expectancy / closes", () => {
+    // Live path: USDC-quoted lite rows (tradeUsd = quote, $1 stable model).
+    const lite: StrategyTradeLite[] = [];
+    let day = 1;
+    const ts = () => `2026-03-${String(day++).padStart(2, "0")}T00:00:00Z`;
+    for (const rt of ROUND_TRIPS) {
+      lite.push({ strategy: "edge-coherence", chain: "base", direction: "buy", base_token: "0xWETH", base_symbol: "WETH", base_amount: String(rt.base), quote_amount: String(rt.buyUsd), quote_symbol: "USDC", value_usd: null, timestamp: ts() });
+      lite.push({ strategy: "edge-coherence", chain: "base", direction: "sell", base_token: "0xWETH", base_symbol: "WETH", base_amount: String(rt.base), quote_amount: String(rt.sellUsd), quote_symbol: "USDC", value_usd: null, timestamp: ts() });
+    }
+    const live = computeStrategyComparison(lite, { now: new Date("2026-03-31T00:00:00Z") }).strategies[0];
+
+    // Backtest path: fires with quote ≈ USD (buy quoteDelta negative, sell positive).
+    const fires: BacktestFire[] = [];
+    day = 1;
+    for (const rt of ROUND_TRIPS) {
+      fires.push({ ts: ts(), action: "fill", priceUsd: rt.buyUsd / rt.base, baseDelta: rt.base, quoteDelta: -rt.buyUsd });
+      fires.push({ ts: ts(), action: "fill", priceUsd: rt.sellUsd / rt.base, baseDelta: -rt.base, quoteDelta: rt.sellUsd });
+    }
+    const edge = tradeEdgeFromFires(fires)!;
+
+    expect(live.closes).toBe(edge.closes);
+    expect(live.wins).toBe(edge.wins);
+    expect(live.losses).toBe(edge.losses);
+    expect(live.winRatePct).toBeCloseTo(edge.winRatePct!, 9);
+    expect(live.profitFactor).toBeCloseTo(edge.profitFactor!, 9);
+    expect(live.payoffRatio).toBeCloseTo(edge.payoffRatio!, 9);
+    expect(live.avgWinUsd).toBeCloseTo(edge.avgWinUsd!, 9);
+    expect(live.avgLossUsd).toBeCloseTo(edge.avgLossUsd!, 9);
+    expect(live.avgRealizedPerClose).toBeCloseTo(edge.expectancyUsd!, 9);
+    expect(live.realizedUsd).toBeCloseTo(edge.realizedUsd, 9);
+  });
 });

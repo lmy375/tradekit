@@ -33,6 +33,12 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 121 — edge 单一来源：让"每个关口的 edge 一致"成为结构保证而非手工巧合（one edge derivation — make "edge reads identically at every trust gate" a structural invariant）** ✅
+- **背景**：edge 弧（v114 实盘对比 → v115 promote → v120 回测）把 profit factor/payoff/expectancy 铺到了每个信任关口。但**这套推导被写了两遍**——`computeStrategyComparison`（实盘，内联）和 `tradeEdgeFromFires`（回测）各算各的，靠人工对齐保持一致。这正是 costBasis.ts 当初为成本基础消灭的那类结构债：将来谁改了 flat-epsilon、改了"无亏损时 profit factor 记 null"的规则、或动了 payoff 的判空，两处就会**悄悄漂移**，而"edge 在每个关口一致可见"（整条弧的全部意义）就会无声地不再成立
+- 为什么重要：edge 弧的价值**完全建立在一致性上**——promote 用回测/纸面 edge 决定是否上真钱，如果实盘 edge 与回测 edge 用两套悄悄分叉的公式算出来，整个信任管道的判断基础就是假的。一致性必须是结构保证，不能是"目前恰好相等"
+- 实现（沿用 v71/v85/v100 的"单一来源"纪律）：把 win/loss 分类（按 EDGE_FLAT_USD）+ gross win/loss 累加 + profit factor/payoff/avg win-loss/expectancy 推导抽成 costBasis.ts 里**一个** `computeEdge(realizedPerClose)`（纯函数，返回 EdgeMetrics）。调用方各自做成本基础游走（实盘用 value_usd、回测用 quote≈USD），只把**逐平仓 realized $** 交给它——edge 由构造保证不可能跨面分叉。`computeStrategyComparison` 的 Acc 改为收集 `realizedCloses[]`、终态调 `computeEdge` 映射到现有 StrategyPerformance 字段（公开形状零变化）；`tradeEdgeFromFires` 同样收集 realized 后调 `computeEdge`，`TradeEdge` 现即 `EdgeMetrics`。promoteCheck 经 gatherStrategyComparison 透传，自动跟随
+- 测试覆盖：+4——computeEdge 单测（PF 3.5/payoff 1.75/expectancy；无亏损→PF&payoff null、sub-epsilon 平仓算 close 但不计胜负；空→0 closes 全 null）+**跨面一致性守卫**：同一组 round-trips 分别走实盘对比（StrategyTradeLite）和回测（BacktestFire），断言 closes/wins/losses/winRate/PF/payoff/avgWin/avgLoss/expectancy/realized 全部逐项相等；3615 测试全绿（+4）
+
 **Phase 120 — edge 进回测：在最早的验证关口就看"有没有 edge"（trade-level edge in the backtest — profit factor/payoff/expectancy at the FIRST trust gate）** ✅
 - **把 edge 信号补到信任管道的最前端**：信任管道是 backtest→paper→promote→live。v114 给实盘对比、v115 给 promote 加了 edge（profit factor/payoff/expectancy），但**回测**（最早的验证关口，连 paper 都还没到）只有权益曲线指标（return/drawdown/sharpe），**没有交易级 edge**。一个回测 +50% 收益、却由一笔幸运历史交易主导（其余 profit factor < 1）的策略，看 return 很漂亮、实则无 edge——而这本该在回测时就被发现
 - 为什么重要：让 edge 在每一个信任关口一致可见（回测→paper 对比→promote→实盘），把"无 edge 的策略"挡在最便宜的关口（回测，零真钱零纸面时间）。return 单看会被运气主导；profit factor 才说明策略是否真的会挑赢家
