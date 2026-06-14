@@ -59,6 +59,9 @@ import { buildStrategyReport, type ReportMode, type ReportWindow, type ReportSec
 import { readEngineStatus } from "./engine.js";
 import { getEngineLockState } from "./engineLock.js";
 import { gatherStatusReport, ALL_SECTIONS, type SectionName } from "./status.js";
+import { loadConfig } from "./config.js";
+import { reviewSafety } from "./safetyReview.js";
+import { gatherSafetyHeadroom } from "./safetyHeadroom.js";
 
 // ── shared helpers ──────────────────────────────────────────
 
@@ -725,6 +728,23 @@ export function registerAutomationRoutes(app: Express): void {
       }
       const report = await buildStrategyReport({ tag, window, mode, sections });
       res.json({ ok: true, report });
+    }),
+  );
+
+  // ── safety (v68) ──────────────────────────────────────────
+  // Web parity for the operator-trust surfaces: the v51 config posture
+  // (what's configured / what's wide open) + the v53 runtime headroom (how
+  // much room is left, what's the binding constraint). Read-only,
+  // deterministic (config + the trades/drawdown tables; no RPC) — the same
+  // pull operators get from `safety review` / `safety headroom` on the CLI,
+  // now consumable by the web dashboard + any external monitor.
+  app.get(
+    "/api/safety",
+    wrap((_req, res) => {
+      const config = loadConfig();
+      const posture = reviewSafety(config);
+      const headroom = gatherSafetyHeadroom({ config });
+      res.json({ ok: true, posture, headroom });
     }),
   );
 }

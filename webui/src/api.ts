@@ -681,3 +681,39 @@ export const getExecutionReport = (params: { since?: string; chain?: string } = 
   if (params.chain) qs.set("chain", params.chain);
   return api.get<ExecutionReportResp>(`/api/execution?${qs}`);
 };
+
+export type SafetyVerdict = "hardened" | "moderate" | "exposed";
+export type GuardrailState = "active" | "off" | "partial";
+export type GapSeverity = "critical" | "warn" | "info";
+export type HeadroomStatus = "ok" | "approaching" | "exhausted" | "tripped";
+
+export interface SafetyResp {
+  ok: true;
+  posture: {
+    generatedAt: string;
+    verdict: SafetyVerdict;
+    counts: { critical: number; warn: number; info: number; activeGuardrails: number; totalGuardrails: number };
+    guardrails: Array<{ key: string; label: string; category: string; state: GuardrailState; detail: string }>;
+    gaps: Array<{ key: string; severity: GapSeverity; finding: string; fix: string }>;
+  };
+  headroom: {
+    generatedAt: string;
+    account: string;
+    chain: string | null;
+    entries: Array<{
+      key: string;
+      label: string;
+      scope: string;
+      limit: number | null;
+      used: number | null;
+      remaining: number | null;
+      utilizationPct: number | null;
+      status: HeadroomStatus;
+      detail: string;
+    }>;
+    binding: SafetyResp["headroom"]["entries"][number] | null;
+    counts: { ok: number; approaching: number; exhausted: number; tripped: number };
+  };
+}
+
+export const getSafety = () => api.get<SafetyResp>("/api/safety");

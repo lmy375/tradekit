@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 68 — 安全态势上 Web（safety posture & headroom on the dashboard — close the last interface gap）** ✅
+- **补齐唯一缺位的一等界面，而非加新能力**：tradekit 三大界面是 CLI / MCP / Web。安全是这个产品**最重要的东西**（agent 拿真钱交易，运营商的信任全系于护栏）。v51 `safety review`（配置审计：哪些护栏开着/哪里裸奔）+ v53 `safety headroom`（运行时余量：还剩多少、谁是约束瓶颈）此前只在 CLI/MCP——Web 仪表盘**完全看不到安全态势**。运营商盯着 dashboard 时，恰恰看不到最该看的东西
+- 缺口：Web 有 Execution/PnL/Approvals 等 13 个 tab，唯独没有"这套配置安不安全 / 限额还剩多少"。运营商要么切到终端跑 `safety review`，要么裸奔。Web 是运营商日常盯盘的地方——安全态势就该在那
+- 实现（一个 payload 合并两个既有只读视图，零新计算）：在**可测的** `registerAutomationRoutes` 注册器里加 `GET /api/safety` → `{ ok, posture: reviewSafety(config), headroom: gatherSafetyHeadroom({config}) }`。确定性、无 RPC（只读 config + trades/drawdown 表）。React `Safety.tsx` 镜像 `Execution.tsx`（只读、防御性 null 处理）：verdict 徽章（hardened/moderate/exposed 配色）+ 计数卡（active 护栏/critical 缺口/警告/约束瓶颈利用率）+ 缺口表（severity 配色 + 修复命令）+ 运行时余量表（利用率/状态配色）+ 护栏清单
+- 为何走 `registerAutomationRoutes` 而非 web.ts 内联：那个注册器是**可单元测试**的（`webAutomation.test.ts` 真起 `app.listen` 打真 HTTP），web.ts 的内联分析路由在一个大函数里测不到。把 API 放进注册器 → API 完全可验证（不依赖 React 渲染）
+- 测试覆盖：`webAutomation.test.ts` +1（`/api/safety` 返回 posture（verdict ∈ 三态、totalGuardrails>0、guardrails/gaps 数组）+ headroom（entries 数组、counts 有 ok/tripped 键））；webui `tsc -b` + `vite build` 全过（React 编译 + 打包验证）
+- 向后兼容：纯加法——新路由、新 React tab、api.ts 新 `getSafety`/`SafetyResp`；既有界面不变；3303 测试全绿（+1）
+- v1 限制：Web 视图只读（改护栏仍走 CLI `config` / `safety` 命令——故意，配置变更是高权操作不放 Web）；headroom 取 default account（与 CLI 默认一致）；React 渲染本身无单元测试（靠 tsc + build 防编译错 + 镜像久经考验的 Execution.tsx 形状降风险）
+
 **Phase 67 — 退出决策合流（price context into open positions — one-read exit view）** ✅
 - **连贯收尾，非新增 surface**：v64 price context（入场时机）、v65 open positions（退出：PnL+持有期+税务 term）、v66 序列缓存。v65 的退出视图缺了 v64 提供的那一项——**当前价在近期区间的哪个位置**（近高=好平仓点，近低=也许持有），这对退出时机是决定性的。v66 刚把"每仓位拉一次序列"变得可负担（缓存+去重），合流时机正好
 - agent 退出决策需要三样：盈亏（有）、税务影响（term，有）、**现在价格好不好**（区间位置——此前不在 open_positions）。补上第三样 → open_positions 成为**一次调用的完整退出决策面**，agent 不必再额外为每个仓位调 price_context、也不会漏判

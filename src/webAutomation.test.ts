@@ -744,3 +744,31 @@ describe("/api/intents", () => {
     expect((await get("/api/intents?status=bogus")).status).toBe(400);
   });
 });
+
+describe("/api/safety", () => {
+  it("returns the config posture + runtime headroom in one payload", async () => {
+    const r = await get("/api/safety");
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+
+    const posture = r.body.posture as {
+      verdict: string;
+      counts: { critical: number; warn: number; info: number; activeGuardrails: number; totalGuardrails: number };
+      guardrails: unknown[];
+      gaps: unknown[];
+    };
+    expect(["hardened", "moderate", "exposed"]).toContain(posture.verdict);
+    expect(posture.counts.totalGuardrails).toBeGreaterThan(0);
+    expect(Array.isArray(posture.guardrails)).toBe(true);
+    expect(Array.isArray(posture.gaps)).toBe(true);
+
+    const headroom = r.body.headroom as {
+      entries: unknown[];
+      binding: unknown;
+      counts: { ok: number; approaching: number; exhausted: number; tripped: number };
+    };
+    expect(Array.isArray(headroom.entries)).toBe(true);
+    expect(headroom.counts).toHaveProperty("ok");
+    expect(headroom.counts).toHaveProperty("tripped");
+  });
+});
