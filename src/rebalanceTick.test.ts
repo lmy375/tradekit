@@ -676,3 +676,69 @@ describe("runRebalanceTick — v33 pending-legs guard", () => {
   });
 
 });
+
+// ── v62: failure circuit-breaker ─────────────────────────────
+
+describe("runRebalanceTick — failure circuit-breaker (v62)", () => {
+  const reDue = (id: number) =>
+    openDb().prepare("UPDATE rebalance_plans SET next_run_at = ? WHERE id = ?").run(PAST, id);
+  const terminalErr = () =>
+    Object.assign(new Error("nope"), { code: "INVALID_PARAMS" });
+  const failTick = async (id: number) => {
+    reDue(id);
+    return tick({ fetchPortfolio: async () => { throw terminalErr(); } });
+  };
+
+  it("increments consecutive_failures on terminal failures and resets on a successful run", async () => {
+    const id = seedPlan();
+    await failTick(id);
+    expect(getRebalancePlanById(id)!.consecutive_failures).toBe(1);
+    await failTick(id);
+    expect(getRebalancePlanById(id)!.consecutive_failures).toBe(2);
+    // A successful run (empty-portfolio no-op → recordRebalanceRun) resets it.
+    reDue(id);
+    await tick({ fetchPortfolio: async () => snapshotOf([]) });
+    expect(getRebalancePlanById(id)!.consecutive_failures).toBe(0);
+  });
+
+  it("auto-pauses the plan once the streak hits the threshold (enabled)", async () => {
+    const { loadConfig, saveConfig } = await import("./config.js");
+    const cfg = loadConfig();
+    saveConfig({ ...cfg, engine: { ...cfg.engine, rebalanceCircuitBreaker: { enabled: true, maxConsecutiveFailures: 3 } } } as never);
+    try {
+      const id = seedPlan();
+      await failTick(id);
+      await failTick(id);
+      expect(getRebalancePlanById(id)!.status).toBe("active");
+      const report = await failTick(id);
+      const row = getRebalancePlanById(id)!;
+      expect(row.consecutive_failures).toBe(3);
+      expect(row.status).toBe("paused");
+      expect(report.fires.find((f) => f.planId === id)?.circuitBroken).toBe(true);
+    } finally {
+      saveConfig(cfg);
+    }
+  });
+
+  it("does NOT auto-pause when the breaker is disabled (default)", async () => {
+    const id = seedPlan();
+    for (let i = 0; i < 5; i++) await failTick(id);
+    const row = getRebalancePlanById(id)!;
+    expect(row.consecutive_failures).toBe(5);
+    expect(row.status).toBe("active");
+  });
+
+  it("operator resume clears the streak", async () => {
+    const { resumeRebalancePlan, pauseRebalancePlan } = await import("./db.js");
+    const id = seedPlan();
+    await failTick(id);
+    await failTick(id);
+    expect(getRebalancePlanById(id)!.consecutive_failures).toBe(2);
+    pauseRebalancePlan(id);
+    expect(getRebalancePlanById(id)!.consecutive_failures).toBe(2);
+    resumeRebalancePlan(id, PAST);
+    const row = getRebalancePlanById(id)!;
+    expect(row.status).toBe("active");
+    expect(row.consecutive_failures).toBe(0);
+  });
+});

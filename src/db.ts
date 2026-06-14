@@ -1305,6 +1305,14 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE schedules ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
   `,
+
+  // v62 — extend the failure circuit-breaker to rebalance plans (the other
+  // cron-firing-forever primitive). Same semantics as the schedules column:
+  // incremented on a terminal failed tick, reset on a successful run and on
+  // operator resume.
+  `
+  ALTER TABLE rebalance_plans ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -4527,6 +4535,10 @@ export interface RebalanceRow {
   /** v32: consecutive transient failures for the CURRENT occurrence
    *  (see ScheduleRow.retry_count). */
   retry_count: number;
+  /** v62: consecutive TERMINAL failed ticks (resets on a successful run
+   *  and on operator resume). The engine's opt-in rebalanceCircuitBreaker
+   *  auto-pauses the plan when this crosses its threshold. */
+  consecutive_failures: number;
   last_run_at: string | null;
   last_run_status: string | null;
   last_run_executed_count: number | null;
@@ -4767,7 +4779,8 @@ export function recordRebalanceRun(
        last_error_code = NULL,
        last_error_message = NULL,
        run_count = run_count + 1,
-       retry_count = 0
+       retry_count = 0,
+       consecutive_failures = 0
      WHERE id = ?`,
   ).run(
     newStatus, now, run.nextRunAt, now, run.status,
@@ -4784,7 +4797,7 @@ export function recordRebalanceError(
   nextRunAt: string,
   errorCode: string,
   errorMessage: string,
-): void {
+): number {
   const db = openDb();
   const now = new Date().toISOString();
   // run_count NOT incremented on failure — same fires-only contract as
@@ -4798,9 +4811,14 @@ export function recordRebalanceError(
        last_run_status = 'failed',
        last_error_code = ?,
        last_error_message = ?,
-       retry_count = 0
+       retry_count = 0,
+       consecutive_failures = consecutive_failures + 1
      WHERE id = ?`,
   ).run(now, nextRunAt, now, errorCode, capAuditText(errorMessage), id);
+  // v62: return the new streak so the tick can decide whether to trip the
+  // circuit-breaker (mirrors recordScheduleError).
+  const r = db.prepare("SELECT consecutive_failures AS n FROM rebalance_plans WHERE id = ?").get(id) as { n: number } | undefined;
+  return r?.n ?? 0;
 }
 
 /** v33: defer a rebalance evaluation WITHOUT consuming run quota or
@@ -4854,8 +4872,11 @@ export function resumeRebalancePlan(id: number, nextRunAt: string): number {
   if (!existing) return 0;
   if (existing.status !== "paused") return -1;
   const now = new Date().toISOString();
+  // v62: resuming is a fresh start — clear the consecutive-failure streak so
+  // a re-enabled plan (e.g. after a circuit-breaker trip the operator fixed)
+  // isn't instantly re-paused by stale failures.
   const r = db
-    .prepare(`UPDATE rebalance_plans SET status = 'active', next_run_at = ?, updated_at = ? WHERE id = ?`)
+    .prepare(`UPDATE rebalance_plans SET status = 'active', next_run_at = ?, updated_at = ?, consecutive_failures = 0 WHERE id = ?`)
     .run(nextRunAt, now, id);
   return Number(r.changes);
 }

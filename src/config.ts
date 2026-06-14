@@ -761,13 +761,27 @@ const engineSchema = z
      * (bad config, dead pool, a token that always fails its honeypot probe)
      * — would otherwise fire-and-fail forever, burning gas on every revert
      * and only surfacing via pull (digest/health) or a strategyAlerts
-     * notification. When enabled, the engine AUTO-PAUSES a schedule once its
-     * consecutive TERMINAL fire failures reach maxConsecutiveFailures, and
-     * notifies (critical). The operator investigates + `schedule resume`
+     * notification. When enabled, the engine AUTO-PAUSES the schedule once
+     * its consecutive TERMINAL fire failures reach maxConsecutiveFailures,
+     * and notifies (critical). The operator investigates + `schedule resume`
      * (which clears the streak). Default OFF — opt-in, so existing
      * deployments keep the fire-each-occurrence-independently DCA semantic.
      */
     scheduleCircuitBreaker: z
+      .object({
+        enabled: z.boolean().default(false),
+        maxConsecutiveFailures: z.number().int().min(2).max(100).default(5),
+      })
+      .strict()
+      .default({ enabled: false, maxConsecutiveFailures: 5 }),
+    /**
+     * v62: the same breaker for REBALANCE plans — the other cron-firing-
+     * forever primitive. Separate knob from scheduleCircuitBreaker so the
+     * two cadences can be tuned independently (and so v61 adopters' existing
+     * scheduleCircuitBreaker config keeps working unchanged). Same shape +
+     * default-off semantics; both route through the shared circuit-breaker.
+     */
+    rebalanceCircuitBreaker: z
       .object({
         enabled: z.boolean().default(false),
         maxConsecutiveFailures: z.number().int().min(2).max(100).default(5),

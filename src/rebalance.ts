@@ -60,6 +60,7 @@ import {
 import { planTransientRetry } from "./schedules.js";
 import { parseCron, nextRun } from "./cron.js";
 import { tryNotify } from "./notify.js";
+import { tripCircuitBreakerIfNeeded } from "./circuitBreaker.js";
 import { loadWallet, loadReadOnlyWallet } from "./wallet.js";
 import { holdingsOnChain } from "./holdings.js";
 import { chainHoldingsToSnapshot, type PortfolioSnapshot, type PortfolioToken } from "./positionLimits.js";
@@ -619,6 +620,9 @@ export interface RebalanceFireReport {
   errorCode?: string;
   errorMessage?: string;
   nextRunAt?: string;
+  /** v62: true when this terminal failure tripped the circuit-breaker and
+   *  the plan was auto-paused. */
+  circuitBroken?: boolean;
 }
 
 export interface RebalanceTickReport {
@@ -803,6 +807,31 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
     } catch (e) {
       args.logger.debug(`rebalance journal write failed (#${entry.planId} ${entry.decision}): ${(e as Error).message}`);
     }
+  };
+
+  // v62: failure circuit-breaker (shared with schedules). After a TERMINAL
+  // failed tick, recordRebalanceError returns the new consecutive-failure
+  // count; the shared helper auto-pauses the plan + pages the operator once
+  // it crosses the threshold — so a persistently-reverting rebalance stops
+  // bleeding gas on every cron window. Returns true when it paused.
+  const maybeCircuitBreak = async (plan: RebalanceRow, failCount: number, lastCode: string): Promise<boolean> => {
+    const broken = await tripCircuitBreakerIfNeeded({
+      kind: "rebalance",
+      id: plan.id!,
+      name: plan.name,
+      chain: plan.chain,
+      account: plan.account,
+      failCount,
+      lastCode,
+      breaker: config.engine.rebalanceCircuitBreaker,
+      pause: dbPauseRebalancePlan,
+      config,
+      logger: args.logger,
+    });
+    if (broken) {
+      journal({ planId: plan.id!, decision: "failed", notes: `circuit-breaker: auto-paused after ${failCount} consecutive failures` });
+    }
+    return broken;
   };
 
   const realFetcher = args.fetchPortfolio ?? defaultFetchPortfolio;
@@ -1045,12 +1074,14 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
       }
       const attemptsMade = plan.retry_count ?? 0;
       const exhausted = isTransientErrorCode(code) && attemptsMade > 0;
-      recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
+      const failCount = recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
       journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: exhausted ? `evaluation skipped after ${attemptsMade + 1} attempts: ${msg.slice(0, 150)}` : msg.slice(0, 200) });
       failed += 1;
+      const broken = await maybeCircuitBreak(plan, failCount, code);
       fires.push({
         planId: plan.id, name: plan.name, status: "failed", executed: [], skipped: [],
         errorCode: code, errorMessage: msg, nextRunAt: nextAt.toISOString(),
+        ...(broken ? { circuitBroken: true } : {}),
       });
       await tryNotify(
         {
@@ -1213,12 +1244,14 @@ export async function runRebalanceTick(args: RebalanceTickArgs): Promise<Rebalan
         });
         continue;
       }
-      recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
+      const failCount = recordRebalanceError(plan.id, nextAt.toISOString(), code, msg);
       journal({ planId: plan.id, decision: "failed", thresholdPct: plan.drift_threshold_pct, errorCode: code, notes: msg.slice(0, 200) });
       failed += 1;
+      const broken = await maybeCircuitBreak(plan, failCount, code);
       fires.push({
         planId: plan.id, name: plan.name, status: "failed", executed: [], skipped: [],
         errorCode: code, errorMessage: msg, nextRunAt: nextAt.toISOString(),
+        ...(broken ? { circuitBroken: true } : {}),
       });
       continue;
     }

@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 62 — 再平衡失败熔断 + 共享熔断器（circuit-breaker generalized to rebalances）** ✅
+- 完成 v61 显式留的对称跟进：**rebalance plans 和 schedules 一样在 cron 上永久 fire**——一个持续失败的再平衡计划（每 tick 的修正交易都 revert）同样无限烧 gas，同样无自动暂停。把熔断器扩到这另一个"永久 fire"原语
+- **抽出共享 helper `circuitBreaker.ts` 的 `tripCircuitBreakerIfNeeded`**：schedules 和 rebalance 都走它（注入 pause fn + breaker config），机制/消息/dedup 形状不会发散。这让本迭代是真正的"提炼复用"而非复制粘贴——v61 schedules.ts 的内联闭包重构为调用共享 helper（行为不变，v61 的 4 个测试验证）
+- Rebalance 侧镜像 schedule 的全套：v62 migration `rebalance_plans.consecutive_failures`；`recordRebalanceError` 自增并返回 streak；`recordRebalanceRun`（成功/skip）+ `resumeRebalancePlan`（运营商重启）归零；tick 两个终态失败站点都接 `maybeCircuitBreak`（pause via `dbPauseRebalancePlan` + critical 通知 `rebalance.circuit_broken` + fire 标 circuitBroken）
+- **配置：保持 `engine.scheduleCircuitBreaker`（v61）+ 新增 `engine.rebalanceCircuitBreaker`**，两个独立 knob——而非合并成一个。**关键决策修正**：我最初想合并成 `failureCircuitBreaker`（更优雅），但意识到 schema 是 `.strict()` 的——**重命名 v61 已发布的 key 是破坏性变更**：任何带旧 `scheduleCircuitBreaker` 的 config（包括 v61 写入的）会被 strict 拒绝。所以回退到保留旧 key + 加平行 key，向后兼容。两个 knob 也允许 schedule（高频 DCA）与 rebalance（低频）独立调阈值
+- 测试覆盖：`circuitBreaker.test.ts` 7 case（disabled/undefined/阈值下不触发、达到/超过阈值 pause+true、pause no-op race→false、rebalance kind）+ `rebalanceTick.test.ts` +4（streak 递增、成功归零、阈值自动暂停+circuitBroken 标、disabled 不暂停、resume 清零）；v61 schedule 测试零改动通过（重构正确性证明）
+- 向后兼容：纯加法——migration 加列、新 config key 默认关、`recordRebalanceError` 返回值新增（既有 void 调用无碍）；v61 的 scheduleCircuitBreaker **逐字节保留**；3277 测试全绿、零回归、零未捕获异常
+- v1 限制：仍未覆盖 **orders**（fill revert 重试——但 orders 主要是 cheap RPC 检查直到触发，gas-bleed 风险低于 cron 永久 fire 的 schedule/rebalance，优先级低）；两个 breaker knob 独立而非统一（strict schema 下保留 v61 key 的代价，可接受）
+
 **Phase 61 — 计划失败熔断（schedule failure circuit-breaker — stop a broken schedule bleeding gas forever）** ✅
 - **转向引擎自主可靠性**（无人值守 agent 最关键的运行时安全）。真实money-loss向量，后端逻辑确定性可验证
 - 缺口：一个**持续失败**的 schedule（每次 fire 都 revert——坏配置、死池、永远过不了 honeypot 探测的 token）会永远 fire-and-fail：v32 `fireRetry` 只做有界 backoff（3 次后下个 cron slot 顶上，又失败……），`strategyAlerts failure_streak` 只**通知**，**没有任何东西自动暂停**它。代码注释（recordScheduleError）甚至明说"想要 halt-on-error 的运营商可以从通知回调手动暂停"——确认了这个缺口。结果：unattended agent 上一个坏 schedule 每个 cron 窗口烧一次 revert 的 gas，运营商只能靠 pull（digest/health）发现

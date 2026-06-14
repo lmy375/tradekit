@@ -61,6 +61,7 @@ import type { Logger } from "./logger.js";
 import type { ChainProfile } from "./chains.js";
 import { loadWallet, loadReadOnlyWallet } from "./wallet.js";
 import { tryNotify } from "./notify.js";
+import { tripCircuitBreakerIfNeeded } from "./circuitBreaker.js";
 import { validateOnFillSpec } from "./scheduleHooks.js";
 import { validateSpendAmounts } from "./orders.js";
 
@@ -461,41 +462,33 @@ export async function runScheduleTick(args: ScheduleTickArgs): Promise<ScheduleT
     }
   };
 
-  // v61: failure circuit-breaker. After a TERMINAL fire failure,
-  // recordScheduleError returns the new consecutive-failure count; if the
-  // breaker is enabled and the count crossed the threshold, auto-pause the
-  // schedule (stop a persistently-reverting schedule bleeding gas every
-  // window) + page the operator. Returns true when it paused.
-  const breaker = config.engine.scheduleCircuitBreaker;
+  // v61/v62: failure circuit-breaker. After a TERMINAL fire failure,
+  // recordScheduleError returns the new consecutive-failure count; the
+  // shared helper auto-pauses the schedule + pages the operator once it
+  // crosses the threshold (stops a persistently-reverting schedule bleeding
+  // gas every window). Returns true when it paused.
   const maybeCircuitBreak = async (schedule: ScheduleRow, failCount: number, lastCode: string): Promise<boolean> => {
-    if (!breaker?.enabled || failCount < breaker.maxConsecutiveFailures) return false;
-    const paused = dbPauseSchedule(schedule.id!);
-    if (paused <= 0) return false; // not active anymore (race) — nothing to pause
-    journal({
-      scheduleId: schedule.id!,
-      decision: "fire_failed",
-      notes: `circuit-breaker: auto-paused after ${failCount} consecutive failures`,
-    });
-    await tryNotify(
-      {
-        event: "schedule.circuit_broken",
-        severity: "critical",
-        title: `Schedule #${schedule.id}${schedule.name ? ` (${schedule.name})` : ""} AUTO-PAUSED — ${failCount} consecutive failures`,
-        body: `The circuit-breaker tripped after ${failCount} consecutive terminal fire failures (threshold ${breaker.maxConsecutiveFailures}; last error ${lastCode}). The schedule is paused so it stops retrying and burning gas. Investigate, then \`tradekit schedule resume ${schedule.id}\` to re-enable (clears the streak).`,
-        fields: {
-          id: schedule.id,
-          chain: schedule.chain,
-          account: schedule.account,
-          consecutiveFailures: failCount,
-          threshold: breaker.maxConsecutiveFailures,
-          lastErrorCode: lastCode,
-        },
-        dedupKey: `schedule.circuit_broken:${schedule.id}`,
-      },
+    const broken = await tripCircuitBreakerIfNeeded({
+      kind: "schedule",
+      id: schedule.id!,
+      name: schedule.name,
+      chain: schedule.chain,
+      account: schedule.account,
+      failCount,
+      lastCode,
+      breaker: config.engine.scheduleCircuitBreaker,
+      pause: dbPauseSchedule,
       config,
-      args.logger,
-    );
-    return true;
+      logger: args.logger,
+    });
+    if (broken) {
+      journal({
+        scheduleId: schedule.id!,
+        decision: "fire_failed",
+        notes: `circuit-breaker: auto-paused after ${failCount} consecutive failures`,
+      });
+    }
+    return broken;
   };
 
   // Walk in deterministic id order. dueSchedules already orders by id ASC,
