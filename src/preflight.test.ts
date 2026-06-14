@@ -21,9 +21,11 @@ function makePreview(overrides?: {
   balanceFractionPct?: number;
   hasSufficientAllowance?: boolean;
   marketContext?: TradePreviewReport["marketContext"];
+  mevExposure?: TradePreviewReport["mevExposure"];
 }): TradePreviewReport {
   return {
     ...(overrides?.marketContext ? { marketContext: overrides.marketContext } : {}),
+    ...(overrides?.mevExposure ? { mevExposure: overrides.mevExposure } : {}),
     chain: "base",
     direction: "buy",
     baseToken: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" as Address,
@@ -391,6 +393,30 @@ describe("combinePreflightVerdict — portfolio gates (v73)", () => {
   it("portfolio fetch error → a check_skipped reason, no crash", () => {
     const r = combinePreflightVerdict({ preview: makePreview(), portfolio: { error: "rpc down" } });
     expect(r.reasons.find((x) => x.source === "portfolio" && x.code === "check_skipped")).toBeDefined();
+  });
+});
+
+describe("combinePreflightVerdict — MEV exposure (v77)", () => {
+  const exposed = { chain: "ethereum", protected: false, sandwichRisk: "high" as const, exposed: true, advisory: "Public-mempool submission on ethereum (high sandwich risk) with NO MEV protection." };
+  const safe = { chain: "ethereum", protected: true, relayLabel: "Flashbots", sandwichRisk: "high" as const, exposed: false, advisory: "MEV-protected via Flashbots." };
+
+  it("an exposed chain (no protection) → caution with mev_exposed", () => {
+    const r = combinePreflightVerdict({ preview: makePreview({ mevExposure: exposed }) });
+    expect(r.verdict).toBe("caution");
+    const reason = r.reasons.find((x) => x.code === "mev_exposed")!;
+    expect(reason.severity).toBe("warn");
+    expect(reason.message).toMatch(/NO MEV protection/);
+  });
+
+  it("MEV-protected → no mev_exposed reason, stays go", () => {
+    const r = combinePreflightVerdict({ preview: makePreview({ mevExposure: safe }) });
+    expect(r.verdict).toBe("go");
+    expect(r.reasons.find((x) => x.code === "mev_exposed")).toBeUndefined();
+  });
+
+  it("absent mevExposure → no mev reason", () => {
+    const r = combinePreflightVerdict({ preview: makePreview() });
+    expect(r.reasons.find((x) => x.code === "mev_exposed")).toBeUndefined();
   });
 });
 

@@ -405,6 +405,14 @@ export async function tradePreviewCommand(
       console.log(`    ${mc.summary}`);
       for (const n of mc.notes) console.log(`    • ${n}`);
     }
+    // v77: MEV/sandwich exposure of submitting on this chain.
+    if (report.mevExposure) {
+      const m = report.mevExposure;
+      const mark = m.protected ? "🛡 protected" : m.exposed ? "🟡 EXPOSED" : "⚪ n/a";
+      console.log("");
+      console.log(`  MEV protection:    ${mark}`);
+      console.log(`    ${m.advisory}`);
+    }
     if (report.alternatives && report.alternatives.length > 0) {
       console.log("");
       console.log(`  Aggregator alternatives (best-of-N race):`);

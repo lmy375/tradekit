@@ -151,6 +151,17 @@ describe("concentration limit (v72)", () => {
   });
 });
 
+describe("MEV protection guardrail (v77)", () => {
+  it("is a gap (info) + reads off when no private relay is configured", () => {
+    const r = review({ perTxUsdLimit: 10 });
+    expect(rail(r, "mevProtection").state).toBe("off");
+    const g = gap(r, "mevProtection");
+    expect(g).not.toBeNull();
+    expect(g!.severity).toBe("info");
+    expect(g!.finding).toMatch(/sandwich/i);
+  });
+});
+
 describe("safetyPromoteBlocker — the v52 promote gate", () => {
   it("blocks on a critical gap (no USD ceiling), naming the finding + fix", () => {
     const blocker = safetyPromoteBlocker(review());

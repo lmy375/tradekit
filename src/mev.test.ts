@@ -16,7 +16,9 @@ import {
   buildSubmitTransport,
   redactPrivateRpcUrl,
   probeMevRpc,
+  assessMevExposure,
 } from "./mev.js";
+import type { MevConfig } from "./config.js";
 import { configSchema, redactConfigForDisplay } from "./config.js";
 import { redactSensitiveFields } from "./db.js";
 import { http } from "viem";
@@ -310,5 +312,49 @@ describe("probeMevRpc — fetch mocked", () => {
     fetchSpy.mockRejectedValueOnce(new TypeError("fetch failed"));
     const fail = await probeMevRpc("https://rpc.flashbots.net/fast", 1);
     expect(typeof fail.elapsedMs).toBe("number");
+  });
+});
+
+describe("assessMevExposure (v77)", () => {
+  const mev = (over: Partial<MevConfig> = {}): MevConfig =>
+    ({ enabled: false, privateRpcs: {}, labels: {}, fallbackToPublic: false, ...over }) as MevConfig;
+
+  it("Ethereum mainnet with NO protection → exposed (high sandwich risk)", () => {
+    const r = assessMevExposure("ethereum", mev());
+    expect(r.sandwichRisk).toBe("high");
+    expect(r.protected).toBe(false);
+    expect(r.exposed).toBe(true);
+    expect(r.advisory).toMatch(/NO MEV protection/);
+  });
+
+  it("Ethereum WITH an active private relay → protected, not exposed", () => {
+    const r = assessMevExposure("ethereum", mev({ enabled: true, privateRpcs: { ethereum: "https://rpc.flashbots.net/fast" }, labels: { ethereum: "Flashbots" } }));
+    expect(r.protected).toBe(true);
+    expect(r.exposed).toBe(false);
+    expect(r.relayLabel).toBe("Flashbots");
+    expect(r.advisory).toMatch(/protected/i);
+  });
+
+  it("BNB / Polygon are medium risk → exposed without protection", () => {
+    expect(assessMevExposure("bnb", mev()).exposed).toBe(true);
+    expect(assessMevExposure("polygon", mev()).sandwichRisk).toBe("medium");
+  });
+
+  it("single-sequencer L2s (base/arbitrum/optimism) are low risk → NOT exposed", () => {
+    for (const c of ["base", "arbitrum", "optimism"]) {
+      const r = assessMevExposure(c, mev());
+      expect(r.sandwichRisk).toBe("low");
+      expect(r.exposed).toBe(false);
+    }
+  });
+
+  it("unknown/custom chains default to low risk (don't over-warn)", () => {
+    expect(assessMevExposure("zkfoo", mev()).sandwichRisk).toBe("low");
+    expect(assessMevExposure("zkfoo", mev()).exposed).toBe(false);
+  });
+
+  it("protection on the same chain clears exposure even at high risk", () => {
+    const r = assessMevExposure("ethereum", mev({ enabled: true, privateRpcs: { ethereum: "https://x" } }));
+    expect(r.exposed).toBe(false);
   });
 });

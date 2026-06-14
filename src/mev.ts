@@ -69,6 +69,67 @@ export function resolveMevSubmit(mev: MevConfig | undefined, chainName: string):
   };
 }
 
+// ── exposure assessment (v77) ────────────────────────────────
+
+export type SandwichRisk = "high" | "medium" | "low";
+
+/**
+ * Per-chain sandwich exposure of NAIVE (public-mempool) submission. Ethereum
+ * mainnet has the deepest public mempool + MEV ecosystem → high. BNB / Polygon
+ * have active public mempools → medium. The major L2s route through a single
+ * sequencer (no public mempool to front-run today) → low. Documented constants,
+ * not vibes; unknown/custom chains default low (don't over-warn).
+ */
+const SANDWICH_RISK: Record<string, SandwichRisk> = {
+  ethereum: "high",
+  bnb: "medium",
+  polygon: "medium",
+  base: "low",
+  arbitrum: "low",
+  optimism: "low",
+};
+
+export interface MevExposure {
+  chain: string;
+  /** Is an MEV-protected submission path active for this chain? */
+  protected: boolean;
+  /** Relay label when protected. */
+  relayLabel?: string;
+  /** How exposed public-mempool submission is to sandwiching here. */
+  sandwichRisk: SandwichRisk;
+  /** True when the sandwich risk is meaningful (high/medium) AND no protection
+   *  is active — i.e. trades on this chain leak to MEV bots right now. */
+  exposed: boolean;
+  /** Plain-language advisory for the operator/agent. */
+  advisory: string;
+}
+
+/**
+ * Pure: assess whether trades on `chainName` are exposed to MEV/sandwiching
+ * given the mev config. Composes resolveMevSubmit (is protection active?) with
+ * the chain's public-mempool risk. No IO — chain + config only, so it's free
+ * to surface at the pre-trade decision point.
+ */
+export function assessMevExposure(chainName: string, mev: MevConfig | undefined): MevExposure {
+  const key = chainName.toLowerCase();
+  const submit = resolveMevSubmit(mev, chainName);
+  const sandwichRisk = SANDWICH_RISK[key] ?? "low";
+  const exposed = !submit.active && (sandwichRisk === "high" || sandwichRisk === "medium");
+  const advisory = submit.active
+    ? `MEV-protected via ${submit.label ?? "private relay"}.`
+    : exposed
+      ? `Public-mempool submission on ${chainName} (${sandwichRisk} sandwich risk) with NO MEV protection — trades can be sandwiched (typically 0.5–3% leak, worse on illiquid pairs). Configure mev.privateRpcs.${key} (e.g. Flashbots Protect / MEV Blocker).`
+      : `${chainName} has ${sandwichRisk} sandwich risk; no MEV protection configured.`;
+  return {
+    chain: chainName,
+    protected: submit.active,
+    relayLabel: submit.active ? submit.label : undefined,
+    sandwichRisk,
+    exposed,
+    advisory,
+  };
+}
+
 // ── transport construction ───────────────────────────────────
 
 /**

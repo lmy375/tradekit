@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 77 — MEV 暴露进决策点（MEV/sandwich exposure surfaced at the pre-trade decision — stop the silent 0.5-3%/trade leak）** ✅
+- **换轴：执行路径的钱漏，而非又一个仓位/组合检测面**：连续多期在仓位/组合风险检测。本期转向一个真实且持续的**钱漏**：MEV/三明治攻击。在公共内存池链（尤其 Ethereum 主网）上，裸提交的交易会被 MEV bot 夹击套利，典型损失每笔 0.5-3%、illiquid 对更高。tradekit **早有** MEV 保护（mev.ts 私有中继传输 Flashbots/MEV Blocker），但保护状态**只在 safety review 的滑点脚注里提了一句**，**preflight/preview 完全不提**——agent 在主网无保护下单时拿到的是"GO"，毫无即将漏给夹击 bot 的提示
+- 为什么是最重要的：安全 = 不因可预防的错误亏钱。MEV 是**每笔交易**的隐形复利损失。over-concentration/over-sizing/裸仓是组合级爆仓源；MEV 是**执行级**的持续失血。把它放进 agent 的下单决策点（preflight 裁决），让坏的执行路径在下单前就被看见
+- **关键优势：纯函数、零成本**：MEV 暴露评估是**纯配置逻辑**（链 + config，无 RPC）——不像 concentration/portfolio 需要拉链上数据。所以放进 preview/preflight 是**免费的**，比 v69 timing（需拉序列）更轻
+- 实现：(1) 纯函数 `assessMevExposure(chain, mevConfig)` → { protected, sandwichRisk (high/medium/low), exposed, advisory }，复用既有 `resolveMevSubmit`（保护是否激活）+ 文档化的每链三明治风险（ethereum=high、bnb/polygon=medium、base/arbitrum/optimism 单 sequencer=low、未知=low 不过度告警）；exposed = 高/中风险链 且 无保护；(2) `tradePreview` 加 `mevExposure` 字段（纯、免费）；(3) preflight combiner 加 `mev_exposed` reason（warn→caution；建议非阻断——是成本非安全违规，部分运营商接受）；(4) `safetyReview` 加 MEV 保护一等护栏（配了私有中继→active；没配→info gap "Ethereum 等公共内存池链可被夹击 0.5-3%/笔"）
+- Surfaces：CLI `trade preflight`（reason 自动渲染）+ `trade preview`（🛡protected/🟡EXPOSED + advisory 行）+ `safety review`（护栏 + gap）+ MCP `preview_trade`（返回 mevExposure）/`preflight_trade`（mev_exposed code）描述更新
+- 测试覆盖：`mev.test.ts` +6（主网无保护→exposed high / 主网有中继→protected 不 exposed / bnb-polygon medium→exposed / 单-sequencer L2 low→不 exposed / 未知链默认 low 不过度告警 / 同链保护清除暴露）+ `preflight.test.ts` +3（exposed→caution+mev_exposed / protected→go 无 reason / 缺省→无 reason）+ `safetyReview.test.ts` +1（未配→off+info gap "sandwich"）
+- 向后兼容：纯加法——新纯函数、preview 新字段、新 reason code、新护栏；全部只读纯逻辑（不碰执行/写路径）；3397 测试全绿（+10）
+- v1 限制：链风险是文档化静态分级（L2 sequencer 现状=low，未来若开放内存池需调）；mev_exposed 是建议非阻断（成本非安全违规）；保护"激活"= 配了该链私有中继（不验证中继实际可达——doctor 的 probeMevRpc 管那个）
+
 **Phase 76 — 持仓保护审计（position protection audit — which holdings have NO downside exit, and how much is at risk?）** ✅
 - **补一个真实的风控能力缺口，换个支柱发力（连续 3 期在 preflight，刻意离开）**：自主 agent 不断累积现货持仓。一个**没有保护性退出**（移动止损 / 止损单）的持仓在暴跌中完全裸露——单个无保护的大仓就能击穿整个 book。tradekit 早已分别追踪**开仓持仓**（v65）和**条件单**（trailing / price_below / price_above），但**没有任何地方交叉引用二者**：agent 可以持 $5k 某币、零自动下行退出，而无任何 surface 指出
 - 为什么是最重要的：安全 = 不因可预防的错误亏钱。preflight 把关**入场**，但**已持有的仓位**的下行保护此前是盲区。over-concentration（v72）、over-sizing（v70）之后，"裸奔持仓"是第三类爆仓源——且最隐蔽（仓位一旦建立就脱离了 pre-trade 把关）

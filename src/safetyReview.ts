@@ -252,6 +252,25 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
     );
   }
 
+  // v77: MEV protection — public-mempool chains (Ethereum / BNB / Polygon) leak
+  // 0.5–3% per trade to sandwich bots without a private-relay submission path.
+  const mevChains = config.mev?.enabled ? Object.keys(config.mev.privateRpcs ?? {}).length : 0;
+  g({
+    key: "mevProtection",
+    label: "MEV protection",
+    category: "execution",
+    state: mevChains > 0 ? "active" : "off",
+    detail: mevChains > 0 ? `private relay on ${mevChains} chain(s)` : "off (public-mempool submission)",
+  });
+  if (mevChains === 0) {
+    gap(
+      "info",
+      "mevProtection",
+      "no MEV protection — trades on public-mempool chains (Ethereum especially) can be sandwiched for 0.5–3% per trade",
+      "tradekit config set mev.enabled true + config set mev.privateRpcs.ethereum <flashbots/mevblocker url>",
+    );
+  }
+
   // ── rate limit ──
   const rateOn = s.minTradeIntervalMs != null && s.minTradeIntervalMs > 0;
   g({

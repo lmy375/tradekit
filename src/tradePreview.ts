@@ -157,6 +157,11 @@ export interface TradePreviewReport {
     timing: import("./priceContext.js").TradeTimingFlag;
     notes: string[];
   };
+  /** v77: MEV/sandwich exposure of submitting this trade on this chain. Pure
+   *  (chain + config, no RPC). `exposed: true` means a public-mempool chain
+   *  with meaningful sandwich risk and NO MEV protection active — the trade
+   *  can leak 0.5–3% to sandwich bots. Always present. */
+  mevExposure?: import("./mev.js").MevExposure;
 }
 
 /**
@@ -558,6 +563,15 @@ export async function previewTrade(args: {
     args.logger.debug(`v69 market context failed: ${(e as Error).message}`);
   }
 
+  // v77: MEV/sandwich exposure — pure (chain + config), so it's free here.
+  let mevExposure: TradePreviewReport["mevExposure"];
+  try {
+    const { assessMevExposure } = await import("./mev.js");
+    mevExposure = assessMevExposure(args.profile.name, args.config.mev);
+  } catch (e) {
+    args.logger.debug(`v77 mev exposure failed: ${(e as Error).message}`);
+  }
+
   return {
     chain: args.profile.name,
     direction: args.direction,
@@ -575,6 +589,7 @@ export async function previewTrade(args: {
     ...(recentFailurePattern ? { recentFailurePattern } : {}),
     ...(limits ? { limits } : {}),
     ...(marketContext ? { marketContext } : {}),
+    ...(mevExposure ? { mevExposure } : {}),
   };
 }
 

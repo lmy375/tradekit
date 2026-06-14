@@ -75,6 +75,7 @@ export interface PreflightReason {
     | "approval_needed"
     | "market_timing_caution"
     | "market_timing_ok"
+    | "mev_exposed"
     | "drawdown_would_trip"
     | "drawdown_approaching"
     | "drawdown_ok"
@@ -138,6 +139,7 @@ export interface PreflightReport {
  *       selling near a low) — advice, nudges to caution, never blocks
  *    8b. drawdown approaching the trip threshold (v73)
  *    8c. post-trade concentration over the configured limit (v73)
+ *    8d. MEV-exposed: public-mempool chain, no protection (v77) — a cost, advisory
  *
  *  Info (still go, but operator should know):
  *    9. balance fraction > 50%
@@ -364,6 +366,19 @@ export function combinePreflightVerdict(args: {
     }
     // verdict 'unconfigured' → no reason (nothing to assert without a limit).
   }
+
+  // v77: MEV/sandwich exposure — a public-mempool chain with no protection
+  // leaks 0.5–3% per trade to sandwich bots. Advisory (warn → caution): it's a
+  // recurring COST, not a safety violation, and some operators accept it.
+  if (args.preview && "mevExposure" in args.preview && args.preview.mevExposure?.exposed) {
+    reasons.push({
+      code: "mev_exposed",
+      severity: "warn",
+      message: args.preview.mevExposure.advisory,
+      source: "preview",
+    });
+  }
+
   if (args.portfolio && "error" in args.portfolio) {
     reasons.push({
       code: "check_skipped",
