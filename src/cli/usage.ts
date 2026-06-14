@@ -120,6 +120,13 @@ TRADING
         projection can't see, so the verdict no longer says go then trips. Fetches
         holdings; --skip-portfolio to skip (auto-skipped when neither gate is set).
         --strict exits 1 when verdict=no_go (iter772 — pipeline gate before actual swap).
+  trade preflight history [--days N] [--verdict go|caution|no_go] [--strategy TAG] [--limit N] [--json]
+        v74: the preflight DECISION JOURNAL. Every preflight run is logged with its
+        verdict — crucially including the caution/no_go runs (trades the agent
+        REFUSED), which leave NO trace in the trades log. The only surface showing
+        the agent's risk JUDGMENT (the bad trades it correctly avoided), plus a
+        verdict breakdown (% flagged caution/no-go). Audit autonomous go/no-go
+        behavior; --verdict no_go to review refused trades. MCP: preflight_history.
         [--base ETH|<addr>] [--quote USDC|<addr>] [--baseAmount|--quoteAmount <n|max>]
         [--slippage <bps>] [--simulate] [--note "..."] [--account <label>] [--chain X]
         [--idempotency-key K]

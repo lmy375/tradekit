@@ -972,3 +972,68 @@ export async function tradePreflightCommand(
     logger.close();
   }
 }
+
+// v74: preflight decision journal — `tradekit trade preflight history`.
+// Every preflight run with its verdict, including the caution/no_go decisions
+// (trades the agent REFUSED) that leave no trace in the trades log. Surfaces
+// the agent's risk discipline for an operator auditing autonomous behavior.
+export async function tradePreflightHistoryCommand(flags: Record<string, string>) {
+  const { listPreflightRuns, preflightVerdictBreakdown } = await import("../db.js");
+  const limit = parseIntFlag(flags["limit"] ?? "20", "--limit", { min: 1, max: 1000 }) ?? 20;
+  const days = parseIntFlag(flags["days"], "--days", { min: 1 });
+  const sinceIso =
+    days != null && days > 0 ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+  const verdict = flags["verdict"];
+  if (verdict != null && !["go", "caution", "no_go"].includes(verdict)) {
+    throw new ToolError("INVALID_PARAMS", `--verdict must be go | caution | no_go (got "${verdict}").`);
+  }
+  const strategy = flags["strategy"];
+  const runs = listPreflightRuns({ limit, verdict, strategy, sinceIso });
+  const breakdown = preflightVerdictBreakdown({ sinceIso, strategy });
+
+  if (flags["json"] === "true") {
+    printJson({
+      ok: true,
+      breakdown,
+      runs: runs.map((r) => ({ ...r, reasons: JSON.parse(r.reasons_json) })),
+    });
+    return;
+  }
+
+  const win = sinceIso ? `last ${days}d` : "all time";
+  console.log(`Preflight decision journal — ${win}`);
+  const refusedPct =
+    breakdown.total > 0 ? (((breakdown.caution + breakdown.no_go) / breakdown.total) * 100).toFixed(0) : "0";
+  console.log(
+    `  Verdicts: ${breakdown.go} go · ${breakdown.caution} caution · ${breakdown.no_go} no-go ` +
+      `(${breakdown.total} total · ${refusedPct}% flagged caution/no-go)`,
+  );
+  if (runs.length === 0) {
+    console.log("  No preflight runs recorded yet.");
+    return;
+  }
+  console.log("");
+  console.log("  When                 Dir   Pair            Verdict   Est$       Top finding");
+  console.log("  " + "-".repeat(98));
+  for (const r of runs) {
+    const when = r.timestamp.slice(0, 19).replace("T", " ");
+    const pair = `${r.base_symbol ?? "?"}/${r.quote_symbol ?? "?"}`.padEnd(15);
+    const badge = r.verdict === "go" ? "🟢 go" : r.verdict === "caution" ? "🟡 caution" : "🔴 no-go";
+    const est = r.est_usd != null ? `$${r.est_usd.toFixed(0)}`.padEnd(10) : "—".padEnd(10);
+    // Show the worst-severity reason as the headline.
+    let topFinding = "";
+    try {
+      const reasons = JSON.parse(r.reasons_json) as Array<{ severity: string; message: string }>;
+      const worst =
+        reasons.find((x) => x.severity === "critical") ??
+        reasons.find((x) => x.severity === "warn") ??
+        reasons[0];
+      topFinding = worst ? worst.message.slice(0, 60) : "";
+    } catch {
+      /* ignore malformed */
+    }
+    console.log(
+      `  ${when}  ${r.direction.padEnd(4)}  ${pair} ${badge.padEnd(10)} ${est} ${topFinding}`,
+    );
+  }
+}

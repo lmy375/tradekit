@@ -531,6 +531,9 @@ export async function runPreflight(args: {
   config: Config;
   logger: Logger;
   accountLabel: string;
+  /** v74: skip persisting this run to the preflight decision journal. Set by
+   *  internal callers that aren't a real agent decision (e.g. a re-check). */
+  skipJournal?: boolean;
 }): Promise<PreflightReport> {
   const { previewTrade } = await import("./tradePreview.js");
   const { checkTokenSafety } = await import("./tokenSafety.js");
@@ -655,13 +658,43 @@ export async function runPreflight(args: {
   const quoteSymbol = !("error" in (preview as object))
     ? (preview as TradePreviewReport).quoteSymbol
     : "?";
+  const timestamp = new Date().toISOString();
+
+  // v74: persist the decision to the preflight journal. The point of capturing
+  // EVERY run (not just go's) is the agent's risk discipline — the caution/no_go
+  // verdicts are trades it refused, otherwise invisible. Best-effort: a journal
+  // write must never break the verdict the caller is waiting on.
+  if (!args.skipJournal) {
+    try {
+      const { insertPreflightRun } = await import("./db.js");
+      const estUsd = !("error" in (preview as object))
+        ? ((preview as TradePreviewReport).metrics.inputUsd ?? null)
+        : null;
+      insertPreflightRun({
+        timestamp,
+        chain: args.profile.name,
+        account: args.accountLabel,
+        direction: args.req.direction,
+        baseSymbol,
+        quoteSymbol,
+        strategy: args.req.strategy ?? null,
+        verdict,
+        estUsd,
+        criticalCount: reasons.filter((r) => r.severity === "critical").length,
+        warnCount: reasons.filter((r) => r.severity === "warn").length,
+        reasonsJson: JSON.stringify(reasons),
+      });
+    } catch (e) {
+      args.logger.debug(`preflight journal write failed: ${(e as Error).message}`);
+    }
+  }
 
   return {
     chain: args.profile.name,
     direction: args.req.direction,
     baseSymbol,
     quoteSymbol,
-    timestamp: new Date().toISOString(),
+    timestamp,
     verdict,
     reasons,
     preview: !("error" in (preview as object)) ? (preview as TradePreviewReport) : undefined,

@@ -216,12 +216,20 @@ async function main() {
         // check that runs preview + token safety + price cross-check + history
         // slippage in parallel and emits a go/caution/no_go verdict.
         else if (action === "preflight") {
-          const dir = positional[2] as "buy" | "sell" | undefined;
-          if (dir !== "buy" && dir !== "sell") {
-            throw subcommandError("trade preflight", dir, ["buy", "sell"]);
+          const sub = positional[2] as string | undefined;
+          // v74: `trade preflight history` — the decision journal (every run's
+          // go/caution/no_go verdict, incl. the trades the agent refused).
+          if (sub === "history" || sub === "log") {
+            const { tradePreflightHistoryCommand } = await import("./cli/trade.js");
+            await tradePreflightHistoryCommand(flags);
+          } else {
+            const dir = sub as "buy" | "sell" | undefined;
+            if (dir !== "buy" && dir !== "sell") {
+              throw subcommandError("trade preflight", dir, ["buy", "sell", "history"]);
+            }
+            const { tradePreflightCommand } = await import("./cli/trade.js");
+            await tradePreflightCommand(dir, flags);
           }
-          const { tradePreflightCommand } = await import("./cli/trade.js");
-          await tradePreflightCommand(dir, flags);
         }
         // v45: unfence an in-flight idempotency key after the operator
         // verified nothing was sent (process died mid-execution).

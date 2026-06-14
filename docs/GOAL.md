@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 74 — preflight 决策日志（preflight decision journal — make the agent's risk JUDGMENT visible, including the trades it refused）** ✅
+- **补问责支柱的最大缺口，而非又一个 pre-trade 面**：连续多期把 pre-trade 安全/决策做到极致（preflight 裁决含 timing/concentration/drawdown/sizing），但这些丰富分析**执行后全部蒸发**——trade 行只有自由文本 note。更关键：**caution/no_go 的 preflight 完全不留痕**。今天运营商只看得到"发生了的交易"，永远看不到"agent 明智避开的交易"。agent 可能在正确地拒绝坏单（恰是托管真钱最该有的风控判断力），而这份判断力**零记录**
+- 为什么是最重要的：托管真钱给自主 agent，安全（已封顶）之后第一位是**问责**——运营商必须能审计 agent 的决策行为。"agent 跑了 50 次 preflight，10 次 no_go（正确拒绝）、15 caution、25 go"是 agent 风控纪律的直接证据，此前不存在。这是信任自主 agent 的核心依据
+- 实现（安全：不碰执行路径）：(1) 新表 `preflight_runs`（v63 迁移）——append-only，存 verdict + reasons + pair + est_usd + critical/warn 计数；(2) `runPreflight` 单一咽喉处 best-effort 持久化每次运行（journal 写失败绝不破坏调用方等待的裁决；`skipJournal` 供内部 re-check 跳过）；(3) `insertPreflightRun`/`listPreflightRuns`（按 verdict/strategy/since/limit 过滤）/`preflightVerdictBreakdown`（go/caution/no_go 计数）
+- 关键洞察：日志的价值不在"为什么这笔交易发生"，而在**"agent 的完整决策行为——含它没做的交易"**。no_go 是 agent 拒绝的坏单，是 invisible-today 的好判断。这是唯一暴露这份判断力的面
+- Surfaces：CLI `trade preflight history [--days --verdict --strategy --limit]`（verdict breakdown「X% flagged caution/no-go」+ 逐条 time/dir/pair/verdict/est$/top-finding）+ MCP `preflight_history`（breakdown + runs，含解析后的 reasons[]）。MCP_TOOLS 不变量加 `preflight_history`
+- 测试覆盖：`preflightJournal.test.ts` 6——round-trip newest-first + reasons 解析 / 按 verdict 过滤（专门暴露 refused 单）/ since+strategy+limit 过滤 / breakdown 计数 / breakdown 限定窗口+策略 / 空日志全零；CLI 离线烟雾验证（seed 2 条→渲染 breakdown「50% flagged」+ 表格 + --verdict 过滤）
+- 向后兼容：纯加法——新表/迁移、runPreflight 末尾 best-effort 持久化（不改裁决逻辑、不碰 trade 执行）、新 CLI 子命令、新 MCP 工具；3368 测试全绿（+6）
+- v1 限制：journal 与 trade 行无硬链接（按 timestamp/pair 关联——足够审计，未来可加 trade.preflight_id 闭环 decision→outcome）；只记 preflight 运行（agent 不跑 preflight 直接下单则不入日志——鼓励 preflight 先行）；append-only 无自动清理（与 audit_log 一致，量级低）
+
 **Phase 73 — preflight 感知组合级闸门（portfolio-aware preflight — close the "preview says GO, execution TRIPS" gap for the portfolio gates）** ✅
 - **补一个真实的"假 GO"风险，而非加新面**：v54 把 preflight 做成"下单前会不会被拒"的完整裁决，明确目标是"agent 不会拿到 GO 然后执行时吃 SAFEGUARD_TRIGGERED"。但 v54 的限额投影是 config/DB 级（便宜），**看不到需要组合估值的两个闸门**：drawdown 熔断器（硬 gate，执行时 throw DRAWDOWN_CIRCUIT_BREAKER_TRIPPED）和 v72 集中度。结果：agent preflight 得到 GO → 下单却被 drawdown 熔断器拦下。这正是 v54 要消灭的"假 GO"，偏偏漏在它唯一覆盖不到的闸门上
 - 为什么是最重要的：preflight 是 agent 的下单决策点。一个不反映**所有**可能拒绝的闸门的裁决会误导 agent。把组合级闸门投影进 preflight = 裁决变得诚实完整。这是 v54 使命的自然补全，不是新功能

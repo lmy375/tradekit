@@ -1313,6 +1313,33 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE rebalance_plans ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
   `,
+
+  // v63 — preflight decision journal (v74 feature). Every preflight_trade run
+  // is persisted with its verdict + reasons. The point: preflight runs that
+  // end in caution/no_go are otherwise INVISIBLE — only executed trades are
+  // recorded, so the agent's risk JUDGMENT (the bad trades it correctly
+  // refused) leaves no trace. This journal surfaces that discipline, lets an
+  // operator audit the agent's go/no-go behavior, and is the link that can
+  // later correlate decisions to outcomes. Append-only; indexed by time.
+  `
+  CREATE TABLE preflight_runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT    NOT NULL,
+    chain         TEXT    NOT NULL,
+    account       TEXT,
+    direction     TEXT    NOT NULL,
+    base_symbol   TEXT,
+    quote_symbol  TEXT,
+    strategy      TEXT,
+    verdict       TEXT    NOT NULL,
+    est_usd       REAL,
+    critical_count INTEGER NOT NULL DEFAULT 0,
+    warn_count    INTEGER NOT NULL DEFAULT 0,
+    reasons_json  TEXT    NOT NULL
+  );
+  CREATE INDEX idx_preflight_runs_ts ON preflight_runs (timestamp);
+  CREATE INDEX idx_preflight_runs_verdict ON preflight_runs (verdict, timestamp);
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -5767,6 +5794,122 @@ export function pruneEngineEvents(beforeIso: string): number {
   const db = openDb();
   const r = db.prepare(`DELETE FROM engine_events WHERE timestamp < ?`).run(beforeIso);
   return Number(r.changes ?? 0);
+}
+
+// ── preflight_runs (v74) ─────────────────────────────────────
+//
+// Decision journal: one row per preflight_trade run, capturing the
+// go/caution/no_go verdict + the reasons. Surfaces the agent's risk
+// judgment — including the trades it CORRECTLY REFUSED, which leave no
+// trace in the trades table. Append-only.
+
+export interface PreflightRunRow {
+  id: number;
+  timestamp: string;
+  chain: string;
+  account: string | null;
+  direction: string;
+  base_symbol: string | null;
+  quote_symbol: string | null;
+  strategy: string | null;
+  verdict: string;
+  est_usd: number | null;
+  critical_count: number;
+  warn_count: number;
+  /** JSON-encoded PreflightReason[] (code/severity/message/source). */
+  reasons_json: string;
+}
+
+export interface InsertPreflightRunArgs {
+  timestamp: string;
+  chain: string;
+  account?: string | null;
+  direction: string;
+  baseSymbol?: string | null;
+  quoteSymbol?: string | null;
+  strategy?: string | null;
+  verdict: string;
+  estUsd?: number | null;
+  criticalCount: number;
+  warnCount: number;
+  reasonsJson: string;
+}
+
+export function insertPreflightRun(args: InsertPreflightRunArgs): number {
+  const db = openDb();
+  const r = db
+    .prepare(
+      `INSERT INTO preflight_runs
+         (timestamp, chain, account, direction, base_symbol, quote_symbol, strategy,
+          verdict, est_usd, critical_count, warn_count, reasons_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      args.timestamp,
+      args.chain,
+      args.account ?? null,
+      args.direction,
+      args.baseSymbol ?? null,
+      args.quoteSymbol ?? null,
+      args.strategy ?? null,
+      args.verdict,
+      args.estUsd ?? null,
+      args.criticalCount,
+      args.warnCount,
+      args.reasonsJson,
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export interface ListPreflightRunsFilter {
+  sinceIso?: string;
+  untilIso?: string;
+  verdict?: string;
+  direction?: string;
+  strategy?: string;
+  /** Max rows, newest-first. Default unbounded. */
+  limit?: number;
+}
+
+export function listPreflightRuns(filter: ListPreflightRunsFilter = {}): PreflightRunRow[] {
+  const db = openDb();
+  const where: string[] = [];
+  const args: (string | number)[] = [];
+  if (filter.sinceIso) { where.push("timestamp >= ?"); args.push(filter.sinceIso); }
+  if (filter.untilIso) { where.push("timestamp <= ?"); args.push(filter.untilIso); }
+  if (filter.verdict) { where.push("verdict = ?"); args.push(filter.verdict); }
+  if (filter.direction) { where.push("direction = ?"); args.push(filter.direction); }
+  if (filter.strategy) { where.push("strategy = ?"); args.push(filter.strategy); }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const limitClause = filter.limit != null ? `LIMIT ${Math.max(1, Math.floor(filter.limit))}` : "";
+  const sql = `SELECT * FROM preflight_runs ${whereClause} ORDER BY timestamp DESC, id DESC ${limitClause}`;
+  return db.prepare(sql).all(...args) as unknown as PreflightRunRow[];
+}
+
+/** Verdict breakdown over a window — the agent's go/no-go discipline at a glance. */
+export function preflightVerdictBreakdown(filter: { sinceIso?: string; strategy?: string } = {}): {
+  total: number;
+  go: number;
+  caution: number;
+  no_go: number;
+} {
+  const db = openDb();
+  const where: string[] = [];
+  const args: (string | number)[] = [];
+  if (filter.sinceIso) { where.push("timestamp >= ?"); args.push(filter.sinceIso); }
+  if (filter.strategy) { where.push("strategy = ?"); args.push(filter.strategy); }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const rows = db
+    .prepare(`SELECT verdict, COUNT(*) as n FROM preflight_runs ${whereClause} GROUP BY verdict`)
+    .all(...args) as unknown as Array<{ verdict: string; n: number }>;
+  const out = { total: 0, go: 0, caution: 0, no_go: 0 };
+  for (const r of rows) {
+    out.total += r.n;
+    if (r.verdict === "go") out.go = r.n;
+    else if (r.verdict === "caution") out.caution = r.n;
+    else if (r.verdict === "no_go") out.no_go = r.n;
+  }
+  return out;
 }
 
 // ── alert_events (v28) ───────────────────────────────────────

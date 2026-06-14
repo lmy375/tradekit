@@ -681,6 +681,40 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── preflight_history (v74) ───────────────────────────────
+  // The decision journal. Every preflight_trade run is persisted with its
+  // verdict + reasons — including the caution/no_go runs (trades the agent
+  // REFUSED), which leave no trace in the trades log. Surfaces the agent's
+  // risk discipline for an operator auditing autonomous behavior.
+  server.tool(
+    "preflight_history",
+    "v74: the preflight DECISION JOURNAL. Every preflight_trade run is logged with its go/caution/no_go verdict + reasons — crucially including the caution/no_go runs (trades the agent REFUSED), which leave NO trace in the trades log. This is the only surface that shows the agent's risk JUDGMENT (the bad trades it correctly avoided), not just the trades it made — exactly what an operator needs to trust an autonomous agent. Returns { ok, breakdown: {total, go, caution, no_go}, runs: [{ id, timestamp, chain, account, direction, base_symbol, quote_symbol, strategy, verdict, est_usd, critical_count, warn_count, reasons[] }] }. Filters: `days` (lookback window), `verdict` (go|caution|no_go), `strategy`, `limit` (default 20, newest-first). Use to audit go/no-go behavior, or correlate decisions with the trades that followed (by timestamp/pair).",
+    {
+      days: z.number().int().min(1).max(3650).optional().describe("Lookback window in days. Omit for all-time."),
+      verdict: z.enum(["go", "caution", "no_go"]).optional().describe("Filter to one verdict — e.g. no_go to review refused trades."),
+      strategy: z.string().optional().describe("Filter to one strategy tag."),
+      limit: z.number().int().min(1).max(1000).optional().describe("Max runs returned, newest-first. Default 20."),
+    },
+    async ({ days, verdict, strategy, limit }) => {
+      try {
+        return ok(
+          await runTool("preflight_history", rt.opts, { days, verdict, strategy, limit }, undefined, async () => {
+            const { listPreflightRuns, preflightVerdictBreakdown } = await import("../db.js");
+            const sinceIso = days != null ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+            const breakdown = preflightVerdictBreakdown({ sinceIso, strategy });
+            const runs = listPreflightRuns({ sinceIso, verdict, strategy, limit: limit ?? 20 }).map((r) => ({
+              ...r,
+              reasons: JSON.parse(r.reasons_json),
+            }));
+            return { ok: true, breakdown, runs };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── import_trade ──────────────────────────────────────────
   server.tool(
     "import_trade",

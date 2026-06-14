@@ -437,6 +437,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "open_positions",
     // v70: solve for the max admissible trade size (inverse of safety_headroom).
     "trade_sizing",
+    // v74: preflight decision journal (verdicts incl. refused trades).
+    "preflight_history",
     // Iter618: portfolio history capture + diff.
     "portfolio_snapshot", "portfolio_history", "portfolio_diff",
     // Iter621: operator dashboard.
