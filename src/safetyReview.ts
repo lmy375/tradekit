@@ -332,6 +332,25 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
       "set safety.maxStrategyLossUsd (e.g. 500) to auto-block new buys once a strategy's realized loss exceeds it",
     );
   }
+  // v91: transfer recipient allowlist — without it, an agent (or a prompt-
+  // injected one) can transfer funds to ANY address over MCP (the trade safety
+  // stack constrains swaps, not transfer destinations).
+  const allowlistOnly = s.transferAllowlistOnly === true;
+  g({
+    key: "transferAllowlist",
+    label: "Transfer recipient allowlist",
+    category: "exposure",
+    state: allowlistOnly ? "active" : "off",
+    detail: allowlistOnly ? "agent transfers restricted to address-book recipients" : "off (agent can transfer to any address)",
+  });
+  if (!allowlistOnly) {
+    gap(
+      "info",
+      "transferAllowlist",
+      "no transfer recipient allowlist — an agent (or a prompt-injected one) can transfer funds to ANY address over MCP; a transfer is irreversible and, unlike a swap, the trade guardrails don't constrain the destination",
+      "set safety.transferAllowlistOnly true + curate trusted recipients via `tradekit address add` — agent transfers then go only to the address book",
+    );
+  }
   // v72: portfolio concentration — the cross-strategy aggregate the per-
   // strategy caps above structurally miss.
   const concLimit = s.maxConcentrationPct;

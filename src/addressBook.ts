@@ -136,6 +136,32 @@ export function findByAddress(book: AddressBook, address: string): AddressEntry 
 }
 
 /**
+ * v91: fund-exfiltration gate (pure). When `allowlistOnly` is on and the
+ * recipient isn't in the operator's address book, refuse the (MCP) transfer —
+ * a prompt-injected agent must not be able to drain funds to an arbitrary
+ * address. No-op when allowlistOnly is off or the recipient is known. The CLI
+ * (operator) never calls this, so the operator can transfer anywhere.
+ */
+export function assertTransferAllowed(args: {
+  allowlistOnly: boolean;
+  recipientKnown: boolean;
+  recipient: string;
+}): void {
+  if (args.allowlistOnly && !args.recipientKnown) {
+    throw new ToolError(
+      "TRANSFER_RECIPIENT_NOT_ALLOWED",
+      `Refusing to transfer to ${args.recipient} over MCP — safety.transferAllowlistOnly is on and this recipient isn't in the address book. The operator adds trusted recipients from the CLI (\`tradekit address add <name> ${args.recipient}\`) or runs the transfer from the CLI directly.`,
+      {
+        details: { recipient: args.recipient, allowlistOnly: true },
+        nextActions: [
+          { tool: "address", reason: `Operator: add this recipient to the address book via the CLI to allow agent transfers to it.` },
+        ],
+      },
+    );
+  }
+}
+
+/**
  * Iter614: parse a recipient input. If it starts with `@`, look up in the
  * address book and return the resolved address. Otherwise return the input
  * unchanged (the caller validates as an address separately).

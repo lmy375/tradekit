@@ -10,9 +10,29 @@ import {
   validateAddressName,
   findEntry,
   findByAddress,
+  assertTransferAllowed,
   type AddressBook,
 } from "./addressBook.js";
 import { ToolError } from "./errors.js";
+
+describe("assertTransferAllowed (v91 fund-exfiltration gate)", () => {
+  const R = "0x1111111111111111111111111111111111111111";
+  it("throws TRANSFER_RECIPIENT_NOT_ALLOWED for an unknown recipient when allowlistOnly is on", () => {
+    expect(() => assertTransferAllowed({ allowlistOnly: true, recipientKnown: false, recipient: R })).toThrowError(ToolError);
+    try {
+      assertTransferAllowed({ allowlistOnly: true, recipientKnown: false, recipient: R });
+    } catch (e) {
+      expect((e as ToolError).code).toBe("TRANSFER_RECIPIENT_NOT_ALLOWED");
+      expect((e as ToolError).message).toContain(R);
+    }
+  });
+  it("allows a KNOWN recipient even when allowlistOnly is on", () => {
+    expect(() => assertTransferAllowed({ allowlistOnly: true, recipientKnown: true, recipient: R })).not.toThrow();
+  });
+  it("is a no-op when allowlistOnly is off (unknown recipient passes)", () => {
+    expect(() => assertTransferAllowed({ allowlistOnly: false, recipientKnown: false, recipient: R })).not.toThrow();
+  });
+});
 
 // Per-test TRADEKIT_DATA_DIR + vi.resetModules + re-import so constants.ts's
 // ADDRESS_BOOK_PATH re-evaluates against the per-test dir each iteration.

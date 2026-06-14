@@ -1832,8 +1832,17 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
             }
             // Iter614: resolve @alias recipients via the address book.
             // Schema regex already validated the input shape (either 0x... or @name).
-            const { resolveRecipient } = await import("../addressBook.js");
+            const { resolveRecipient, loadAddressBook, findByAddress, assertTransferAllowed } = await import("../addressBook.js");
             const { address: resolvedTo } = resolveRecipient(input.to);
+            // v91: fund-exfiltration gate — when transferAllowlistOnly is on, an
+            // agent may only transfer to operator-curated (address-book)
+            // recipients. The CLI path (operator) skips this. Simulate is also
+            // gated so a dry-run can't be used to confirm an unlisted recipient.
+            assertTransferAllowed({
+              allowlistOnly: config.safety.transferAllowlistOnly === true,
+              recipientKnown: findByAddress(loadAddressBook(), resolvedTo) != null,
+              recipient: resolvedTo,
+            });
             const { executeTransfer } = await import("../transfer.js");
             return await executeTransfer(
               {

@@ -62,6 +62,17 @@ export type ErrorCode =
   // (resize, wait for the window to roll, or raise the cap).
   | "STRATEGY_BUDGET_EXCEEDED"
   | "POSITION_CAP_EXCEEDED"
+  // v91: agent fund-exfiltration defense. transfer over MCP to a recipient NOT
+  // in the operator-curated address book, while safety.transferAllowlistOnly is
+  // on. A transfer moves funds OUT to an arbitrary address — irreversible —
+  // and (unlike a swap) the trade safety stack doesn't constrain the
+  // destination. The operator adds trusted recipients via the CLI.
+  | "TRANSFER_RECIPIENT_NOT_ALLOWED"
+  // v91: the agent tried to mutate the address book over MCP while
+  // transferAllowlistOnly is on. The book is the operator's trusted-recipient
+  // allowlist — letting the agent write it would let a prompt-injected agent
+  // self-whitelist an attacker then transfer freely. Operator-only (CLI).
+  | "ADDRESS_BOOK_LOCKED"
   // v89: the agent tried to mutate operator-owned safety config (safety.* —
   // limits, breakers, whitelists, the human approval gate) over MCP. Blocked so
   // a prompt-injected agent can't weaken its OWN guardrails then trade freely.
@@ -426,6 +437,8 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "STRATEGY_LOSS_BREAKER_TRIPPED":
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
     case "SAFETY_CONFIG_LOCKED":
+    case "TRANSFER_RECIPIENT_NOT_ALLOWED":
+    case "ADDRESS_BOOK_LOCKED":
     case "ENGINE_LOCKED":
       return 403;
     case "TX_NOT_FOUND":

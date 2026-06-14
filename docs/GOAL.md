@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 91 — 转账收款人白名单（transfer recipient allowlist — block agent fund-exfiltration to arbitrary addresses）** ✅
+- **堵住最直接的盗窃向量**：v89/v90 锁了配置改写，但**最直接的盗窃**——`transfer` 把资金转出到任意地址——此前在 MCP 上无收款人限制、无审批门（交易安全栈管 swap 的滑点/限额，但 transfer 是把钱整个转走到任意收款人，不可逆，目的地不受任何护栏约束）。被注入的 agent 一次 `transfer @max 0xattacker` 即可清空钱包。地址簿此前只是**信息性**的（recipientIsKnown 标记），不拦截
+- 为什么是最重要的：自主 agent 托管真钱，最坏情况是资金被转给攻击者（不可逆，比坏成交严重得多）。审批门（v47）只覆盖 buy/sell，transfer 漏掉了。这是 backup/panic/config-lock 同一信任边界的最后一块、也是危害最大的一块
+- 实现（opt-in 收款人白名单 + 防自我授权）：新 config `safety.transferAllowlistOnly`（默认 false，在 safety.* 下→受 v89 锁、仅 CLI 可改）。开启时：(1) 纯 gate `assertTransferAllowed({allowlistOnly, recipientKnown, recipient})`——MCP transfer 收款人不在地址簿→抛 `TRANSFER_RECIPIENT_NOT_ALLOWED`（含 simulate，防 dry-run 探测）；(2) MCP `address` 工具的 add/remove→抛 `ADDRESS_BOOK_LOCKED`（地址簿成了信任锚，agent 不能自我授权攻击者）。地址簿=运营商经 CLI 策展的可信收款人白名单
+- 边界一致：CLI（运营商）不受限——operator 转任意地址、CLI 策展白名单；MCP 受限；读（address list）+ recipientIsKnown 标记保持开放。默认 off→零行为变化，运营商显式 opt in
+- 测试覆盖：`addressBook.test.ts` +3（assertTransferAllowed 纯函数：未知收款人+on→抛带地址 / 已知→放行 / off→放行）+ `admin-tools.test.ts` +2（address add/remove：off→放行、on→ADDRESS_BOOK_LOCKED + list 读放行）+ `safetyReview.test.ts` +2（未配→info gap "transfer to ANY address"、配了→active）；CLI 烟雾验证 safety review 两态；2 新 ErrorCode（403）
+- 向后兼容：纯加法+opt-in——默认 off 零行为变化；config literal fixture 补 transferAllowlistOnly；3480 测试全绿（+7）
+- v1 限制：opt-in（默认 off——不强加于未启用白名单的运营商）；按地址簿白名单（非审批队列——transfer 接入 approve-execute 较重，留作后续；白名单+CLI 已是强边界）；MCP-only gate（CLI/operator 不受限，正确职责分离）
+
 **Phase 90 — 运营商所有的配置边界（operator-owned config boundary — extend the MCP write-lock to RPC / relay / alert config）** ✅
 - **补完 v89 的注入防御边界，而非加 feature**：v89 锁住 safety.* 防 agent 削弱护栏。但注入威胁模型更广——agent 还能经 MCP `config set` 改写**基础设施**配置发起攻击：`chains.*.rpcs`（注入恶意 RPC → 假价格喂坏滑点检查/坏成交，或前跑签名 tx）、`mev.*`（把签名 tx 重定向到恶意 relay → 偷币）、`webhooks`/`notifications`（重定向/静音告警 → 蒙蔽运营商藏匿盗取）。这些直接使能盗窃或藏匿，是 v89 同一边界的剩余缺口
 - 为什么是最重要的：自主（尤其被注入）agent 托管真钱，安全根基是它**不能重配自己的保护/基础设施/可见性**。v89 锁了护栏，本期锁住资金流（RPC/relay）和可见性（告警）——注入 agent 的配置改写攻击面被完整封住

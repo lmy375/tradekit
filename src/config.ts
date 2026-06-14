@@ -200,6 +200,14 @@ const safetySchema = z
      *  (portfolio mark-to-market). Realized-only + deterministic (stablecoin-$1
      *  model). Off when unset. */
     maxStrategyLossUsd: z.number().positive().optional(),
+    /** v91: fund-exfiltration defense. When true, MCP transfers may only go to
+     *  recipients in the operator-curated address book, and address-book writes
+     *  become operator-only (CLI) — so a prompt-injected agent can't drain funds
+     *  to an attacker address (or self-whitelist one). A transfer moves funds
+     *  OUT irreversibly and, unlike a swap, the trade safety stack doesn't
+     *  constrain the destination. The CLI (operator) is unrestricted. Off by
+     *  default (no behavior change); the operator opts in. */
+    transferAllowlistOnly: z.boolean().default(false),
     maxSlippageBps: z.number().int().min(1).max(5000).default(500),
     tokenWhitelist: z.record(z.string(), z.array(addressSchema)).optional(),
     tokenBlacklist: z.record(z.string(), z.array(addressSchema)).optional(),

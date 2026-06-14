@@ -151,6 +151,23 @@ describe("concentration limit (v72)", () => {
   });
 });
 
+describe("transfer recipient allowlist guardrail (v91)", () => {
+  it("is a gap (info) + reads off when unset", () => {
+    const r = review({ perTxUsdLimit: 10 });
+    expect(rail(r, "transferAllowlist").state).toBe("off");
+    const g = gap(r, "transferAllowlist");
+    expect(g).not.toBeNull();
+    expect(g!.severity).toBe("info");
+    expect(g!.finding).toMatch(/transfer funds to ANY address|irreversible/i);
+  });
+
+  it("is active + no gap once enabled", () => {
+    const r = review({ perTxUsdLimit: 10, transferAllowlistOnly: true });
+    expect(rail(r, "transferAllowlist").state).toBe("active");
+    expect(gap(r, "transferAllowlist")).toBeNull();
+  });
+});
+
 describe("strategy loss breaker guardrail (v84)", () => {
   it("is a gap (info) + reads off when unset", () => {
     const r = review({ perTxUsdLimit: 10 });

@@ -115,3 +115,32 @@ describe("config MCP tool — v89 safety-config lock", () => {
     expect(r.ok).toBe(true);
   });
 });
+
+describe("address MCP tool — v91 address-book write lock", () => {
+  const address = () => registered.get("address")!;
+  const VALID = "0x2222222222222222222222222222222222222222";
+
+  it("ALLOWS add/remove when transferAllowlistOnly is OFF (default)", async () => {
+    // Default config has transferAllowlistOnly=false → writes permitted.
+    const r = parse(await address().handler({ action: "add", name: "coldwallet", address: VALID }));
+    expect(r.ok).toBe(true);
+  });
+
+  it("BLOCKS add/remove when transferAllowlistOnly is ON (agent can't self-whitelist)", async () => {
+    // Turn the allowlist on via the file (the operator/CLI path), then the
+    // agent's MCP add/remove must be refused with ADDRESS_BOOK_LOCKED.
+    const { saveConfig, loadConfig: lc, setConfigPath } = await import("../config.js");
+    saveConfig(setConfigPath(lc(), "safety.transferAllowlistOnly", true));
+    try {
+      const add = parse(await address().handler({ action: "add", name: "attacker", address: "0x3333333333333333333333333333333333333333" }));
+      expect((add.error as { code: string }).code).toBe("ADDRESS_BOOK_LOCKED");
+      const rem = parse(await address().handler({ action: "remove", name: "coldwallet" }));
+      expect((rem.error as { code: string }).code).toBe("ADDRESS_BOOK_LOCKED");
+      // Reads stay open even when locked.
+      const list = parse(await address().handler({ action: "list" }));
+      expect(list.ok).toBe(true);
+    } finally {
+      saveConfig(setConfigPath(lc(), "safety.transferAllowlistOnly", false));
+    }
+  });
+});

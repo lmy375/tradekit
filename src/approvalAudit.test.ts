@@ -162,7 +162,7 @@ describe("auditAllowanceList (iter606)", () => {
     defaultSlippageBps: 50,
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
-    safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
+    safety: { enabled: true, transferAllowlistOnly: false, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
     webhooks: {},
     notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
@@ -325,7 +325,7 @@ describe("approval freshness signal (iter617)", () => {
     defaultSlippageBps: 50,
     chains: {},
     aggregator: { preferred: ["kyberswap"], mode: "first" as const },
-    safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
+    safety: { enabled: true, transferAllowlistOnly: false, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
     webhooks: {},
     notifications: { channels: [], dedupWindowMs: 60_000, digest: { enabled: false, hourUtc: 9, window: "24h", minVerdict: "healthy" as const }, quietHours: { enabled: false, startHourUtc: 22, endHourUtc: 7, breakthroughSeverity: "critical" as const } },
     engine: {
@@ -482,7 +482,7 @@ describe("aggregateMultiChainAudits", () => {
       defaultSlippageBps: 50,
       chains: {},
       aggregator: { preferred: ["kyberswap"], mode: "first" as const },
-      safety: { enabled: true, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
+      safety: { enabled: true, transferAllowlistOnly: false, maxSlippageBps: 500, allowInfiniteApprovals: false, tradeApproval: { enabled: false, thresholdUsd: null, expiresMinutes: 60 } },
     } as never;
     return auditAllowanceList(rows, {
       chain,

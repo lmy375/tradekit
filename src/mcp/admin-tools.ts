@@ -1137,6 +1137,21 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
     async ({ action, name, address, note, overwrite }) => {
       try {
         const a = action ?? "list";
+        // v91: when transferAllowlistOnly is on, the address book IS the
+        // trusted-recipient allowlist that gates agent transfers — so the agent
+        // must not be able to WRITE it (a prompt-injected agent could
+        // self-whitelist an attacker, then transfer freely). add/remove are
+        // operator-only (CLI). list (read) stays open.
+        if (a === "add" || a === "remove") {
+          const cfg = rt.getConfig();
+          if (cfg.safety.transferAllowlistOnly === true) {
+            throw new ToolError(
+              "ADDRESS_BOOK_LOCKED",
+              `Refusing to ${a} an address-book entry over MCP — safety.transferAllowlistOnly is on, so the address book is the operator's trusted-recipient allowlist and changes only from the CLI (\`tradekit address ${a} …\`). This stops an agent from whitelisting its own transfer recipient.`,
+              { details: { action: a }, nextActions: [] },
+            );
+          }
+        }
         const { listAddressEntries, addAddressEntry, removeAddressEntry } = await import("../addressBook.js");
         return ok(
           await runTool("address", rt.opts, { action: a, name, address }, undefined, async () => {
