@@ -431,6 +431,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "verify",
     // data-tools.ts: chains, gas, price, holdings, portfolio, trending, pnl, viewTx, check_price
     "chains", "gas", "price", "holdings", "portfolio", "trending", "pnl", "viewTx", "check_price",
+  // v64: recent price range/trend/position for entry-timing.
+  "price_context",
     // Iter618: portfolio history capture + diff.
     "portfolio_snapshot", "portfolio_history", "portfolio_diff",
     // Iter621: operator dashboard.

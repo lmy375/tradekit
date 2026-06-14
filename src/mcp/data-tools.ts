@@ -135,6 +135,49 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── price_context (v64) ───────────────────────────────────
+  // Entry-timing context: where the price sits in its recent range +
+  // trend + volatility. Complements `price` (spot + raw history blob) and
+  // `trending` (volume/liquidity discovery) — this is the "WHEN" signal.
+  server.tool(
+    "price_context",
+    "v64: recent price CONTEXT for entry/exit timing — where the current price sits in its recent range, the trend, and how choppy it's been. Distinct from `price` (spot + a raw history blob) and `trending` (volume/liquidity discovery): this answers WHEN, not just what it costs or what's hot. Returns { ok, token, coinId, windowDays, samples, currentPriceUsd, low, high, rangePositionPct (0=at low, 100=at high; null if flat), changePctWindow, changePct24h (null if window <24h), rangeWidthPct, volatilityPct (stddev of period returns; null if <2 samples), summary (plain-language one-liner) }. Use before sizing/timing a buy: 'near the 7d high' vs 'near the 7d low' is a very different entry. `days` is the lookback window (default 7). Returns ok:false UNKNOWN_TOKEN when the token has no CoinGecko mapping (too new / unmapped) — degrade gracefully, don't treat as fatal. Deterministic given the series; source is the same CoinGecko market_chart the backtester uses. Errors: UNKNOWN_TOKEN (symbol not on the chain), UNKNOWN_CHAIN.",
+    {
+      chain: z.string().optional(),
+      token: z.string().optional().describe("Token symbol or address. Default: native (mapped to WETH for the price series)."),
+      days: z.number().int().min(1).max(3650).optional().describe("Lookback window in days. Default 7."),
+    },
+    async ({ chain, token, days }) => {
+      try {
+        return ok(
+          await runTool("price_context", rt.opts, { chain, token, days }, chain, async () => {
+            const config = rt.getConfig();
+            const profile = resolveProfile(chain ?? config.activeChain, config);
+            const resolved = token ? resolveToken(profile, token) : profile.weth;
+            if (!resolved) throw unknownTokenError("token", token ?? "(none)", profile);
+            const tokenAddr = /^0x[0-9a-fA-F]{40}$/.test(resolved) ? resolved : profile.weth;
+            const { gatherPriceContext } = await import("../priceContext.js");
+            const report = await gatherPriceContext({
+              tokenAddress: tokenAddr,
+              windowDays: days ?? 7,
+              config,
+              logger: rt.opts.logger,
+            });
+            if (report == null) {
+              throw new ToolError(
+                "UNKNOWN_TOKEN",
+                `No CoinGecko price history for ${token ?? resolved} — too new or unmapped; price context unavailable.`,
+              );
+            }
+            return { ok: true, token: (token ?? "ETH").toUpperCase(), ...report };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── holdings ──────────────────────────────────────────────
   server.tool(
     "holdings",

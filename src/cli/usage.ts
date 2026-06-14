@@ -951,6 +951,13 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
   gas    [--chain X | --chains a,b,c] [--strict] [--json] [--watch N]    Current EIP-1559 fees; --strict exits 1 when any chain's snapshot failed (iter761).
   price  <symbol|addr> [--chain X] [--period 1d|1w|1m|1y] [--strict] [--json] [--watch N]
         --strict exits 1 when the price oracle returns null (iter769 — cron oracle health gate).
+  price context <symbol|addr> [--days N (default 7)] [--chain X] [--json]
+        v64: recent price CONTEXT for entry/exit timing — where current sits in the N-day
+        range (0=low, 100=high), the trend (Nd + 24h % change), range width, and volatility.
+        Distinct from 'price' (spot) and 'trending' (discovery): this is the WHEN signal —
+        'near the 7d high' vs 'near the 7d low' is a very different entry. Source: the same
+        CoinGecko series the backtester uses; tokens with no CoinGecko mapping report
+        gracefully (no history). MCP: price_context.
   price stats [--reset] [--json]
         Iter38: per-provider observability for the price-fetch layer (CoinGecko + DexScreener).
         Shows calls / hit rate / latency p50/p95 / last error per provider since process start.

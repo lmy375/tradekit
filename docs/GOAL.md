@@ -33,6 +33,18 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 64 — 价格上下文（price context — "where does the price sit, which way is it going?"）** ✅
+- **转向最少被服务的支柱：行情/发现（market data）**——agent 决策漏斗的前端"该不该/何时交易"。前面大量迭代在 safety/reliability/accounting；这次服务 agent 的核心市场决策
+- 缺口：agent 有**现价**（check_price）和**发现**（trending 按 volume/liquidity），但没有**价格上下文**——当前价在近期区间的哪个位置、趋势方向、波动多大。"在 7d 高点附近买" vs "在 7d 低点附近买"是天差地别的决策，而 agent 此前无从判断。仅有的历史序列 `fetchPriceSeries` 埋在 backtest 里、只给回测用
+- 新模块 `priceContext.ts`：纯函数 `computePriceContext(points, windowDays)` → { current, low, high, rangePositionPct（0=低 100=高）, changePctWindow, changePct24h, rangeWidthPct, volatilityPct（period-return 标准差）, summary（一句话）} + `gatherPriceContext` 复用 `fetchPriceSeries`（CoinGecko market_chart，**注入式 fetch** 作测试 seam）。确定性：compute 纯函数可单测；唯一 IO 是序列拉取
+- 诚实降级：CoinGecko 无映射的 token → 返回 null（"无价格历史"建议），不是错误
+- Surfaces：CLI `price context <token> [--days N]` + MCP `price_context`。与既有区分：`price`=现价+原始历史 blob，`trending`=发现，`price_context`=**何时**（区间位置/趋势/波动），entry-timing 信号
+- 实测（live CoinGecko）：`price context ETH` → "$1,676 · +3.9% over 7d · 69% of range (mid-range) · 24h +0.4%"，区间 $1,608→$1,706，波动 0.60%，169 样本——正是 agent 定时入场需要的上下文
+- 测试覆盖：`priceContext.test.ts` 9 case（computePriceContext：上涨近高点 / 回落近低点 / 区间中部 / 平坦序列→null 位置+0 波动 / 24h 变化有无 / 波动=return 标准差 / 单点降级；gatherPriceContext：映射 token 注入 fetch 端到端 / 无映射→null 且不调 fetch）
+- MCP_TOOLS 不变量：`price_context` 加入 iter589/iter877 set
+- 向后兼容：纯加法——新模块、新 CLI 子命令、新 MCP 工具；复用 fetchPriceSeries 无改动
+- v1 限制：依赖 CoinGecko id 映射（无映射 token 无上下文——与 backtest 同款约束）；窗口用日级 market_chart（CoinGecko 对 >90d 自动降到日粒度，对 entry-timing 够用）；波动是 period-return 标准差非年化（清晰的"多choppy"量度，非风险定价）
+
 **Phase 63 — 测试隔离修复：测试套件不再读写真实配置（test-isolation: stop the suite touching the operator's real ~/.tradekit）** ✅
 - **修复一个真实、已证实的危害**：v62 的调试暴露出测试套件在**写我的真实 `~/.tradekit/config.json`**（我的真实 config 里被写进了 `scheduleCircuitBreaker`/`rebalanceCircuitBreaker`——测试干的）。对一个"生产级"框架，测试污染运营商的真实配置文件是不可接受的，且会破坏真实部署、让那些测试非确定（依赖真实 config 内容）、并埋雷（任何 schema 变更都可能经真实 config 炸测试）
 - 根因：`constants.ts` 的 `DATA_DIR = env.TRADEKIT_DATA_DIR || ~/.tradekit` 在**首次 import 时解析一次**。多数测试在模块顶部、import db/config **之前**设好临时目录——但 `doctor.test.ts` 第 9 行有个**静态** `import { checkEnv } from "./doctor.js"`，它**被提升到第 14 行的 env 赋值之上**（ESM import hoisting），且 doctor.js 间接 import constants → DATA_DIR 在临时目录设好前就解析成了真实 home。注释甚至写着"在 dynamic db import 之前设置"——但漏看了这个静态 import 会 hoist

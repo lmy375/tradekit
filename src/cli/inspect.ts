@@ -2752,6 +2752,12 @@ export async function priceCommand(flags: Record<string, string>, positional: st
     await priceStatsCommand(flags);
     return;
   }
+  // v64: `price context <token>` — recent range / trend / position for
+  // entry-timing decisions (distinct from the spot lookup below).
+  if (positional[1] === "context") {
+    await priceContextCommand(flags, positional);
+    return;
+  }
   // Iter328: thread through withWatch so `tradekit price ETH --watch` polls
   // periodically. Iter238 mentioned this use case in a comment but the wrapper
   // was never wired up — the comment was aspirational. Now the response-envelope
@@ -2806,6 +2812,41 @@ export async function priceStatsCommand(flags: Record<string, string>) {
   }
   console.log("");
   console.log("Stats are in-memory only and reset on process restart. Use --reset to clear within this process.");
+}
+
+// v64: recent price range / trend / position — entry-timing context the
+// spot lookup can't give. Reuses the backtester's CoinGecko series fetch.
+async function priceContextCommand(flags: Record<string, string>, positional: string[]) {
+  const config = loadConfig();
+  const chainName = flags["chain"] ?? config.activeChain;
+  const profile = resolveProfile(chainName, config);
+  const tokenInput = positional[2] ?? "ETH";
+  const resolved = resolveToken(profile, tokenInput);
+  if (!resolved) throw unknownTokenError("token", tokenInput, profile);
+  // Native / non-address resolutions map to the chain's WETH for the
+  // CoinGecko id lookup (same substitution the price-fetch path uses).
+  const tokenAddr = /^0x[0-9a-fA-F]{40}$/.test(resolved) ? resolved : profile.weth;
+  const days = parseFloatFlag(flags["days"], "--days", { min: 1, max: 3650 }) ?? 7;
+  const logger = makeCliLogger(flags);
+  try {
+    const { gatherPriceContext, renderPriceContext } = await import("../priceContext.js");
+    const report = await gatherPriceContext({ tokenAddress: tokenAddr, windowDays: days, config, logger });
+    if (report == null) {
+      if (flags["json"] === "true") {
+        printJson({ ok: false, error: { code: "UNKNOWN_TOKEN", message: `No CoinGecko price history for ${tokenInput} (too new or unmapped).` } });
+      } else {
+        console.log(`No price history available for ${tokenInput} — no CoinGecko mapping for this token.`);
+      }
+      return;
+    }
+    if (flags["json"] === "true") {
+      printJson({ ok: true, token: tokenInput.toUpperCase(), ...report });
+    } else {
+      console.log(renderPriceContext(report, tokenInput.toUpperCase()));
+    }
+  } finally {
+    logger.close();
+  }
 }
 
 async function priceCommandOnce(flags: Record<string, string>, positional: string[]) {
