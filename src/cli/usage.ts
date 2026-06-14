@@ -127,6 +127,14 @@ TRADING
         the agent's risk JUDGMENT (the bad trades it correctly avoided), plus a
         verdict breakdown (% flagged caution/no-go). Audit autonomous go/no-go
         behavior; --verdict no_go to review refused trades. MCP: preflight_history.
+  trade preflight calibration [--days N] [--window M] [--strategy TAG] [--json]
+        v75: are the verdicts PREDICTIVE? Correlates each recorded verdict to the
+        trade that followed (same pair/dir, nearest within ±M min, default 30) and
+        reports per-verdict fill rate + median realized slippage. The deepest trust
+        question — not what the agent decided but whether its judgment was GOOD: if
+        'go' fills clean while 'caution' slips worse / fails more, preflight is
+        well-calibrated. Heuristic proximity match (aggregate read). MCP:
+        preflight_calibration.
         [--base ETH|<addr>] [--quote USDC|<addr>] [--baseAmount|--quoteAmount <n|max>]
         [--slippage <bps>] [--simulate] [--note "..."] [--account <label>] [--chain X]
         [--idempotency-key K]

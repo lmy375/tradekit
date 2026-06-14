@@ -439,6 +439,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "trade_sizing",
     // v74: preflight decision journal (verdicts incl. refused trades).
     "preflight_history",
+    // v75: preflight calibration — did the verdicts predict outcomes?
+    "preflight_calibration",
     // Iter618: portfolio history capture + diff.
     "portfolio_snapshot", "portfolio_history", "portfolio_diff",
     // Iter621: operator dashboard.

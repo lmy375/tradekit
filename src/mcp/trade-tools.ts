@@ -715,6 +715,34 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── preflight_calibration (v75) ───────────────────────────
+  // Closes the loop on the v74 journal: were the recorded verdicts actually
+  // predictive? Correlates each preflight decision to the trade that followed
+  // and reports per-verdict outcomes (fill/fail/slippage).
+  server.tool(
+    "preflight_calibration",
+    "v75: are the preflight verdicts PREDICTIVE, or noise? Closes the loop on the v74 decision journal by correlating each recorded verdict to the trade that followed and reporting how those trades turned out. Returns { ok, windowMinutes, totalRuns, totalMatched, byVerdict: [{ verdict, runs, matched, filled, failed, pending, medianSlippageBps }], summary, generatedAt }. The operator's deepest trust question — not 'what did the agent decide' (preflight_history) but 'was its judgment GOOD': if 'go' trades fill cleanly while 'caution' trades slip worse / fail more, preflight is well-calibrated and the agent's discipline is meaningful; if outcomes are indistinguishable, the signal is noise (summary states which). Correlation is by proximity (same chain/account/pair/direction, nearest trade within `window` minutes AFTER the decision, one trade per run) — a labelled heuristic for an AGGREGATE read, since decisions and trades aren't hard-linked. Filters: `days` (lookback), `window` (match window, default 30m), `strategy`.",
+    {
+      days: z.number().int().min(1).max(3650).optional().describe("Lookback window in days. Omit for all-time."),
+      window: z.number().int().min(1).max(1440).optional().describe("Decision→trade correlation window in minutes. Default 30."),
+      strategy: z.string().optional().describe("Filter to one strategy tag."),
+    },
+    async ({ days, window, strategy }) => {
+      try {
+        return ok(
+          await runTool("preflight_calibration", rt.opts, { days, window, strategy }, undefined, async () => {
+            const { gatherPreflightCalibration } = await import("../preflightCalibration.js");
+            const sinceIso = days != null ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+            const report = gatherPreflightCalibration({ windowMinutes: window, sinceIso, strategy });
+            return { ok: true, ...report };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── import_trade ──────────────────────────────────────────
   server.tool(
     "import_trade",

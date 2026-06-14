@@ -222,10 +222,14 @@ async function main() {
           if (sub === "history" || sub === "log") {
             const { tradePreflightHistoryCommand } = await import("./cli/trade.js");
             await tradePreflightHistoryCommand(flags);
+          } else if (sub === "calibration" || sub === "calibrate") {
+            // v75: did the recorded verdicts predict the trades that followed?
+            const { tradePreflightCalibrationCommand } = await import("./cli/trade.js");
+            await tradePreflightCalibrationCommand(flags);
           } else {
             const dir = sub as "buy" | "sell" | undefined;
             if (dir !== "buy" && dir !== "sell") {
-              throw subcommandError("trade preflight", dir, ["buy", "sell", "history"]);
+              throw subcommandError("trade preflight", dir, ["buy", "sell", "history", "calibration"]);
             }
             const { tradePreflightCommand } = await import("./cli/trade.js");
             await tradePreflightCommand(dir, flags);

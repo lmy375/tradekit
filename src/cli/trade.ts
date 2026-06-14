@@ -1037,3 +1037,40 @@ export async function tradePreflightHistoryCommand(flags: Record<string, string>
     );
   }
 }
+
+// v75: preflight calibration — `tradekit trade preflight calibration`.
+// Correlates each recorded preflight verdict to the trade that followed and
+// shows whether the verdicts actually predicted outcomes (fill rate, realized
+// slippage). The operator's deepest trust question: was the agent's judgment
+// GOOD, not just recorded.
+export async function tradePreflightCalibrationCommand(flags: Record<string, string>) {
+  const { gatherPreflightCalibration } = await import("../preflightCalibration.js");
+  const days = parseIntFlag(flags["days"], "--days", { min: 1 });
+  const windowMinutes = parseIntFlag(flags["window"], "--window", { min: 1 }) ?? 30;
+  const sinceIso = days != null && days > 0 ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+  const report = gatherPreflightCalibration({ windowMinutes, sinceIso, strategy: flags["strategy"] });
+
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...report });
+    return;
+  }
+
+  const win = sinceIso ? `last ${days}d` : "all time";
+  console.log(`Preflight calibration — ${win} (trade match window ±${report.windowMinutes}m)`);
+  console.log(`  ${report.totalRuns} preflight runs · ${report.totalMatched} correlated to a trade`);
+  console.log("");
+  console.log("  Verdict   Runs  Traded  Filled  Failed  Median slip");
+  console.log("  " + "-".repeat(58));
+  for (const v of report.byVerdict) {
+    const badge = v.verdict === "go" ? "go     " : v.verdict === "caution" ? "caution" : "no_go  ";
+    const slip = v.medianSlippageBps != null ? `${v.medianSlippageBps.toFixed(0)}bps` : "—";
+    console.log(
+      `  ${badge}  ${String(v.runs).padStart(4)}  ${String(v.matched).padStart(6)}  ${String(v.filled).padStart(6)}  ${String(v.failed).padStart(6)}  ${slip.padStart(11)}`,
+    );
+  }
+  console.log("");
+  console.log(`  → ${report.summary}`);
+  console.log("");
+  console.log("  Note: decisions↔trades are correlated by proximity (same pair/dir, nearest");
+  console.log("  trade within the window), not a hard link — an aggregate read, not per-trade truth.");
+}

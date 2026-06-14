@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 75 — preflight 校准（preflight calibration — close the decision→outcome loop: were the verdicts actually predictive?）** ✅
+- **闭合 v74 的问责回路，而非加新面**：v74 让 agent 的**决策**可见（每次 go/caution/no_go），但只回答"决定了什么"。运营商更深的信任问题是"**判断对不对**"——preflight 裁决到底有没有预测力，还是噪音？本期把每次记录的裁决关联到其后发生的交易，按 verdict 报告实际结果（成交率、已实现滑点、失败数）
+- 为什么是最重要的：托管真钱给自主 agent，安全（已封顶）+ 问责（v74 决策可见）之后，第一位是**判断质量的验证**。"go 单干净成交（20bps、0% 失败）、caution 单更差（70bps、50% 失败）→ 裁决有预测力"——这是判断 agent 是否真的擅长此事的直接证据，也是 calibration/learning 回路此前缺失的一环
+- 实现（只读、不碰执行/写路径）：纯关联核心 `correlatePreflightToTrades(runs, trades, windowMs)`——每个 preflight run 贪心认领其后同 key（chain/account/pair/direction）窗口内最近的一笔交易，一单只被一个 run 认领；按 verdict 聚合 { runs, matched, filled, failed, pending, medianSlippageBps }。`summarizeCalibration` 给出"caution 比 go 滑点差 Xbps → 有预测力 / 滑点未被 verdict 区分 / 数据不足"的白话判读。`gatherPreflightCalibration` 做 DB 读 + 关联
+- 关联方式诚实标注：决策与交易**无硬链接**，按邻近度（同 pair/dir、决策后窗口内最近一笔、一单一认领）启发式匹配——明确说明是**聚合读**而非逐单真相（偶发错配在聚合中互相抵消）。这避免了改 trade 写路径的风险，且对既有 agent 流程零行为要求
+- Surfaces：CLI `trade preflight calibration [--days --window --strategy]`（per-verdict 表 + 白话判读 + 启发式说明）+ MCP `preflight_calibration`。MCP_TOOLS 不变量加 `preflight_calibration`
+- 测试覆盖：`preflightCalibration.test.ts` 9——关联核心 6（匹配最近后续同 key 单 / 窗口外+决策前不匹配 / 跨 pair-dir-chain 不匹配 / 一单一认领两 run 不共享 / per-verdict fill+fail+中位滑点聚合 / verdict 排序 go→caution→no_go）+ summarize 3（caution 更差→predictive / 未区分→noted / 数据不足→优雅）；CLI 离线烟雾（seed go×2 干净 + caution×2 差/失败 → 渲染表 + "predictive" 判读）
+- 向后兼容：纯加法——新模块、新 CLI 子命令、新 MCP 工具；只读（不改 trade/preflight 写路径）；3377 测试全绿（+9）
+- v1 限制：启发式邻近关联（非硬链接——未来 trade.preflight_id 可精确闭环）；结果用执行质量（成交/滑点/失败），非持仓 P&L（后者需平仓、噪音大）；caution 样本通常小（守规 agent 少在 caution 后下单）→ 数据稀疏时 summarize 优雅降级
+
 **Phase 74 — preflight 决策日志（preflight decision journal — make the agent's risk JUDGMENT visible, including the trades it refused）** ✅
 - **补问责支柱的最大缺口，而非又一个 pre-trade 面**：连续多期把 pre-trade 安全/决策做到极致（preflight 裁决含 timing/concentration/drawdown/sizing），但这些丰富分析**执行后全部蒸发**——trade 行只有自由文本 note。更关键：**caution/no_go 的 preflight 完全不留痕**。今天运营商只看得到"发生了的交易"，永远看不到"agent 明智避开的交易"。agent 可能在正确地拒绝坏单（恰是托管真钱最该有的风控判断力），而这份判断力**零记录**
 - 为什么是最重要的：托管真钱给自主 agent，安全（已封顶）之后第一位是**问责**——运营商必须能审计 agent 的决策行为。"agent 跑了 50 次 preflight，10 次 no_go（正确拒绝）、15 caution、25 go"是 agent 风控纪律的直接证据，此前不存在。这是信任自主 agent 的核心依据
