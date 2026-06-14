@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 120 — edge 进回测：在最早的验证关口就看"有没有 edge"（trade-level edge in the backtest — profit factor/payoff/expectancy at the FIRST trust gate）** ✅
+- **把 edge 信号补到信任管道的最前端**：信任管道是 backtest→paper→promote→live。v114 给实盘对比、v115 给 promote 加了 edge（profit factor/payoff/expectancy），但**回测**（最早的验证关口，连 paper 都还没到）只有权益曲线指标（return/drawdown/sharpe），**没有交易级 edge**。一个回测 +50% 收益、却由一笔幸运历史交易主导（其余 profit factor < 1）的策略，看 return 很漂亮、实则无 edge——而这本该在回测时就被发现
+- 为什么重要：让 edge 在每一个信任关口一致可见（回测→paper 对比→promote→实盘），把"无 edge 的策略"挡在最便宜的关口（回测，零真钱零纸面时间）。return 单看会被运气主导；profit factor 才说明策略是否真的会挑赢家
+- 实现（复用共享 cost-basis reducer，与 v114 零分歧）：BacktestMetrics 加 `edge: TradeEdge | null`。新 `tradeEdgeFromFires(fires)` 把模拟 fires 走**同一个** costBasis.ts reducer（回测 quote≈USD，买入成本=−quoteDelta、卖出收益=+quoteDelta）→ 逐平仓 realized → profit factor/payoff/avg win-loss/expectancy。computeBacktestMetrics 从 fires 算 edge；metricsFromCurve（无 fires 的曲线调用者：快照/playbook sim）edge=null。CLI backtest render 加 Edge 行；MCP backtest_order 描述同步
+- 测试覆盖：+4——混合盈亏算出 PF 3.5/payoff 1.75/expectancy / 75% 胜率但 PF 0.5（暴露无 edge）/ 无亏损→PF null、无平仓/空→edge null / computeBacktestMetrics 从 fires 透出 edge；3611 测试全绿（+4）
+- 向后兼容：纯加法——edge 字段（曲线调用者为 null）；复用共享 reducer；不改回测模拟/曲线/风险数学
+
 **Phase 119 — 持仓审阅 detect→respond：裸奔持仓直接给出一键保护命令（open_positions emits ready protect actions for exposed positions — detect→respond for position protection）** ✅
 - **补上 v110 的响应半边**：v110 让 open_positions 显示每仓保护状态（DETECT——"这个赢家裸奔着"）。但只检测、不响应——agent 看到 UNPROTECTED 后，还得自己拼一个 order_create（side/trigger/base/amount）。这正是 v98 detect→respond 模式要消除的缝隙
 - 为什么重要：持仓管理是 agent 核心循环。审阅持仓时看到裸奔仓，应当一步拿到现成的保护命令，而非手搓订单参数（易错：数量/触发类型）。这把 v110 的检测接进行动，和 promote-outcome（v98）同款 recommendedActions 标准

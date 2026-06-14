@@ -187,6 +187,17 @@ function riskLines(metrics: BacktestMetrics | null, holdMetrics: BacktestMetrics
   };
   const lines = [`  Risk:          ${fmtM(metrics)}   in-market ${metrics.timeInMarketPct.toFixed(0)}%`];
   if (holdMetrics) lines.push(`  Hold risk:     ${fmtM(holdMetrics)}`);
+  // v120: trade-level edge — return alone can be one lucky trade; profit factor
+  // says whether the strategy actually picks winners.
+  if (metrics.edge) {
+    const e = metrics.edge;
+    const pf = e.profitFactor != null ? e.profitFactor.toFixed(2) : (e.losses === 0 && e.wins > 0 ? "∞ (no losses)" : "—");
+    lines.push(
+      `  Edge:          profit factor ${pf} · payoff ${e.payoffRatio != null ? `${e.payoffRatio.toFixed(2)}×` : "—"}` +
+        ` · win rate ${e.winRatePct != null ? `${e.winRatePct.toFixed(0)}%` : "—"} (${e.wins}/${e.wins + e.losses})` +
+        ` · expectancy ${e.expectancyUsd != null ? `${e.expectancyUsd >= 0 ? "+" : "−"}$${Math.abs(e.expectancyUsd).toFixed(2)}` : "—"}/trade over ${e.closes} closes`,
+    );
+  }
   return lines;
 }
 

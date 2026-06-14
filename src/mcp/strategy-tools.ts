@@ -486,7 +486,7 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
   // ── backtest_order ─────────────────────────────────────────
   server.tool(
     "backtest_order",
-    "Replay a single order spec (price_below / price_above / trailing) against a CoinGecko price series. Returns the simulated fire timeline + PnL + vs-hold counterfactual. CoinGecko resolution: ≤1 day → 5-min, ≤90 days → hourly, >90 days → daily. Persists a row in backtest_runs for later retrieval via `backtest_show`. Errors: INVALID_PARAMS (spec validation); UNKNOWN_TOKEN (base not CoinGecko-listed).",
+    "Replay a single order spec (price_below / price_above / trailing) against a CoinGecko price series. Returns the simulated fire timeline + PnL + vs-hold counterfactual + risk metrics (return/drawdown/vol/sharpe). v120: metrics.edge gives trade-level EDGE on the simulated round-trips — profitFactor / payoffRatio / winRatePct / expectancyUsd (same shape as live strategy_compare + promote_check) — so you catch a strategy whose +X% backtest is one lucky trade (profit factor < 1) BEFORE paper, the earliest trust gate. CoinGecko resolution: ≤1 day → 5-min, ≤90 days → hourly, >90 days → daily. Persists a row in backtest_runs for later retrieval via `backtest_show`. Errors: INVALID_PARAMS (spec validation); UNKNOWN_TOKEN (base not CoinGecko-listed).",
     {
       side: z.enum(["buy", "sell"]).describe("Trade direction."),
       trigger: z.enum(["price_below", "price_above", "trailing"]).describe("Trigger type."),

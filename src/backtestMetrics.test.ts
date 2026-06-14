@@ -9,6 +9,7 @@ import {
   computeBacktestMetrics,
   inferPeriodsPerYear,
   downsampleCurve,
+  tradeEdgeFromFires,
   type EquityPoint,
 } from "./backtestMetrics.js";
 import type { BacktestFire, PriceSeries } from "./backtest.js";
@@ -193,5 +194,57 @@ describe("inferPeriodsPerYear / downsampleCurve", () => {
       series: { coinId: "x", daysRequested: 1, points: [] },
       baseSymbol: "ETH", quoteSymbol: "USDC",
     })).toBeNull();
+  });
+});
+
+// v120: trade-level edge on the simulated fires (mirrors v114/v115 metrics).
+describe("tradeEdgeFromFires", () => {
+  it("computes profit factor / payoff / expectancy over mixed round-trips", () => {
+    const fires = [
+      fill("2026-01-01T00:00:00Z", 1, -2000), fill("2026-01-02T00:00:00Z", -1, 2500), // +500 win
+      fill("2026-01-03T00:00:00Z", 1, -2000), fill("2026-01-04T00:00:00Z", -1, 2200), // +200 win
+      fill("2026-01-05T00:00:00Z", 1, -2000), fill("2026-01-06T00:00:00Z", -1, 1800), // -200 loss
+    ];
+    const e = tradeEdgeFromFires(fires)!;
+    expect(e.closes).toBe(3);
+    expect(e.wins).toBe(2);
+    expect(e.losses).toBe(1);
+    expect(e.profitFactor).toBeCloseTo(700 / 200, 4); // 3.5
+    expect(e.avgWinUsd).toBeCloseTo(350, 4);
+    expect(e.avgLossUsd).toBeCloseTo(200, 4);
+    expect(e.payoffRatio).toBeCloseTo(350 / 200, 4);
+    expect(e.expectancyUsd).toBeCloseTo((500 + 200 - 200) / 3, 4);
+  });
+
+  it("a high win rate with one big loser → profit factor < 1 (edge exposed)", () => {
+    const fires = [
+      fill("2026-01-01T00:00:00Z", 1, -2000), fill("2026-01-02T00:00:00Z", -1, 2100), // +100
+      fill("2026-01-03T00:00:00Z", 1, -2000), fill("2026-01-04T00:00:00Z", -1, 2100), // +100
+      fill("2026-01-05T00:00:00Z", 1, -2000), fill("2026-01-06T00:00:00Z", -1, 2100), // +100
+      fill("2026-01-07T00:00:00Z", 1, -2000), fill("2026-01-08T00:00:00Z", -1, 1400), // -600
+    ];
+    const e = tradeEdgeFromFires(fires)!;
+    expect(e.winRatePct).toBeCloseTo(75, 4);
+    expect(e.profitFactor).toBeCloseTo(300 / 600, 4); // 0.5 — bleeding
+    expect(e.profitFactor! < 1).toBe(true);
+  });
+
+  it("no losses → profitFactor null; no closes → whole edge null", () => {
+    const allWins = tradeEdgeFromFires([
+      fill("2026-01-01T00:00:00Z", 1, -2000), fill("2026-01-02T00:00:00Z", -1, 2500),
+    ])!;
+    expect(allWins.profitFactor).toBeNull();
+    expect(allWins.payoffRatio).toBeNull();
+    expect(tradeEdgeFromFires([fill("2026-01-01T00:00:00Z", 1, -2000)])).toBeNull(); // buy only
+    expect(tradeEdgeFromFires([])).toBeNull();
+  });
+
+  it("computeBacktestMetrics surfaces the edge from the fires", () => {
+    const series = dailySeries("2026-01-01T00:00:00Z", [2000, 2000, 2500, 2500]);
+    const fires = [fill("2026-01-01T00:00:00Z", 1, -2000), fill("2026-01-03T00:00:00Z", -1, 2500)];
+    const m = computeBacktestMetrics({ initialBalance: { USDC: 5000 }, fires, series, baseSymbol: "WETH", quoteSymbol: "USDC" })!;
+    expect(m.edge).not.toBeNull();
+    expect(m.edge!.closes).toBe(1);
+    expect(m.edge!.expectancyUsd).toBeCloseTo(500, 4);
   });
 });

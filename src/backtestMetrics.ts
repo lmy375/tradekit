@@ -25,6 +25,7 @@
  */
 
 import type { BacktestFire, PriceSeries, SymbolBalance } from "./backtest.js";
+import { applyBuy, applySell } from "./costBasis.js";
 
 export interface EquityPoint {
   ts: string;
@@ -56,6 +57,75 @@ export interface BacktestMetrics {
   equityEndUsd: number;
   /** Equity curve downsampled to ≤100 points (endpoints always kept). */
   curve: EquityPoint[];
+  /** v120: trade-level EDGE on the simulated round-trips (profit factor / payoff
+   *  / expectancy) — answers "does this strategy have an edge?", which returnPct
+   *  alone can't (a +50% backtest driven by one lucky trade has no edge). Null
+   *  when nothing closed, or when the curve had no fires (metricsFromCurve). */
+  edge: TradeEdge | null;
+}
+
+/** v120: trade-level edge metrics — mirrors the live strategy-comparison (v114)
+ *  + promote-check (v115) shapes so edge reads consistently at EVERY trust gate
+ *  (backtest → paper-compare → promote → live). */
+export interface TradeEdge {
+  closes: number;
+  wins: number;
+  losses: number;
+  winRatePct: number | null;
+  avgWinUsd: number | null;
+  avgLossUsd: number | null;
+  /** grossWin / grossLoss. > 1 = profitable edge. Null when no losses. */
+  profitFactor: number | null;
+  /** avgWin / avgLoss. Null until both a win and a loss exist. */
+  payoffRatio: number | null;
+  /** realized $ ÷ closes — per-trade expectancy. */
+  expectancyUsd: number | null;
+}
+
+const EDGE_FLAT_USD = 1e-6;
+
+/**
+ * v120: walk the simulated fires through the SAME cost-basis reducer the live
+ * P&L surfaces use (costBasis.ts) to derive trade-level edge. The backtest
+ * prices quote ≈ USD (the equity curve adds `quote` as USD), so a buy's cost is
+ * the USD spent (−quoteDelta) and a sell's proceeds are the USD received
+ * (+quoteDelta) — realized P&L per closed round-trip, no divergence from v114.
+ */
+export function tradeEdgeFromFires(fires: readonly BacktestFire[]): TradeEdge | null {
+  const pos = { amount: 0, cost: 0 };
+  let closes = 0, wins = 0, losses = 0, grossWin = 0, grossLoss = 0, realizedTotal = 0;
+  const sorted = [...fires]
+    .filter((f) => f.action === "fill")
+    .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  for (const f of sorted) {
+    if (f.baseDelta > 0) {
+      // Buy: acquire baseDelta for the USD spent (−quoteDelta, quote ≈ USD).
+      applyBuy(pos, f.baseDelta, -f.quoteDelta);
+    } else if (f.baseDelta < 0) {
+      const sellAmt = -f.baseDelta;
+      const sellPricePerUnit = sellAmt > 0 ? f.quoteDelta / sellAmt : 0;
+      const { avgCost, sold } = applySell(pos, sellAmt);
+      if (sold > 0) {
+        const realized = (sellPricePerUnit - avgCost) * sold;
+        realizedTotal += realized;
+        closes += 1;
+        if (realized > EDGE_FLAT_USD) { wins += 1; grossWin += realized; }
+        else if (realized < -EDGE_FLAT_USD) { losses += 1; grossLoss += -realized; }
+      }
+    }
+  }
+  if (closes === 0) return null;
+  return {
+    closes,
+    wins,
+    losses,
+    winRatePct: wins + losses > 0 ? (wins / (wins + losses)) * 100 : null,
+    avgWinUsd: wins > 0 ? grossWin / wins : null,
+    avgLossUsd: losses > 0 ? grossLoss / losses : null,
+    profitFactor: grossLoss > EDGE_FLAT_USD ? grossWin / grossLoss : null,
+    payoffRatio: wins > 0 && losses > 0 ? (grossWin / wins) / (grossLoss / losses) : null,
+    expectancyUsd: realizedTotal / closes,
+  };
 }
 
 const CURVE_MAX_POINTS = 100;
@@ -129,7 +199,11 @@ export function computeBacktestMetrics(args: {
     }
   }
 
-  return metricsFromCurve({ curve, inMarketFlags });
+  // v120: trade-level edge from the fires (metricsFromCurve can't — it's
+  // curve-only). Override the null edge it returns.
+  const base = metricsFromCurve({ curve, inMarketFlags });
+  if (base == null) return null;
+  return { ...base, edge: tradeEdgeFromFires(args.fires) };
 }
 
 /**
@@ -207,6 +281,9 @@ export function metricsFromCurve(args: {
     equityStartUsd,
     equityEndUsd,
     curve: downsampleCurve(curve, CURVE_MAX_POINTS),
+    // v120: curve-only callers (equity snapshots, playbook sim) have no fires →
+    // no trade-level edge. computeBacktestMetrics overrides this from the fires.
+    edge: null,
   };
 }
 
