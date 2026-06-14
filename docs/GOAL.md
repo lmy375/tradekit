@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 113 — 安全网可靠性上 Web：运营商在主监控界面看到"护栏到底能不能生效"（safety-net reliability on the dashboard — engine liveness + notification delivery where the web operator watches）** ✅
+- **把"护栏能否真正生效"的信号搬到 web 操作面**：web Safety 页显示配置 posture（配了哪些护栏）+ headroom（还剩多少额度）。但护栏只有在**引擎能触发止损 + 告警能送达运营商**时才真正保护你——v103 引擎存活只在 cron digest、v106 通知投递健康只在 doctor。主要用 web 监控的运营商看不到"引擎死了→止损静默失效"或"告警通道死了→盲飞"。posture 显示"hardened"而安全网实际断了
+- 为什么重要：自主交易里运营商保持掌控的关键，是知道安全网真的在运转。把可靠性信号搬到运营商主盯的界面（v86/87/102 确立的"关键信号上滞后 web 界面"模式），让"我的护栏现在能生效吗"一眼可判。这直接服务"运营商掌控自主交易"
+- 实现（复用 doctor 导出的 check，单一源）：`/api/safety` 扩展返回 `reliability: CheckResult[]`——调用 doctor 已导出的 `checkEngineLiveness`（v103 同源）+ `checkNotificationDelivery`（v106 同源），两者快速无 RPC。Safety.tsx 新增"Safety net operational?"卡片：逐 check badge（ok/warn/FAIL）+ message +（非 ok 时）hint。web 和 doctor 用同一判定、不分叉
+- 测试覆盖：webAutomation.test.ts /api/safety 扩展断言（reliability 含 engine liveness + notification delivery、severity ∈ ok/warn/fail）；3589 后端测试全绿；webui `tsc -b && vite build` 干净（801 模块）
+- 向后兼容：纯加法——/api/safety 仅增 reliability 字段（既有 posture/headroom 不变）；SafetyResp.reliability optional（旧 server 缺省时前端不渲染该卡）；复用 doctor checks 不改判定逻辑
+
 **Phase 112 — logger.close() 保证 flush：消除测试套件里的计时竞态 flake（awaitable logger flush — kill the fixed-setTimeout race that made the suite intermittently red）** ✅
 - **修复侵蚀"全绿"信号的 flaky 测试**：每次迭代我都靠"3589 全绿"来验证正确性工作。但 logger.test.ts 偶发失败（"fileLevel gates which levels reach the disk"）——`logger.close()` 是 fire-and-forget（`logStream.end()`），测试用固定 `setTimeout(50ms)` 等异步 flush 再读文件；并行满载下 50ms 不够，readFileSync 在 warn-keep/error-keep 落盘前就读了→失败。一个偶发红是真实负债：它侵蚀对测试套件的信任，还可能掩盖真实失败（开发者看到红以为是 flake 而忽略真 break）
 - 为什么重要：测试套件是保护所有正确性投资（v104-v111 整条 value_usd 弧）的根基。一个不可信的"全绿"让每次迭代的验证打折。修掉 flake 的根因比任何新 feature 都更保护已有工作

@@ -65,7 +65,9 @@ export function Safety({ status: _status }: PageProps) {
 
   if (!data) return loading ? <Loader size="sm" /> : null;
   const { posture, headroom } = data;
+  const reliability = data.reliability ?? [];
   const c = posture.counts;
+  const RELIA_COLOR: Record<string, string> = { ok: "teal", warn: "yellow", fail: "red" };
 
   return (
     <Stack>
@@ -104,6 +106,30 @@ export function Safety({ status: _status }: PageProps) {
           )}
         </Card>
       </SimpleGrid>
+
+      {reliability.length > 0 && (
+        <Card withBorder padding="sm">
+          <Text fw={600} mb={4}>Safety net operational?</Text>
+          <Text size="xs" c="dimmed" mb="xs">
+            Guardrails only protect you if the engine can FIRE stops and alerts REACH you. A failure
+            here means the net is down even when the posture above looks fine.
+          </Text>
+          <Stack gap={6}>
+            {reliability.map((r) => (
+              <Group key={r.name} gap="xs" wrap="nowrap" align="flex-start">
+                <Badge color={RELIA_COLOR[r.severity] ?? "gray"} variant="light" style={{ flexShrink: 0 }}>
+                  {r.severity === "fail" ? "FAIL" : r.severity}
+                </Badge>
+                <div>
+                  <Text size="sm" fw={500}>{r.name}</Text>
+                  <Text size="xs" c="dimmed">{r.message}</Text>
+                  {r.severity !== "ok" && r.hint && <Text size="xs" c="dimmed" fs="italic">→ {r.hint}</Text>}
+                </div>
+              </Group>
+            ))}
+          </Stack>
+        </Card>
+      )}
 
       {posture.gaps.length > 0 && (
         <Alert

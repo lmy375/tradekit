@@ -739,6 +739,9 @@ export interface SafetyResp {
     binding: SafetyResp["headroom"]["entries"][number] | null;
     counts: { ok: number; approaching: number; exhausted: number; tripped: number };
   };
+  /** v113: safety-NET reliability — does the engine fire stops + do alerts reach
+   *  you? Reused doctor checks. Absent on older servers. */
+  reliability?: Array<{ name: string; severity: "ok" | "warn" | "fail"; message: string; hint?: string }>;
 }
 
 export const getSafety = () => api.get<SafetyResp>("/api/safety");

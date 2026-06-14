@@ -769,11 +769,17 @@ export function registerAutomationRoutes(app: Express): void {
   // now consumable by the web dashboard + any external monitor.
   app.get(
     "/api/safety",
-    wrap((_req, res) => {
+    wrap(async (_req, res) => {
       const config = loadConfig();
       const posture = reviewSafety(config);
       const headroom = gatherSafetyHeadroom({ config });
-      res.json({ ok: true, posture, headroom });
+      // v113: bring the safety-NET reliability signals to the web operator —
+      // the cron digest (engine liveness) and doctor (notification delivery)
+      // checks decide whether the guardrails can actually FIRE / REACH you. Reuse
+      // the exported doctor checks (single source); both are fast + RPC-free.
+      const { checkEngineLiveness, checkNotificationDelivery } = await import("./doctor.js");
+      const reliability = await Promise.all([checkEngineLiveness(), checkNotificationDelivery()]);
+      res.json({ ok: true, posture, headroom, reliability });
     }),
   );
 

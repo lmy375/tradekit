@@ -807,6 +807,17 @@ describe("/api/safety", () => {
     expect(Array.isArray(headroom.entries)).toBe(true);
     expect(headroom.counts).toHaveProperty("ok");
     expect(headroom.counts).toHaveProperty("tripped");
+
+    // v113: safety-net reliability checks (engine liveness + notification delivery).
+    const reliability = r.body.reliability as Array<{ name: string; severity: string; message: string }>;
+    expect(Array.isArray(reliability)).toBe(true);
+    expect(reliability.map((x) => x.name)).toEqual(
+      expect.arrayContaining(["engine liveness", "notification delivery"]),
+    );
+    for (const chk of reliability) {
+      expect(["ok", "warn", "fail"]).toContain(chk.severity);
+      expect(typeof chk.message).toBe("string");
+    }
   });
 });
 
