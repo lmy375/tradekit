@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 69 — 入场/退出时机进 pre-trade 决策门（market timing in the preflight verdict — "is now a good time?", not just "will it execute?"）** ✅
+- **把已有能力合流进最关键的决策时刻，而非加新 surface**：v64 给了 price_context（区间位置/趋势），但它是**独立**的一次调用——agent 要在交易前自己记得调、自己综合。`preview_trade`/`preflight_trade` 是 agent 下单前的**单一决策面**（执行 gauntlet：滑点、限额、token、失败模式），却**只回答"能不能干净成交"，不回答"现在是不是好时机"**。agent 完全可能拿到一个 go，然后买在 30 天高点 / 接飞刀
+- 为什么这是最重要的：agent 拿真钱交易，**亏钱的两大来源是 (a) 被坑（已重投：安全栈）和 (b) 时机差（买顶/卖底/接飞刀）**。(b) 此前在决策门里完全缺位。把时机读数放进 preflight 的 go/caution/no_go 裁决 → agent 分支 `report.verdict` 时**自动**把坏时机纳入考量，不必记得单独调 price_context、也不会漏判
+- **方向感知是真正的 feature（非薄包装）**：同一个区间位置对 buy/sell **意义相反**。近期高点 = 买入"追顶"（caution）/ 卖出"在高位出货"（favorable）；近期低点 = 买入"有利入场区"（favorable）/ 卖出"锁死弱价"（caution）；窗口内陡跌 = 买入"接飞刀"（caution）；陡涨 = 卖出"顺势出货"（favorable）。纯函数 `assessTradeTiming(ctx, direction)` 把原始区间数据翻译成与 agent 即将做的动作对齐的决策信号
+- 实现：(1) `priceContext.ts` 加纯函数 `assessTradeTiming` + 文档常量 `STEEP_TREND_PCT=15`（飞刀/强势阈值）、`ELEVATED_VOL_PCT=12`（波动率提示，不单独驱动裁决）；(2) `tradePreview.ts` 加 `marketContext` 字段——与既有 6 路并行读**并发**拉取（base token，native→weth；v66 缓存吸收重复；best-effort，无映射/失败则缺省，绝不阻塞 preview）；(3) **`preflight.ts` 把它接进裁决门**：新 reason code `market_timing_caution`（warn→裁决降为 caution，但**只是建议，永不阻断**）/ `market_timing_ok`（info）；(4) CLI preview 渲染时机行 + MCP 两个工具描述更新
+- 测试覆盖：`priceContext.test.ts` +8（buy 近高→caution / sell 近高→favorable / buy 近低陡跌→飞刀 caution 压过 / buy 近低缓跌→favorable / sell 近低→caution / sell 陡涨→顺势 favorable / mid-range 平→neutral 无 notes / flat null 位置不崩）；`preflight.test.ts` +5（caution→裁决 caution + reason 形状/severity/source / favorable→仍 go info / neutral→go / 无 context→无 market_timing reason / caution 不压过 critical 仍 no_go）
+- 向后兼容：纯加法——`marketContext` 仅在 base 有 CoinGecko 映射时出现；新 reason code 加法（agent 分支既有 code 不受影响）；MCP_TOOLS 不变量不动（只改描述未加工具）；3316 测试全绿（+13）
+- v1 限制：时机是**建议非护栏**（caution 降级到 caution，永不 no_go——区间位置不是安全问题，强行阻断会挡住合理的逆势/止损交易）；时机看 base token（native 经 weth）；窗口默认 7d（entry/exit 时机够用，可配）；无 CoinGecko 映射的 token 无时机读数（优雅缺省）；`previewTrade` 编排仍 RPC-bound 不做端到端单测（沿用 iter608 纪律——纯逻辑 assessTradeTiming+裁决接线全测，glue 镜像既有 limits/failurePattern best-effort 模式）
+
 **Phase 68 — 安全态势上 Web（safety posture & headroom on the dashboard — close the last interface gap）** ✅
 - **补齐唯一缺位的一等界面，而非加新能力**：tradekit 三大界面是 CLI / MCP / Web。安全是这个产品**最重要的东西**（agent 拿真钱交易，运营商的信任全系于护栏）。v51 `safety review`（配置审计：哪些护栏开着/哪里裸奔）+ v53 `safety headroom`（运行时余量：还剩多少、谁是约束瓶颈）此前只在 CLI/MCP——Web 仪表盘**完全看不到安全态势**。运营商盯着 dashboard 时，恰恰看不到最该看的东西
 - 缺口：Web 有 Execution/PnL/Approvals 等 13 个 tab，唯独没有"这套配置安不安全 / 限额还剩多少"。运营商要么切到终端跑 `safety review`，要么裸奔。Web 是运营商日常盯盘的地方——安全态势就该在那

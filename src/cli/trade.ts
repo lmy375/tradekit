@@ -395,6 +395,16 @@ export async function tradePreviewCommand(
         }
       }
     }
+    // v69: market-timing context — where the base price sits + a
+    // direction-aware read of whether now is a good moment for this trade.
+    if (report.marketContext) {
+      const mc = report.marketContext;
+      const mark = mc.timing === "caution" ? "🟡 CAUTION" : mc.timing === "favorable" ? "🟢 FAVORABLE" : "⚪ NEUTRAL";
+      console.log("");
+      console.log(`  Market timing:     ${mark} (${mc.windowDays}d)`);
+      console.log(`    ${mc.summary}`);
+      for (const n of mc.notes) console.log(`    • ${n}`);
+    }
     if (report.alternatives && report.alternatives.length > 0) {
       console.log("");
       console.log(`  Aggregator alternatives (best-of-N race):`);

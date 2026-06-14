@@ -49,6 +49,8 @@ export interface PreflightReason {
     | "gas_pct_high"
     | "balance_fraction_high"
     | "approval_needed"
+    | "market_timing_caution"
+    | "market_timing_ok"
     | "preview_ok"
     | "token_ok"
     | "price_ok"
@@ -57,7 +59,7 @@ export interface PreflightReason {
   severity: "info" | "warn" | "critical";
   message: string;
   /** Source check this came from. */
-  source: "preview" | "token_safety" | "price_cross_check" | "history" | "general";
+  source: "preview" | "token_safety" | "price_cross_check" | "history" | "market_timing" | "general";
 }
 
 export interface PreflightReport {
@@ -98,10 +100,13 @@ export interface PreflightReport {
  *    5. price suspicious divergence
  *    6. historical median slippage > 100 bps (route quality issue)
  *    7. gas % of trade > 10%
+ *    8. market-timing caution (buying near a high / into a falling knife;
+ *       selling near a low) — advice, nudges to caution, never blocks
  *
  *  Info (still go, but operator should know):
- *    8. balance fraction > 50%
- *    9. approval needed
+ *    9. balance fraction > 50%
+ *   10. approval needed
+ *   11. market-timing favorable / neutral
  *
  * Multiple findings can be reported; verdict is the WORST severity. Reasons
  * list is the COMPLETE set so the operator sees every signal.
@@ -227,6 +232,31 @@ export function combinePreflightVerdict(args: {
         message: "Approval needed before this trade — agent must call `approve` first, or the trade orchestrator will handle it.",
         source: "preview",
       });
+    }
+
+    // v69: market-timing read. `limits`/`safety` answer "will it execute?";
+    // this answers "is now a good time?". A caution flag (buying near the
+    // recent high / into a falling knife; selling near the recent low) is a
+    // warn — it nudges the verdict to caution but never blocks: timing is
+    // advice, not a hard guardrail. Favorable / neutral is recorded info-level
+    // so the verdict stays honest about what was checked.
+    if (args.preview.marketContext) {
+      const mc = args.preview.marketContext;
+      if (mc.timing === "caution") {
+        reasons.push({
+          code: "market_timing_caution",
+          severity: "warn",
+          message: `Market timing caution: ${mc.notes.join("; ") || mc.summary}.`,
+          source: "market_timing",
+        });
+      } else {
+        reasons.push({
+          code: "market_timing_ok",
+          severity: "info",
+          message: `Market timing ${mc.timing}: ${mc.summary}.`,
+          source: "market_timing",
+        });
+      }
     }
   }
 

@@ -6,7 +6,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { computePriceContext, gatherPriceContext, NEAR_HIGH_PCT, NEAR_LOW_PCT } from "./priceContext.js";
+import {
+  computePriceContext,
+  gatherPriceContext,
+  assessTradeTiming,
+  NEAR_HIGH_PCT,
+  NEAR_LOW_PCT,
+  STEEP_TREND_PCT,
+} from "./priceContext.js";
 import type { PricePoint } from "./backtest.js";
 
 const DAY = 86_400_000;
@@ -110,5 +117,72 @@ describe("gatherPriceContext", () => {
       fetchImpl: async () => { throw new Error("should not fetch an unmapped token"); },
     });
     expect(r).toBeNull();
+  });
+});
+
+describe("assessTradeTiming — direction-aware verdict (v69)", () => {
+  // The same context reads opposite for buy vs sell.
+  it("BUY near the high → caution (chasing the top)", () => {
+    const ctx = computePriceContext(series([100, 110, 120, 130, 140]), 7, NOW); // at the high
+    const r = assessTradeTiming(ctx, "buy");
+    expect(r.timing).toBe("caution");
+    expect(r.notes.join(" ")).toMatch(/near the 7d high/);
+  });
+
+  it("SELL near the high → favorable (taking the top)", () => {
+    const ctx = computePriceContext(series([100, 110, 120, 130, 140]), 7, NOW);
+    const r = assessTradeTiming(ctx, "sell");
+    expect(r.timing).toBe("favorable");
+    expect(r.notes.join(" ")).toMatch(/favorable exit/);
+  });
+
+  it("BUY near the low → favorable entry zone", () => {
+    const ctx = computePriceContext(series([140, 130, 120, 110, 100]), 7, NOW); // at the low, but falling
+    // Falling-knife caution should dominate a steep decline even at the low.
+    const r = assessTradeTiming(ctx, "buy");
+    expect(r.timing).toBe("caution"); // -28.6% over window → falling knife
+    expect(r.notes.join(" ")).toMatch(/falling-knife/);
+  });
+
+  it("BUY near the low with a GENTLE pullback → favorable (no falling-knife)", () => {
+    // Down only ~7% over the window (< STEEP_TREND_PCT) and at the low.
+    const ctx = computePriceContext(series([107, 112, 100, 99.5, 100]), 7, NOW);
+    expect(Math.abs(ctx.changePctWindow)).toBeLessThan(STEEP_TREND_PCT);
+    expect(ctx.rangePositionPct!).toBeLessThanOrEqual(NEAR_LOW_PCT);
+    const r = assessTradeTiming(ctx, "buy");
+    expect(r.timing).toBe("favorable");
+    expect(r.notes.join(" ")).toMatch(/favorable entry/);
+  });
+
+  it("SELL near the low → caution (locking in a weak price)", () => {
+    const ctx = computePriceContext(series([140, 130, 120, 110, 100]), 7, NOW);
+    const r = assessTradeTiming(ctx, "sell");
+    expect(r.timing).toBe("caution");
+    expect(r.notes.join(" ")).toMatch(/weak price/);
+  });
+
+  it("SELL into a steep rise → favorable (selling into strength)", () => {
+    // Mid-range position but a strong up move over the window.
+    const ctx = computePriceContext(series([100, 90, 130, 150, 135]), 7, NOW);
+    expect(ctx.changePctWindow).toBeGreaterThanOrEqual(STEEP_TREND_PCT);
+    const r = assessTradeTiming(ctx, "sell");
+    expect(r.timing).toBe("favorable");
+    expect(r.notes.join(" ")).toMatch(/selling into strength/);
+  });
+
+  it("mid-range, flat trend → neutral with no notes", () => {
+    const ctx = computePriceContext(series([100, 102, 98, 101, 100]), 7, NOW);
+    expect(ctx.rangePositionPct!).toBeGreaterThan(NEAR_LOW_PCT);
+    expect(ctx.rangePositionPct!).toBeLessThan(NEAR_HIGH_PCT);
+    const r = assessTradeTiming(ctx, "buy");
+    expect(r.timing).toBe("neutral");
+    expect(r.notes).toHaveLength(0);
+  });
+
+  it("flat range (null position) → neutral, no crash", () => {
+    const ctx = computePriceContext(series([100, 100, 100]), 7, NOW);
+    expect(ctx.rangePositionPct).toBeNull();
+    expect(assessTradeTiming(ctx, "buy").timing).toBe("neutral");
+    expect(assessTradeTiming(ctx, "sell").timing).toBe("neutral");
   });
 });

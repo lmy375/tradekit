@@ -137,6 +137,26 @@ export interface TradePreviewReport {
    *  Computed via the real enforcers (zero divergence). Absent only when
    *  the projection itself errors (best-effort, never blocks the preview). */
   limits?: import("./tradeAdmissibility.js").TradeLimitProjection;
+  /** v69: market-timing context for THIS trade. Where `limits`/`safety`
+   *  answer "will it execute cleanly?", this answers "is now a good time?" —
+   *  where the base price sits in its recent range, the trend, and a
+   *  direction-aware verdict (buying near a high vs a low, selling into
+   *  strength vs weakness). Composes the v64 price context + a pure timing
+   *  assessment so the agent's pre-trade dashboard covers timing, not just
+   *  mechanics. Best-effort: absent when the base has no CoinGecko mapping or
+   *  the series fetch fails (never blocks the preview). */
+  marketContext?: {
+    windowDays: number;
+    coinId: string;
+    currentPriceUsd: number;
+    rangePositionPct: number | null;
+    changePctWindow: number;
+    changePct24h: number | null;
+    volatilityPct: number | null;
+    summary: string;
+    timing: import("./priceContext.js").TradeTimingFlag;
+    notes: string[];
+  };
 }
 
 /**
@@ -268,6 +288,12 @@ export async function previewTrade(args: {
    *  evaluates the per-strategy budget + net-exposure position cap that
    *  would gate a tagged agent trade at execution. */
   strategy?: string | null;
+  /** v69: window (days) for the market-timing context. Default 7d — good for
+   *  entry/exit timing without over-fetching. */
+  marketContextDays?: number;
+  /** v69: test seam for the market-context series fetch — passed through to
+   *  gatherPriceContext. Defaults to the live CoinGecko fetch. */
+  seriesFetchImpl?: (url: string) => Promise<unknown>;
 }): Promise<TradePreviewReport> {
   const baseIsNative = args.base === NATIVE_TOKEN;
   const quoteIsNative = args.quote === NATIVE_TOKEN;
@@ -332,6 +358,20 @@ export async function previewTrade(args: {
     args.config,
     args.logger,
   );
+
+  // v69: kick off the market-timing context fetch for the BASE token now so it
+  // overlaps the balance/price/allowance reads below (zero added latency in the
+  // common case; v66 caches the series). Best-effort — never blocks the
+  // preview. Native base → use WETH (mirrors the price-context surface).
+  const { gatherPriceContext } = await import("./priceContext.js");
+  const marketCtxBase = baseIsNative ? args.profile.weth : (args.base as Address);
+  const marketCtxPromise = gatherPriceContext({
+    tokenAddress: marketCtxBase,
+    windowDays: args.marketContextDays ?? 7,
+    config: args.config,
+    logger: args.logger,
+    fetchImpl: args.seriesFetchImpl,
+  }).catch(() => null);
 
   // Fan out parallel reads: input USD price, output USD price, native USD price
   // (for gas), wallet balance for tokenIn, current allowance to the
@@ -492,6 +532,32 @@ export async function previewTrade(args: {
     args.logger.debug(`v54 limit projection failed: ${(e as Error).message}`);
   }
 
+  // v69: resolve the market-timing context kicked off above + apply the
+  // direction-aware assessment. Best-effort — absent on no-mapping / fetch
+  // failure, matching the limits / failure-pattern stance.
+  let marketContext: TradePreviewReport["marketContext"];
+  try {
+    const ctx = await marketCtxPromise;
+    if (ctx) {
+      const { assessTradeTiming } = await import("./priceContext.js");
+      const { timing, notes } = assessTradeTiming(ctx, args.direction);
+      marketContext = {
+        windowDays: ctx.windowDays,
+        coinId: ctx.coinId,
+        currentPriceUsd: ctx.currentPriceUsd,
+        rangePositionPct: ctx.rangePositionPct,
+        changePctWindow: ctx.changePctWindow,
+        changePct24h: ctx.changePct24h,
+        volatilityPct: ctx.volatilityPct,
+        summary: ctx.summary,
+        timing,
+        notes,
+      };
+    }
+  } catch (e) {
+    args.logger.debug(`v69 market context failed: ${(e as Error).message}`);
+  }
+
   return {
     chain: args.profile.name,
     direction: args.direction,
@@ -508,6 +574,7 @@ export async function previewTrade(args: {
     timestamp: new Date().toISOString(),
     ...(recentFailurePattern ? { recentFailurePattern } : {}),
     ...(limits ? { limits } : {}),
+    ...(marketContext ? { marketContext } : {}),
   };
 }
 

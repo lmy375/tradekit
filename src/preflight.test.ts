@@ -18,8 +18,10 @@ function makePreview(overrides?: {
   gasPctOfInput?: number | null;
   balanceFractionPct?: number;
   hasSufficientAllowance?: boolean;
+  marketContext?: TradePreviewReport["marketContext"];
 }): TradePreviewReport {
   return {
+    ...(overrides?.marketContext ? { marketContext: overrides.marketContext } : {}),
     chain: "base",
     direction: "buy",
     baseToken: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" as Address,
@@ -118,6 +120,64 @@ describe("combinePreflightVerdict — go path", () => {
     });
     expect(r.verdict).toBe("go");
     expect(r.reasons.find((x) => x.code === "approval_needed")).toBeDefined();
+  });
+});
+
+describe("combinePreflightVerdict — market timing (v69)", () => {
+  const mc = (timing: "favorable" | "neutral" | "caution", notes: string[] = []): TradePreviewReport["marketContext"] => ({
+    windowDays: 7,
+    coinId: "ethereum",
+    currentPriceUsd: 3000,
+    rangePositionPct: timing === "caution" ? 95 : timing === "favorable" ? 5 : 50,
+    changePctWindow: 10,
+    changePct24h: 1,
+    volatilityPct: 4,
+    summary: "$3,000 · +10% over 7d",
+    timing,
+    notes,
+  });
+
+  it("caution timing → verdict caution (advice nudges, never blocks)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview({ marketContext: mc("caution", ["buying near the 7d high (95% of range) — chasing the top"]) }),
+      tokenSafety: makeTokenSafety("ok"),
+    });
+    expect(r.verdict).toBe("caution");
+    const reason = r.reasons.find((x) => x.code === "market_timing_caution");
+    expect(reason).toBeDefined();
+    expect(reason!.severity).toBe("warn");
+    expect(reason!.source).toBe("market_timing");
+    expect(reason!.message).toMatch(/chasing the top/);
+  });
+
+  it("favorable timing → still go, recorded info-level", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview({ marketContext: mc("favorable", ["near the 7d low — favorable entry zone"]) }),
+      tokenSafety: makeTokenSafety("ok"),
+    });
+    expect(r.verdict).toBe("go");
+    const reason = r.reasons.find((x) => x.code === "market_timing_ok");
+    expect(reason).toBeDefined();
+    expect(reason!.severity).toBe("info");
+  });
+
+  it("neutral timing → go, info-level", () => {
+    const r = combinePreflightVerdict({ preview: makePreview({ marketContext: mc("neutral") }) });
+    expect(r.verdict).toBe("go");
+    expect(r.reasons.find((x) => x.code === "market_timing_ok")).toBeDefined();
+  });
+
+  it("absent market context → no market_timing reason at all", () => {
+    const r = combinePreflightVerdict({ preview: makePreview() });
+    expect(r.reasons.find((x) => x.source === "market_timing")).toBeUndefined();
+  });
+
+  it("a caution timing does NOT override a critical finding (still no_go)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview({ marketContext: mc("caution") }),
+      tokenSafety: makeTokenSafety("honeypot"),
+    });
+    expect(r.verdict).toBe("no_go");
   });
 });
 

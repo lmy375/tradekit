@@ -26,6 +26,14 @@ import { fetchPriceSeries, type PricePoint } from "./backtest.js";
 export const NEAR_HIGH_PCT = 80;
 export const NEAR_LOW_PCT = 20;
 
+/** A window move steeper than this (absolute %) is a strong trend — a buy into
+ *  a steep decline is a falling-knife risk; a sell into a steep rise is selling
+ *  into strength. Documented constant. */
+export const STEEP_TREND_PCT = 15;
+/** Period-return volatility at/above this (%) is "elevated" — surfaced as a
+ *  sizing note, not a verdict driver on its own. */
+export const ELEVATED_VOL_PCT = 12;
+
 export interface PriceContextReport {
   coinId: string;
   windowDays: number;
@@ -156,6 +164,72 @@ export async function gatherPriceContext(args: {
   const ctx = computePriceContext(series.points, args.windowDays, args.now);
   ctx.coinId = series.coinId;
   return ctx;
+}
+
+/** A direction-aware read of whether NOW is a good moment for THIS trade. */
+export type TradeTimingFlag = "favorable" | "neutral" | "caution";
+
+export interface TradeTimingAssessment {
+  timing: TradeTimingFlag;
+  /** Plain-language reasons behind the flag (may be empty for neutral). */
+  notes: string[];
+}
+
+/**
+ * Interpret a price context FOR a specific trade direction. The same context
+ * means opposite things depending on what you're about to do: near the recent
+ * high is a caution to BUY (buying the top) but favorable to SELL (taking the
+ * top); near the low is the inverse. A steep decline is a falling-knife caution
+ * for a buy; a steep rise is "selling into strength" for a sell.
+ *
+ * Pure + deterministic. `caution` if any caution signal fires; else `favorable`
+ * if any favorable signal fires; else `neutral`. Volatility is a sizing note
+ * that never drives the flag on its own.
+ */
+export function assessTradeTiming(
+  ctx: PriceContextReport,
+  direction: "buy" | "sell",
+): TradeTimingAssessment {
+  const notes: string[] = [];
+  let caution = false;
+  let favorable = false;
+  const pos = ctx.rangePositionPct;
+  const N = ctx.windowDays;
+  const trend = ctx.changePctWindow;
+
+  if (direction === "buy") {
+    if (pos != null && pos >= NEAR_HIGH_PCT) {
+      caution = true;
+      notes.push(`buying near the ${N}d high (${pos.toFixed(0)}% of range) — chasing the top`);
+    } else if (pos != null && pos <= NEAR_LOW_PCT) {
+      favorable = true;
+      notes.push(`near the ${N}d low (${pos.toFixed(0)}% of range) — favorable entry zone`);
+    }
+    if (trend <= -STEEP_TREND_PCT) {
+      caution = true;
+      notes.push(`down ${Math.abs(trend).toFixed(1)}% over ${N}d — falling-knife risk, the move down may not be finished`);
+    }
+  } else {
+    if (pos != null && pos >= NEAR_HIGH_PCT) {
+      favorable = true;
+      notes.push(`near the ${N}d high (${pos.toFixed(0)}% of range) — favorable exit zone`);
+    } else if (pos != null && pos <= NEAR_LOW_PCT) {
+      caution = true;
+      notes.push(`selling near the ${N}d low (${pos.toFixed(0)}% of range) — locking in a weak price`);
+    }
+    if (trend >= STEEP_TREND_PCT) {
+      favorable = true;
+      notes.push(`up ${trend.toFixed(1)}% over ${N}d — selling into strength`);
+    }
+  }
+
+  // Volatility: informational sizing note, not a verdict driver.
+  if (ctx.volatilityPct != null && ctx.volatilityPct >= ELEVATED_VOL_PCT) {
+    notes.push(`elevated volatility (${ctx.volatilityPct.toFixed(1)}% period stddev) — wider swings, size accordingly`);
+  }
+
+  const timing: TradeTimingFlag = caution ? "caution" : favorable ? "favorable" : "neutral";
+  return { timing, notes };
 }
 
 export function renderPriceContext(r: PriceContextReport, label: string): string {
