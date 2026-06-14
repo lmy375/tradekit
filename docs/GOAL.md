@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 98 — detect→respond：偏离的已晋升策略给出结构化的"该怎么办"（promote-outcome recommendedActions — close the trust pipeline's final gap from detection to the protective response）** ✅
+- **检测到了，然后呢？**：信任管道的检测端已经很完整——v50 promote-outcome 判定 diverged/underperforming，v95 让它进 cron digest 主动暴露。但检测到"这个已晋升策略在实盘亏钱/低于纸面承诺"之后，报告只给 `verdict` + `reasons[]`，**没有任何结构化的响应指引**。运营商凭直觉知道"该 demote 或砍掉"，但 **agent 经 MCP 拿到 `verdict: "diverged"` 却不知道下一步调什么工具**——这正是产品到处都有 `recommendedActions[]`（每个 MCP 工具都带 next_actions）的原因，唯独最危险结局的检测器没有
+- 为什么是最重要的：托管真钱的 agent，最危险的不是看不见问题，而是**看见了却不知道怎么安全响应**。"diverged = 实盘正在亏钱"的正确响应是立刻 demote 回 paper——停掉真钱交易、同时保留策略状态（HWM/计数器）以便观察或修复后重新晋升。把这个响应**结构化、内联进检测结果**，让 agent 不止知道"出事了"，而是知道"调 playbook_promote {to:'paper', yes:true} 止血"。这收尾了信任管道的最后一环：paper→promote-check→promote→live→outcome→**respond**
+- 实现（复用全局 `recommendedActions: NextAction[]` 标准，按 verdict 映射）：`PromoteOutcomeReport` 加 `recommendedActions`，纯函数 `recommendedActionsFor(verdict, id, name)` 映射——**diverged** → demote NOW，`{id, to:'paper', yes:true}`（活跃亏损，止血动作零摩擦预填 yes）；**underperforming** → 建议 demote，`{id, to:'paper'}`**故意不预填 yes**（可恢复还是砍掉是运营商判断，强制有意识确认）；on_track / insufficient_data → 无动作。CLI render 把 agent 工具调用翻译成运营商命令形式（`tradekit playbook promote <id> --to paper [--yes]`）；MCP `playbook_outcome` 直接返回整个报告，agent 自动拿到
+- 测试覆盖：promoteOutcome.test.ts +4（diverged→demote 预填 yes + render 含 --yes / underperforming→demote 不预填 yes + render 不含 --yes / on_track→空 / insufficient_data→空）；3508 测试全绿（+4）；CLI 路径已烟测
+- 向后兼容：纯加法——`recommendedActions` 新字段；render 只在非空时多印一个 Recommended 块；复用既有 NextAction 类型 + demote 动作（playbook_promote to=paper，早已存在）；不改 verdict 判定逻辑；digest 的 v95 promote section 只读 verdict/reasons，不受影响
+
 **Phase 97 — readiness 闸到达 agent 侧：MCP promote 也问"策略证明过自己了吗？"（the readiness gate reaches the agent — MCP playbook_promote gains the same third gate）** ✅
 - **补上 v96 的 MCP 半边——agent 也会晋升真钱**：v96 给 CLI promote 接上了第三道就绪闸，但 `playbook_promote` **同样暴露在 MCP 上**（agent 可调）。MCP 工具跑了 v36 资金闸（requireFunded）+ v52 安全闸（requireSafe），却**完全跳过 v96 就绪检查**——agent 经 MCP 可以把一个只跑了 1 天、1 笔成交、零业绩的纸面策略零摩擦晋升上真钱。CLI 有质量闸、MCP 没有：v96 在 agent 侧是半残的
 - 为什么是 v96 的一部分而非新功能：产品最危险的动作是"让 agent 开始用真钱"，而 promote **正是 agent 自己能调的 MCP 工具**。只给运营商（CLI）装质量闸、却让 agent（更需要被 gate 的一方）经 MCP 绕过，等于护栏装在了没人闯的门上。要让 v96 真正成立，readiness 必须到达 agent 实际走的那条路径——这是让 v96 完整，不是第 N 个 feature（同 v92 让 v91 真正生效的逻辑）

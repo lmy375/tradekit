@@ -271,3 +271,56 @@ describe("normalization + rendering", () => {
     expect(text).toMatch(/Per-fill realized:/);
   });
 });
+
+// v98: the RESPONSE half — detect→respond. Each verdict maps to the right
+// protective action (demote to paper, state-preserving), or none.
+describe("recommendedActions (detect→respond)", () => {
+  it("diverged → demote to paper NOW, with yes pre-filled (active bleed)", async () => {
+    const id = mkPlaybook();
+    seedPaperRoundTrips(id, { pairs: 5, buyPx: 2000, sellPx: 2100 });
+    seedRealRoundTrips(id, { pairs: 3, buyPx: 2000, sellPx: 1900 }); // loses live
+    const r = await outcome(id);
+    expect(r.verdict).toBe("diverged");
+    expect(r.recommendedActions).toHaveLength(1);
+    const a = r.recommendedActions[0];
+    expect(a.tool).toBe("playbook_promote");
+    expect(a.params).toMatchObject({ id, to: "paper", yes: true });
+    expect(a.reason).toMatch(/DIVERGED/);
+    // the CLI render translates the action to the operator command form.
+    expect(renderPromoteOutcome(r)).toMatch(new RegExp(`tradekit playbook promote ${id} --to paper --yes`));
+  });
+
+  it("underperforming → demote SUGGESTED, yes NOT pre-filled (judgment call)", async () => {
+    const id = mkPlaybook();
+    seedPaperRoundTrips(id, { pairs: 5, buyPx: 2000, sellPx: 2100 });
+    seedRealRoundTrips(id, { pairs: 3, buyPx: 2000, sellPx: 2020 }); // edge shrank → 20%
+    const r = await outcome(id);
+    expect(r.verdict).toBe("underperforming");
+    expect(r.recommendedActions).toHaveLength(1);
+    const a = r.recommendedActions[0];
+    expect(a.tool).toBe("playbook_promote");
+    expect(a.params).toMatchObject({ id, to: "paper" });
+    expect(a.params!.yes).toBeUndefined(); // conscious confirm required
+    expect(a.reason).toMatch(/UNDERPERFORMING/);
+    // render shows the demote command WITHOUT --yes for the soft case.
+    expect(renderPromoteOutcome(r)).toMatch(new RegExp(`tradekit playbook promote ${id} --to paper(?! --yes)`));
+  });
+
+  it("on_track → no recommended actions", async () => {
+    const id = mkPlaybook();
+    seedPaperRoundTrips(id, { pairs: 5, buyPx: 2000, sellPx: 2100 });
+    seedRealRoundTrips(id, { pairs: 3, buyPx: 2000, sellPx: 2100 }); // tracks paper
+    const r = await outcome(id);
+    expect(r.verdict).toBe("on_track");
+    expect(r.recommendedActions).toEqual([]);
+  });
+
+  it("insufficient_data → no recommended actions", async () => {
+    const id = mkPlaybook();
+    seedPaperRoundTrips(id, { pairs: 5, buyPx: 2000, sellPx: 2100 });
+    // no live fills → insufficient_data
+    const r = await outcome(id);
+    expect(r.verdict).toBe("insufficient_data");
+    expect(r.recommendedActions).toEqual([]);
+  });
+});

@@ -111,6 +111,14 @@ export interface PromoteOutcomeReport {
   } | null;
   verdict: OutcomeVerdict;
   reasons: string[];
+  /** v98: the RESPONSE half — structured next-step(s) the operator/agent
+   *  should take given the verdict, closing the trust pipeline's
+   *  detect→respond loop. `diverged` → demote to paper NOW (halt the
+   *  real-money bleed, state preserved); `underperforming` → consider
+   *  demoting (a recoverable-or-cut judgment, so `yes` is intentionally
+   *  NOT pre-filled — the agent must confirm consciously). on_track /
+   *  insufficient_data carry none. */
+  recommendedActions: import("./errors.js").NextAction[];
 }
 
 function median(values: number[]): number | null {
@@ -364,8 +372,42 @@ export async function gatherPromoteOutcome(args: {
       comparison,
       verdict: v,
       reasons: rs,
+      recommendedActions: recommendedActionsFor(v, args.playbookId, row!.name),
     };
   }
+}
+
+/** v98: map an outcome verdict to the protective RESPONSE. The demote
+ *  target is `playbook_promote to=paper` — it halts real-money trades while
+ *  PRESERVING strategy state (HWM, run counters, drift telemetry), so the
+ *  strategy can be observed further or re-promoted after the cause is fixed.
+ *  diverged pre-fills `yes` (the bleed is active — make the protective stop
+ *  frictionless); underperforming does NOT (recoverable-or-cut is a judgment
+ *  the operator/agent owns). */
+function recommendedActionsFor(
+  v: OutcomeVerdict,
+  playbookId: number,
+  name: string,
+): import("./errors.js").NextAction[] {
+  if (v === "diverged") {
+    return [
+      {
+        tool: "playbook_promote",
+        params: { id: playbookId, to: "paper", yes: true },
+        reason: `DIVERGED — "${name}" is losing money with real execution against a paper baseline that promised profit. Demote to paper NOW to halt real-money trades; strategy state (HWM, counters) is preserved, so you can keep observing or re-promote after fixing the cause.`,
+      },
+    ];
+  }
+  if (v === "underperforming") {
+    return [
+      {
+        tool: "playbook_promote",
+        params: { id: playbookId, to: "paper" },
+        reason: `UNDERPERFORMING — "${name}"'s live edge fell short of its paper promise. Decide whether the edge is recoverable or the strategy should be demoted (re-run with yes:true to flip it back to paper). Pair with playbook_promote_outcome for the per-fill/slippage/cadence breakdown.`,
+      },
+    ];
+  }
+  return [];
 }
 
 // ── rendering ────────────────────────────────────────────────
@@ -414,6 +456,20 @@ export function renderPromoteOutcome(r: PromoteOutcomeReport): string {
     }
     if (c.slippageRatioPct != null) {
       lines.push(`  Slippage:          live is ${(c.slippageRatioPct / 100).toFixed(1)}× paper-assumed`);
+    }
+  }
+  // v98: the RESPONSE — what to do about this verdict.
+  if (r.recommendedActions.length > 0) {
+    lines.push(``);
+    lines.push(`  Recommended:`);
+    for (const a of r.recommendedActions) {
+      // Translate the agent-facing tool call to the operator's CLI form.
+      const cli =
+        a.tool === "playbook_promote" && a.params?.to === "paper"
+          ? `tradekit playbook promote ${a.params.id} --to paper${a.params.yes ? " --yes" : ""}`
+          : a.tool;
+      lines.push(`    → ${cli}`);
+      lines.push(`      ${a.reason}`);
     }
   }
   return lines.join("\n");
