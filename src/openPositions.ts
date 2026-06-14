@@ -66,6 +66,24 @@ export interface OpenPositionEntry {
     changePctWindow: number;
     summary: string;
   } | null;
+  /** v110: downside-protection status for THIS position — is there an active
+   *  stop/trailing sell covering it, and how much downside cushion is left
+   *  before it triggers? Merges the v76 protection audit into the position
+   *  review so "how's it doing AND is it protected?" is one call. Present only
+   *  when withProtection is requested. */
+  protection?: {
+    status: "protected" | "partial" | "unprotected";
+    /** Base units covered by downside-protective sell orders. */
+    protectedAmount: number;
+    unprotectedAmount: number;
+    /** The protective sell orders covering this position. */
+    stops: Array<{ id: number; triggerType: string; trailPct: number | null; targetPriceUsd: number | null }>;
+    /** For the HIGHEST fixed stop floor (price_below), how far the current
+     *  price sits ABOVE it (% cushion before the stop fires). Null when there's
+     *  no fixed-price stop or the position is unpriced. A trailing stop's
+     *  giveback is its trailPct instead. */
+    downsideToStopPct: number | null;
+  } | null;
 }
 
 export interface OpenPositionsReport {
@@ -101,6 +119,11 @@ export async function gatherOpenPositions(args: {
   contextDays?: number;
   /** Test seam: the price-series fetcher (passed through to fetchPriceSeries). */
   seriesFetchImpl?: (url: string) => Promise<unknown>;
+  /** v110: annotate each position with its downside-protection status (active
+   *  stop/trailing coverage + cushion). Off by default — loads active orders. */
+  withProtection?: boolean;
+  /** Test seam: the active sell orders feeding the protection annotation. */
+  protOrdersImpl?: () => import("./positionProtection.js").ProtOrderLite[];
 }): Promise<OpenPositionsReport> {
   const config = args.config ?? loadConfig();
   const now = args.now ?? new Date();
@@ -213,6 +236,59 @@ export async function gatherOpenPositions(args: {
     );
   }
 
+  // v110: per-position downside-protection status. Reuses the v76 computeProtection
+  // matcher (positions × active protective sell orders) so the position review and
+  // the protection audit can't disagree. Real mode uses real orders; paper uses
+  // paper orders. Best-effort: any failure leaves protection undefined.
+  if (args.withProtection && positions.length > 0) {
+    try {
+      const { computeProtection } = await import("./positionProtection.js");
+      let orders = args.protOrdersImpl?.();
+      if (orders == null) {
+        const { listOrders } = await import("./db.js");
+        const wantPaper = args.mode === "paper";
+        orders = listOrders({ status: "active" })
+          .filter((o) => o.side === "sell" && Boolean(o.paper) === wantPaper)
+          .map((o) => ({
+            id: o.id!,
+            chain: o.chain,
+            base_token: o.base_token,
+            side: o.side,
+            trigger_type: o.trigger_type,
+            base_amount: o.base_amount,
+            trail_pct: o.trail_pct,
+            target_price_usd: o.target_price_usd,
+          }));
+      }
+      const protPositions = positions.map((p) => ({
+        chain: p.chain, token: p.token, symbol: p.symbol,
+        amount: p.amount, currentPriceQuote: p.currentPriceQuote, valueQuote: p.valueQuote,
+      }));
+      const prot = computeProtection(protPositions, orders, now);
+      const byKey = new Map(prot.positions.map((pp) => [`${pp.chain}:${pp.token.toLowerCase()}`, pp]));
+      for (const p of positions) {
+        const pp = byKey.get(`${p.chain}:${p.token.toLowerCase()}`);
+        if (!pp) { p.protection = null; continue; }
+        // Cushion to the HIGHEST fixed stop floor (the first to fire on a drop).
+        let downsideToStopPct: number | null = null;
+        const floors = pp.protectingOrders.map((o) => o.targetPriceUsd).filter((t): t is number => t != null && t > 0);
+        if (floors.length > 0 && p.currentPriceQuote != null && p.currentPriceQuote > 0) {
+          const highestFloor = Math.max(...floors);
+          downsideToStopPct = ((p.currentPriceQuote - highestFloor) / p.currentPriceQuote) * 100;
+        }
+        p.protection = {
+          status: pp.status,
+          protectedAmount: pp.protectedAmount,
+          unprotectedAmount: pp.unprotectedAmount,
+          stops: pp.protectingOrders.map((o) => ({ id: o.id, triggerType: o.triggerType, trailPct: o.trailPct, targetPriceUsd: o.targetPriceUsd })),
+          downsideToStopPct,
+        };
+      }
+    } catch {
+      // protection annotation is best-effort — never break the position review.
+    }
+  }
+
   return {
     mode: args.mode,
     generatedAt: now.toISOString(),
@@ -263,6 +339,17 @@ export function renderOpenPositions(r: OpenPositionsReport): string {
           ? `           price ctx: — (no CoinGecko mapping)`
           : `           price ctx: ${c.changePctWindow >= 0 ? "+" : ""}${c.changePctWindow.toFixed(1)}% over ${c.windowDays}d · ${c.rangePositionPct != null ? `${c.rangePositionPct.toFixed(0)}% of range` : "flat range"}`,
       );
+    }
+    if (p.protection !== undefined && p.protection !== null) {
+      const pr = p.protection;
+      const badge = pr.status === "protected" ? "🛡 protected" : pr.status === "partial" ? "⚠ partial" : "🔴 UNPROTECTED";
+      const stopDesc = pr.stops.length === 0
+        ? ""
+        : " · " + pr.stops.map((s) => s.trailPct != null ? `${s.trailPct}% trail` : s.targetPriceUsd != null ? `stop $${s.targetPriceUsd}` : s.triggerType).join(", ") +
+          (pr.downsideToStopPct != null ? ` (${pr.downsideToStopPct.toFixed(1)}% cushion)` : "");
+      lines.push(`           protection: ${badge}${stopDesc}`);
+    } else if (p.protection === null) {
+      lines.push(`           protection: 🔴 UNPROTECTED`);
     }
   }
   return lines.join("\n");

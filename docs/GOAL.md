@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 110 — 持仓审阅合并保护状态：一次调用回答"赚没赚 + 有没有保护"（open positions gains per-position protection status — "how's it doing AND is it protected?" in one call）** ✅
+- **补上持仓管理驾驶舱的缺口**：自主 agent 审阅持仓时，open_positions 给每个持仓的成本基础/未实现盈亏/税务期限/价格 context，却**不含保护状态**——"这个 +50% 的赢家有没有挂止损？离触发还有多远？"得另调 position_protection（v76，且是聚合报告、不带逐仓盈亏）。两个工具交叉对照才能回答"赚没赚 + 有没有保护"。一个裸奔的赢家在持仓审阅里看不出来
+- 为什么重要：持仓管理是 agent 核心循环的一环。把保护状态并进持仓视图，让"该不该给这个仓加止损 / 这个赢家已保护、让它跑"成为一眼可判的决策，而非跨工具拼接。surfaces 一个 UNPROTECTED 的大赢家——既是有效性（管理）也是安全（暴露下行）
+- 实现（复用 v76 matcher，零分歧）：OpenPositionEntry 加 `protection`（opt-in via withProtection）：status（protected/partial/unprotected）+ protectedAmount/unprotectedAmount + stops[]（覆盖该仓的 trailing/stop-loss 卖单）+ **downsideToStopPct**（当前价高于最高固定止损 floor 的缓冲 %，price_below 止损才有；trailing 用 trailPct 表达 giveback）。直接复用 v76 的 `computeProtection`（持仓 × 活跃保护性卖单匹配）——持仓审阅和保护审计不会分叉。real 用真实订单、paper 用 paper 订单；最佳努力（失败不破坏审阅）
+- 新分析：downsideToStopPct——固定止损的"锁定下限"缓冲，是别处都没算的逐仓量化（"+50% 但止损在当前价下方 10%，跌破才触发"）
+- 接入：CLI `--protection`、MCP open_positions `withProtection`（注入式 protOrdersImpl seam 供测试）；render 加 protection 行（🛡 protected / ⚠ partial / 🔴 UNPROTECTED + 止损描述 + 缓冲%）
+- 测试覆盖：+5——trailing 覆盖→protected 无固定 floor / price_below→protected 带 10% 缓冲 / 无订单→UNPROTECTED / 别的 token 的订单不算 / withProtection off→无字段；3585 测试全绿（+5）
+- 向后兼容：纯加法——protection opt-in（默认不加载订单）；复用 v76 computeProtection；不改持仓/盈亏计算
+
 **Phase 109 — 策略对比/止损熔断用 value_usd：非稳定币报价策略不再"零亏损"地逃过熔断（strategy comparison + loss breaker use value_usd — a non-stablecoin-quoted strategy can no longer read $0 realized and dodge the v84 breaker）** ✅
 - **修复一个有安全后果的 value_usd 缺口**：strategyCompare（"stablecoin-$1 模型"）此前对**非稳定币报价的交易直接跳过**（无法无 RPC 定价）→ 该策略 realizedUsd 恒为 \$0。但它喂着 v84 **止损熔断**（安全强制）、v99 headroom、v88 digest——于是一个 WETH 报价、正在亏钱的策略，熔断**永远不触发**（看到 \$0 亏损）、headroom 显示满额、digest 不报 bleeding。安全护栏对这类策略静默失效
 - 为什么重要：止损熔断是按策略的真金白银自动护栏。它对一整类策略（非稳定币报价）失灵，是 v104/v107 同类的 value_usd 缺口——但这次直接削弱了**强制执行**。v104 刚把 value_usd（交易时刻精确美元，无 RPC、已持久化）备好，正好让 strategyCompare 既精确又仍然零 RPC

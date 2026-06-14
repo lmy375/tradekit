@@ -42,6 +42,14 @@ const mark = (price: number | null) => async () => price;
 const gather = (markPrice: number | null = 3000) =>
   gatherOpenPositions({ mode: "paper", markPriceFn: mark(markPrice), now: NOW });
 
+// v110: an active sell order shape for the protection annotation seam.
+const ord = (o: Partial<{ id: number; chain: string; base_token: string; side: string; trigger_type: string; base_amount: string | null; trail_pct: number | null; target_price_usd: number | null }>) => ({
+  id: 1, chain: "base", base_token: WETH, side: "sell", trigger_type: "trailing",
+  base_amount: "max", trail_pct: 5, target_price_usd: null, ...o,
+});
+const gatherProt = (orders: ReturnType<typeof ord>[], markPrice = 3000) =>
+  gatherOpenPositions({ mode: "paper", markPriceFn: mark(markPrice), now: NOW, withProtection: true, protOrdersImpl: () => orders });
+
 describe("gatherOpenPositions", () => {
   it("a position held >365d projects long-term with no days-to-long", async () => {
     trade({ ts: day(-400), dir: "buy", amount: "1", quote: "2000" });
@@ -133,5 +141,45 @@ describe("gatherOpenPositions", () => {
     expect(r.totalCostBasisQuote).toBeCloseTo(42000, 6);
     expect(r.totalValueQuote).toBeCloseTo(6000, 6); // 2 positions × 3000
     expect(r.totalUnrealizedQuote).toBeCloseTo(6000 - 42000, 6);
+  });
+});
+
+// v110: per-position downside-protection annotation (reuses the v76 matcher).
+describe("gatherOpenPositions — withProtection", () => {
+  it("a covering trailing stop → protected, trail surfaced, no fixed-floor cushion", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gatherProt([ord({ trigger_type: "trailing", trail_pct: 5, base_amount: "max" })]);
+    const p = r.positions[0];
+    expect(p.protection!.status).toBe("protected");
+    expect(p.protection!.stops[0].trailPct).toBe(5);
+    expect(p.protection!.downsideToStopPct).toBeNull(); // trailing has no fixed floor
+  });
+
+  it("a price_below stop → protected with a downside cushion %", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    // current $3000, stop floor $2700 → cushion (3000−2700)/3000 = 10%.
+    const r = await gatherProt([ord({ trigger_type: "price_below", trail_pct: null, target_price_usd: 2700, base_amount: "max" })], 3000);
+    const p = r.positions[0];
+    expect(p.protection!.status).toBe("protected");
+    expect(p.protection!.downsideToStopPct).toBeCloseTo(10, 6);
+  });
+
+  it("no covering order → UNPROTECTED", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gatherProt([]); // no protective orders
+    expect(r.positions[0].protection!.status).toBe("unprotected");
+    expect(r.positions[0].protection!.unprotectedAmount).toBeCloseTo(1, 6);
+  });
+
+  it("an order for a DIFFERENT token doesn't protect this position", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" }); // WETH
+    const r = await gatherProt([ord({ base_token: WBTC, trigger_type: "trailing", trail_pct: 5 })]);
+    expect(r.positions[0].protection!.status).toBe("unprotected");
+  });
+
+  it("withProtection off → no protection field (opt-in)", async () => {
+    trade({ ts: day(-10), dir: "buy", amount: "1", quote: "2000" });
+    const r = await gather(3000);
+    expect(r.positions[0].protection).toBeUndefined();
   });
 });
