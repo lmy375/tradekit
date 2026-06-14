@@ -1344,6 +1344,42 @@ function viemChainFor(chainId: number, name: string, nativeSymbol = "ETH") {
 
 // ── nested get / set helpers (used by `tradekit config get/set`) ──
 
+/**
+ * v89/v90: config sections an MCP AGENT must not WRITE — operator-owned because
+ * a prompt-injected agent could weaponize them. The CLI (operator, who has
+ * shell access + owns risk/infra policy) is unrestricted; only the agent-facing
+ * MCP `config` write path consults this. Reads + config_preflight dry-runs stay
+ * open, so an agent can still analyze a change and recommend it to the operator.
+ *
+ * Each section is a genuine injection attack vector with no legitimate
+ * agent-write flow:
+ *   - safety:        weaken guardrails (limits/breakers/whitelists) or disable
+ *                    the human approval gate (safety.tradeApproval), then trade.
+ *   - chains:        inject a hostile RPC → fake prices (bad fills / fooled
+ *                    slippage checks) or front-run the signed tx.
+ *   - mev:           redirect signed txs to a hostile private relay → theft.
+ *   - webhooks /     redirect or mute the operator's alerts → hide a draining
+ *     notifications: attack (visibility integrity).
+ * `aggregator` is intentionally NOT here — aggregator_tune legitimately tunes
+ * routing preference, and routing order can't enable theft.
+ */
+const AGENT_LOCKED_CONFIG_SECTIONS: ReadonlyArray<{ prefix: string; what: string }> = [
+  { prefix: "safety", what: "safety guardrails (limits, breakers, whitelists, the approval gate)" },
+  { prefix: "chains", what: "chain RPC endpoints (a hostile RPC can feed fake prices or front-run)" },
+  { prefix: "mev", what: "MEV relay endpoints (signed txs could be redirected to a hostile relay)" },
+  { prefix: "webhooks", what: "notification channels (alerts could be redirected or muted to hide activity)" },
+  { prefix: "notifications", what: "notification settings (alerts could be muted to hide activity)" },
+];
+
+/** Returns the locked-section descriptor when `dotted` targets an operator-owned
+ *  config section (exact match or a `<section>.` prefix), else null. */
+export function agentLockedConfigSection(dotted: string): { what: string } | null {
+  for (const s of AGENT_LOCKED_CONFIG_SECTIONS) {
+    if (dotted === s.prefix || dotted.startsWith(s.prefix + ".")) return { what: s.what };
+  }
+  return null;
+}
+
 export function getConfigPath(config: Config, dotted: string): unknown {
   return dotted
     .split(".")

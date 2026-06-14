@@ -11,6 +11,7 @@ import {
   dropConfigArray,
   redactConfigForDisplay,
   getConfigPath,
+  agentLockedConfigSection,
 } from "../config.js";
 import {
   listAccounts,
@@ -539,7 +540,7 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
   // ── config ────────────────────────────────────────────────
   server.tool(
     "config",
-    "Read or update the tradekit config file. action=show (default — returns the whole config, REDACTED on MCP so API keys never leak into agent context) | get (path required — returns { path, value, set }) | set (path + value required — value is JSON-encoded) | push (path + value, appends to an array field e.g. safety.contractWhitelist.base) | drop (path + value, removes matching item from array). Matches the `tradekit config <action>` CLI. v89 SECURITY: writes (set/push/drop) to `safety.*` are BLOCKED over MCP with SAFETY_CONFIG_LOCKED — the guardrails (limits, breakers, token/contract whitelists, AND the human approval gate safety.tradeApproval) are operator-owned and change only from the CLI, so an agent can't weaken its own protections then trade freely (same CLI-only boundary as backup/panic). You can still READ safety config (show/get) and DRY-RUN a change via config_preflight to recommend it to the operator. Errors: SAFETY_CONFIG_LOCKED (write to safety.*), INVALID_PARAMS (missing path/value for actions that need them, invalid action name, bad JSON in value, schema-rejected value). Note: push/drop on non-array paths throws; set replaces the whole value.",
+    "Read or update the tradekit config file. action=show (default — returns the whole config, REDACTED on MCP so API keys never leak into agent context) | get (path required — returns { path, value, set }) | set (path + value required — value is JSON-encoded) | push (path + value, appends to an array field e.g. safety.contractWhitelist.base) | drop (path + value, removes matching item from array). Matches the `tradekit config <action>` CLI. v89/v90 SECURITY: writes (set/push/drop) to OPERATOR-OWNED sections are BLOCKED over MCP with SAFETY_CONFIG_LOCKED — `safety.*` (limits, breakers, whitelists, the approval gate safety.tradeApproval), `chains.*` (RPC endpoints — a hostile RPC can feed fake prices / front-run), `mev.*` (relay endpoints — signed txs could be redirected to a hostile relay), and `webhooks`/`notifications` (alert channels — could be muted to hide activity). These change only from the CLI, so a prompt-injected agent can't reconfigure its own protections/infrastructure then trade or hide (same CLI-only boundary as backup/panic). `aggregator.*` and operational keys (activeChain/activeAccount/defaultSlippageBps) stay agent-writable. You can still READ any config (show/get) and DRY-RUN a change via config_preflight to recommend it to the operator. Errors: SAFETY_CONFIG_LOCKED (write to a locked section), INVALID_PARAMS (missing path/value for actions that need them, invalid action name, bad JSON in value, schema-rejected value). Note: push/drop on non-array paths throws; set replaces the whole value.",
     {
       action: z.enum(["show", "get", "set", "push", "drop"]).optional(),
       path: z.string().optional().describe("Dotted path, e.g. \"safety.perTxUsdLimit\""),
@@ -548,19 +549,23 @@ export const registerAdminTools: RegisterFn = (server, rt) => {
     async ({ action, path, value }) => {
       try {
         const a = action ?? "show";
-        // v89: safety guardrails are OPERATOR-owned. Block any write to
-        // safety.* (every limit / breaker / whitelist + the human approval
-        // gate safety.tradeApproval) over MCP — a prompt-injected agent must
-        // not be able to disable the drawdown breaker or loosen slippage and
-        // then trade freely. Same CLI-only boundary as backup/panic. Reads
-        // (show/get) + config_preflight (dry-run) stay open so the agent can
-        // still ANALYZE a change and recommend it to the operator.
-        if ((a === "set" || a === "push" || a === "drop") && path != null && (path === "safety" || path.startsWith("safety."))) {
-          throw new ToolError(
-            "SAFETY_CONFIG_LOCKED",
-            `Refusing to ${a} "${path}" over MCP — safety guardrails (limits, breakers, whitelists, the approval gate) are operator-owned and change only from the CLI (\`tradekit config ${a} ${path} …\`), so an agent can't weaken its own protections. Use config_preflight to dry-run the change and recommend it to the operator.`,
-            { details: { action: a, path }, nextActions: [{ tool: "config_preflight", reason: "Analyze the proposed safety change; the operator applies it via the CLI." }] },
-          );
+        // v89/v90: operator-owned config is OFF-LIMITS to the agent over MCP.
+        // A prompt-injected agent must not be able to weaken its guardrails
+        // (safety.*), MITM via a hostile RPC (chains.*), redirect signed txs to
+        // a hostile relay (mev.*), or mute the operator's alerts (webhooks /
+        // notifications) — then trade / hide freely. Same CLI-only boundary as
+        // backup/panic. Reads (show/get) + config_preflight (dry-run) stay open
+        // so the agent can still ANALYZE a change and recommend it to the
+        // operator, who applies it from the CLI (unrestricted).
+        if (a === "set" || a === "push" || a === "drop") {
+          const locked = path != null ? agentLockedConfigSection(path) : null;
+          if (locked) {
+            throw new ToolError(
+              "SAFETY_CONFIG_LOCKED",
+              `Refusing to ${a} "${path}" over MCP — ${locked.what} are operator-owned and change only from the CLI (\`tradekit config ${a} ${path} …\`), so an agent can't reconfigure its own protections/infrastructure. Use config_preflight to dry-run the change and recommend it to the operator.`,
+              { details: { action: a, path }, nextActions: [{ tool: "config_preflight", reason: "Analyze the proposed change; the operator applies it via the CLI." }] },
+            );
+          }
         }
         const config = loadConfig();
         // Always redact in MCP: an LLM agent has no legitimate workflow that needs the

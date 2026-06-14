@@ -9,6 +9,7 @@ import {
   chainRecordLookup,
   redactConfigForDisplay,
   resolveProfile,
+  agentLockedConfigSection,
   type Config,
 } from "./config.js";
 import { ToolError } from "./errors.js";
@@ -326,5 +327,34 @@ describe("resolveProfile UNKNOWN_CHAIN typo suggestion (iter343)", () => {
     } catch (e) {
       expect((e as ToolError).message).toContain("Did you mean 'myinternall3'?");
     }
+  });
+});
+
+describe("agentLockedConfigSection (v89/v90 — operator-owned config)", () => {
+  it("locks every operator-owned section (exact + nested path)", () => {
+    for (const p of ["safety", "safety.maxSlippageBps", "safety.tradeApproval.enabled",
+                     "chains", "chains.base.rpcs", "mev", "mev.privateRpcs.ethereum",
+                     "webhooks", "webhooks.ops.url", "notifications"]) {
+      expect(agentLockedConfigSection(p), p).not.toBeNull();
+    }
+  });
+
+  it("leaves operational + routing config open (agent-writable)", () => {
+    for (const p of ["activeChain", "activeAccount", "defaultSlippageBps",
+                     "aggregator", "aggregator.mode", "aggregator.preferred"]) {
+      expect(agentLockedConfigSection(p), p).toBeNull();
+    }
+  });
+
+  it("matches on the section PREFIX, not a substring", () => {
+    // A hypothetical sibling key that merely starts with the same letters must
+    // not be falsely locked (prefix is "<section>." or exact).
+    expect(agentLockedConfigSection("safetyNet")).toBeNull();
+    expect(agentLockedConfigSection("chainsExtra")).toBeNull();
+  });
+
+  it("carries a human-readable reason for the error message", () => {
+    expect(agentLockedConfigSection("chains.base.rpcs")!.what).toMatch(/RPC/i);
+    expect(agentLockedConfigSection("mev")!.what).toMatch(/relay/i);
   });
 });

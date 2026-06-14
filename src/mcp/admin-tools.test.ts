@@ -70,6 +70,26 @@ describe("config MCP tool — v89 safety-config lock", () => {
     expect((r.error as { code: string }).code).toBe("SAFETY_CONFIG_LOCKED");
   });
 
+  // v90: the lock extends to the other operator-owned (injection-weaponizable)
+  // sections — RPC endpoints, MEV relays, and alert channels.
+  for (const path of ["chains", "chains.base.rpcs", "mev", "mev.privateRpcs.ethereum", "webhooks", "notifications"]) {
+    it(`blocks set "${path}" (infra/visibility tampering)`, async () => {
+      const r = parse(await config().handler({ action: "set", path, value: "\"https://evil.example\"" }));
+      expect(r.ok).toBe(false);
+      expect((r.error as { code: string }).code).toBe("SAFETY_CONFIG_LOCKED");
+    });
+  }
+
+  it("blocks push to chains.*.rpcs (hostile RPC injection)", async () => {
+    const r = parse(await config().handler({ action: "push", path: "chains.base.rpcs", value: "\"https://evil.example\"" }));
+    expect((r.error as { code: string }).code).toBe("SAFETY_CONFIG_LOCKED");
+  });
+
+  it("ALLOWS aggregator.* (legitimate routing tuning — not a theft vector)", async () => {
+    const r = parse(await config().handler({ action: "set", path: "aggregator.mode", value: "\"best\"" }));
+    expect(r.ok).toBe(true);
+  });
+
   it("blocks drop from safety.* (removing a blacklist entry)", async () => {
     const r = parse(await config().handler({ action: "drop", path: "safety.tokenBlacklist.base", value: "\"0xscam\"" }));
     expect((r.error as { code: string }).code).toBe("SAFETY_CONFIG_LOCKED");

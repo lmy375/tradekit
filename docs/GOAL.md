@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 90 — 运营商所有的配置边界（operator-owned config boundary — extend the MCP write-lock to RPC / relay / alert config）** ✅
+- **补完 v89 的注入防御边界，而非加 feature**：v89 锁住 safety.* 防 agent 削弱护栏。但注入威胁模型更广——agent 还能经 MCP `config set` 改写**基础设施**配置发起攻击：`chains.*.rpcs`（注入恶意 RPC → 假价格喂坏滑点检查/坏成交，或前跑签名 tx）、`mev.*`（把签名 tx 重定向到恶意 relay → 偷币）、`webhooks`/`notifications`（重定向/静音告警 → 蒙蔽运营商藏匿盗取）。这些直接使能盗窃或藏匿，是 v89 同一边界的剩余缺口
+- 为什么是最重要的：自主（尤其被注入）agent 托管真钱，安全根基是它**不能重配自己的保护/基础设施/可见性**。v89 锁了护栏，本期锁住资金流（RPC/relay）和可见性（告警）——注入 agent 的配置改写攻击面被完整封住
+- 实现（提取为可测策略 + 扩展）：把 v89 内联检查重构为 config.ts 的 `agentLockedConfigSection(path)`——运营商所有段列表（safety/chains/mev/webhooks/notifications）+ 每段理由（用于错误信息）。MCP `config` 写操作（set/push/drop）命中任一段 → 抛 `SAFETY_CONFIG_LOCKED`。`aggregator.*`（aggregator_tune 合法调路由，非盗窃向量）+ 操作键（activeChain/activeAccount/defaultSlippageBps）保持开放
+- 边界不变：CLI 不受限（运营商有 shell、负责基础设施/风险策略）；读 + config_preflight dry-run 开放（agent 仍能分析+建议）；前缀匹配非子串（safetyNet/chainsExtra 不误锁）
+- 测试覆盖：`config.test.ts` +4（纯策略：每个运营商所有段锁定（精确+嵌套）/ 操作+aggregator 开放 / 前缀非子串 / 错误理由文案）+ `admin-tools.test.ts` +8（真 MCP handler：set chains/chains.base.rpcs/mev/mev.privateRpcs/webhooks/notifications→SAFETY_CONFIG_LOCKED / push chains.rpcs 恶意 RPC→锁 / aggregator.mode→放行）；v89 的 safety 测试仍全过
+- 向后兼容：纯加法+收紧——锁面从 safety.* 扩到 5 段（全是运营商 setup 配置，无合法 agent 写流程）；CLI 不变；3473 测试全绿（+12）
+- v1 限制：锁段是固定列表（新增敏感段需更新策略——回归测试钉住覆盖）；硬块无 opt-out（安全默认）；SAFETY_CONFIG_LOCKED 错误码名沿用 v89（现覆盖>safety，但语义"安全/安保配置锁"成立，避免改名 churn）
+
 **Phase 89 — 护栏自保护（safety config is operator-owned — an agent can't weaken its OWN guardrails over MCP）** ✅
 - **堵住一个真实的安全完整性漏洞，而非加 feature**：整套安全栈保护**交易**，但**护栏配置本身**此前可被 agent 经 MCP `config set` 改写。攻击路径：被提示注入的 agent → `config set safety.maxSlippageBps 5000` / 关掉 drawdown breaker / 从黑名单 drop 一个币 / **关掉人工审批门 safety.tradeApproval** → 然后在松掉的护栏内自由交易。护栏只和 agent 的自律一样强——等于没有
 - 为什么是最重要的：自主 agent（尤其被注入的）托管真钱，安全的根基是护栏**不可被被保护方自己削弱**。产品已有 backup/panic/审批 CLI-only 边界防注入 agent 导出密钥/拉总闸——但**护栏配置**这个最该保护的东西却敞着。这是和那些同类的信任边界，补上最后一块
