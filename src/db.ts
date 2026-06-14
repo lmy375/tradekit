@@ -1360,6 +1360,23 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE trades ADD COLUMN value_usd REAL;
   `,
+
+  // v66 — v106: passive notification-delivery health. notify() knows each
+  // dispatch's success/failure but never persisted it, so a channel that dies
+  // AFTER setup (rotated/revoked webhook) fails silently forever — the operator
+  // flies blind exactly when an alert matters. One upserted row per channel
+  // tracks last success/failure + a consecutive-failure streak so `doctor` can
+  // proactively warn "your alerts aren't reaching you" without a manual test.
+  `
+  CREATE TABLE notification_health (
+    channel_name          TEXT    PRIMARY KEY,
+    last_success_at       TEXT,
+    last_failure_at       TEXT,
+    consecutive_failures  INTEGER NOT NULL DEFAULT 0,
+    last_error            TEXT,
+    updated_at            TEXT    NOT NULL
+  );
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -2932,6 +2949,56 @@ export function hasPriorTokenFill(args: { account: string; chain: string; baseTo
     )
     .get(args.account, args.chain.toLowerCase(), args.baseToken) as { 1: number } | undefined;
   return row != null;
+}
+
+// ── notification health (v106) ───────────────────────────────
+
+export interface NotificationHealthRow {
+  channel_name: string;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+  consecutive_failures: number;
+  last_error: string | null;
+  updated_at: string;
+}
+
+/**
+ * v106: record a notification-delivery outcome for a channel. A success resets
+ * the consecutive-failure streak (and stamps last_success_at); a failure
+ * increments it (and stamps last_failure_at + last_error). Upsert keyed by
+ * channel name — one row per channel, O(1). Best-effort callers wrap this in
+ * try/catch so the notify path never breaks on a DB hiccup.
+ */
+export function recordNotificationDelivery(args: { channelName: string; ok: boolean; error?: string | null; now?: string }): void {
+  const db = openDb();
+  const now = args.now ?? new Date().toISOString();
+  if (args.ok) {
+    db.prepare(
+      `INSERT INTO notification_health (channel_name, last_success_at, consecutive_failures, last_error, updated_at)
+       VALUES (?, ?, 0, NULL, ?)
+       ON CONFLICT(channel_name) DO UPDATE SET
+         last_success_at = excluded.last_success_at,
+         consecutive_failures = 0,
+         last_error = NULL,
+         updated_at = excluded.updated_at`,
+    ).run(args.channelName, now, now);
+  } else {
+    db.prepare(
+      `INSERT INTO notification_health (channel_name, last_failure_at, consecutive_failures, last_error, updated_at)
+       VALUES (?, ?, 1, ?, ?)
+       ON CONFLICT(channel_name) DO UPDATE SET
+         last_failure_at = excluded.last_failure_at,
+         consecutive_failures = notification_health.consecutive_failures + 1,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`,
+    ).run(args.channelName, now, args.error ?? null, now);
+  }
+}
+
+/** v106: read every channel's delivery-health row (for doctor / dashboards). */
+export function listNotificationHealth(): NotificationHealthRow[] {
+  const db = openDb();
+  return db.prepare(`SELECT * FROM notification_health ORDER BY channel_name`).all() as unknown as NotificationHealthRow[];
 }
 
 // ── sync_bookmarks (iter737) ─────────────────────────────────

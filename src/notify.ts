@@ -562,6 +562,18 @@ export async function notify(
     else if (r.ok) delivered += 1;
     else failed += 1;
   }
+  // v106: persist delivery health per channel so a silently-dead webhook is
+  // caught proactively (doctor) instead of leaving the operator flying blind.
+  // Only ATTEMPTED sends count — a skip (dedup/severity/quiet-hours/disabled)
+  // is neither success nor failure. Best-effort: never let a DB hiccup break
+  // notification delivery (and keep no-data-dir unit tests hermetic).
+  const attempts = results.filter((r) => !r.skipped);
+  if (attempts.length > 0) {
+    try {
+      const { recordNotificationDelivery } = await import("./db.js");
+      for (const r of attempts) recordNotificationDelivery({ channelName: r.channelName, ok: r.ok, error: r.error ?? null });
+    } catch { /* health table unavailable (fresh db / no data dir) — delivery already happened */ }
+  }
   return { event: evt.event, channels: allChannels.length, delivered, skipped, failed, results };
 }
 

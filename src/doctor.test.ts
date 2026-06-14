@@ -141,6 +141,41 @@ describe("checkEnv (iter660)", () => {
   });
 });
 
+describe("checkNotificationDelivery (v106)", () => {
+  it("ok when no delivery attempts have been recorded", async () => {
+    const { openDb } = await import("./db.js");
+    openDb().exec("DELETE FROM notification_health");
+    const { checkNotificationDelivery } = await import("./doctor.js");
+    const r = await checkNotificationDelivery();
+    expect(r.severity).toBe("ok");
+    expect(r.message).toMatch(/no delivery attempts/);
+  });
+
+  it("ok when channels are delivering (streak below the warn threshold)", async () => {
+    const { openDb, recordNotificationDelivery } = await import("./db.js");
+    openDb().exec("DELETE FROM notification_health");
+    recordNotificationDelivery({ channelName: "slack", ok: true });
+    recordNotificationDelivery({ channelName: "slack", ok: false }); // streak 1 < 3
+    const { checkNotificationDelivery } = await import("./doctor.js");
+    const r = await checkNotificationDelivery();
+    expect(r.severity).toBe("ok");
+  });
+
+  it("FAILS when a channel hits the consecutive-failure threshold — flags flying blind", async () => {
+    const { openDb, recordNotificationDelivery } = await import("./db.js");
+    const { checkNotificationDelivery, NOTIFY_FAILURE_STREAK_WARN } = await import("./doctor.js");
+    openDb().exec("DELETE FROM notification_health");
+    for (let i = 0; i < NOTIFY_FAILURE_STREAK_WARN; i++) {
+      recordNotificationDelivery({ channelName: "dead-webhook", ok: false, error: "ECONNREFUSED" });
+    }
+    const r = await checkNotificationDelivery();
+    expect(r.severity).toBe("fail");
+    expect(r.message).toMatch(/dead-webhook/);
+    expect(r.message).toMatch(/never delivered|consecutive/);
+    expect(r.hint).toMatch(/notify test/);
+  });
+});
+
 describe("checkSyncBookmarks (iter740)", () => {
   const OWNER = "0xa000000000000000000000000000000000000001";
 

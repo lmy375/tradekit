@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 106 — 通知投递健康：静默失效的告警通道不再让运营商"盲飞"（notification-delivery health — a silently-dead alert channel is caught proactively, not discovered during an incident）** ✅
+- **补上"告警通道死了也没人知道"的信任盲区**：运营商靠 notifications.channels（webhook/Slack/Discord/Telegram）接收 digest、安全告警、agent 审批待办。`notify()` 每次投递都知道每个通道成功/失败，但**从不持久化**——一个 setup 时能用、之后 URL 轮换/吊销而失效的通道，会**永远静默失败**。运营商停止收到任何告警却毫不知情，恰恰在出事、最需要告警时盲飞。只有手动跑 `notify test` 才会发现
+- 为什么重要：自主交易的整个安全网（断路器、引擎存活、偏离检测…）最终都靠"告警真的送达运营商"。通道静默失效=安全网的最后一跳断了。这是 v103（引擎存活）同类的可靠性盲区——运营商依赖、静默损坏、必须主动暴露。被动追踪（无需手动 test）在运营商下次 check-in 时就报"你的告警两天没送出去了"
+- 实现（被动追踪 + pull-based 暴露）：迁移 v66 加 `notification_health` 表（每通道一行：last_success_at / last_failure_at / consecutive_failures / last_error）。db `recordNotificationDelivery`（成功重置连败streak+清错误、失败累加）+ `listNotificationHealth`。`notify()` 对每个**实际尝试**的投递（跳过的 dedup/severity/quiet-hours 不算）best-effort 记录（DB 故障绝不阻断投递、无 data dir 的测试保持 hermetic）。doctor `checkNotificationDelivery`：任一通道连败≥3 → **fail**（"你的告警可能没送达"+last error+`notify test` 提示）。用 pull-based 的 doctor 暴露——正因为 push 通道本身可能就是坏的那个
+- 测试覆盖：+6——db（失败累加streak / 成功重置+清错误 / 每通道独立 upsert）+ doctor（无记录→ok / streak<3→ok / streak≥3→fail 点名通道+提示）；3568 测试全绿（+6）；doctor 已烟测
+- 向后兼容：纯加法——新表 + 新 db helper + 新 doctor check；notify() 投递路径只多一个 best-effort 持久化（try/catch 包裹，永不阻断）；无 data dir 的调用点静默 no-op
+
 **Phase 105.1 — 让风险定仓可执行：一条命令完成"按风险定仓 + 入场即挂止损"（make risk sizing actionable — emit a ready-to-run protected entry, the disciplined path in one call）** ✅
 - **把 v105 从"建议数字"变成"可执行的纪律入场"**：v105 算出该买多少（advisory），但 agent 还得手动把数字穿进 buy、还得记得用同一个止损距离挂保护单——两步、易错（数字穿错、忘挂止损）。本期用 v98 的 detect→respond 模式，让 `risk_size` 直接产出一条**现成的 buy**（带算好的 quoteAmount + 把止损距离作为 protectTrailPct 挂上），把"按风险定仓→执行→保护"合成一次原子操作
 - 为什么重要：自主 agent 里，让正确的事成为容易的事（同 v93 一键加固的哲学）。两步之间的缝隙正是出错处——算了风险尺寸却 fat-finger 金额、或忘了挂止损裸奔。一条 recommendedActions 消除这整类错误：尺寸来自风险预算（被安全天花板夹住）、止损就是定仓假设的那个距离——realized 风险=预算

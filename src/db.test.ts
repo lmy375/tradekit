@@ -14,7 +14,7 @@ const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-db-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 // Static imports happen before tmp dir is set, so use dynamic import after env var.
-const { dailyUsdVolume, usdSpentUnderStrategy, insertTrade, hasPriorTokenFill, closeDb } = await import("./db.js");
+const { dailyUsdVolume, usdSpentUnderStrategy, insertTrade, hasPriorTokenFill, recordNotificationDelivery, listNotificationHealth, closeDb } = await import("./db.js");
 type TradeRow = Awaited<ReturnType<typeof import("./db.js").recentTrades>>[number];
 
 const ACCOUNT = "test-acct";
@@ -52,6 +52,38 @@ beforeAll(() => {
 afterAll(() => {
   closeDb();
   rmSync(tmpDataDir, { recursive: true, force: true });
+});
+
+describe("notification delivery health (v106)", () => {
+  const health = (name: string) => listNotificationHealth().find((r) => r.channel_name === name);
+
+  it("a failure increments the streak; consecutive failures accumulate", () => {
+    recordNotificationDelivery({ channelName: "ch-fail", ok: false, error: "404", now: "2026-06-15T00:00:00Z" });
+    recordNotificationDelivery({ channelName: "ch-fail", ok: false, error: "timeout", now: "2026-06-15T00:01:00Z" });
+    const h = health("ch-fail")!;
+    expect(h.consecutive_failures).toBe(2);
+    expect(h.last_error).toBe("timeout"); // most recent
+    expect(h.last_failure_at).toBe("2026-06-15T00:01:00Z");
+    expect(h.last_success_at).toBeNull();
+  });
+
+  it("a success RESETS the streak + clears the error, stamping last_success_at", () => {
+    recordNotificationDelivery({ channelName: "ch-recover", ok: false, error: "boom" });
+    recordNotificationDelivery({ channelName: "ch-recover", ok: false, error: "boom2" });
+    recordNotificationDelivery({ channelName: "ch-recover", ok: true, now: "2026-06-15T01:00:00Z" });
+    const h = health("ch-recover")!;
+    expect(h.consecutive_failures).toBe(0);
+    expect(h.last_error).toBeNull();
+    expect(h.last_success_at).toBe("2026-06-15T01:00:00Z");
+  });
+
+  it("upserts one row per channel — independent streaks", () => {
+    recordNotificationDelivery({ channelName: "ch-a", ok: false });
+    recordNotificationDelivery({ channelName: "ch-b", ok: true });
+    recordNotificationDelivery({ channelName: "ch-a", ok: false });
+    expect(health("ch-a")!.consecutive_failures).toBe(2);
+    expect(health("ch-b")!.consecutive_failures).toBe(0);
+  });
 });
 
 describe("hasPriorTokenFill (v101 new-token detection)", () => {

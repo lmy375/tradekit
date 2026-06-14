@@ -1101,6 +1101,40 @@ export async function checkEngineLiveness(): Promise<CheckResult> {
   }
 }
 
+/** v106: notification-delivery health. A channel that worked at setup but
+ *  later died (rotated/revoked webhook) fails SILENTLY — the operator stops
+ *  getting digests/alerts/approval-pages and doesn't know. This catches a
+ *  channel with a consecutive-failure streak so the operator learns their
+ *  alerts aren't landing the next time they run doctor (the pull-based path
+ *  that survives even when the push path is the thing that's broken). */
+export const NOTIFY_FAILURE_STREAK_WARN = 3;
+export async function checkNotificationDelivery(): Promise<CheckResult> {
+  try {
+    const { listNotificationHealth } = await import("./db.js");
+    const rows = listNotificationHealth();
+    if (rows.length === 0) {
+      return { name: "notification delivery", severity: "ok", message: "no delivery attempts recorded yet (no events fired, or no channels)" };
+    }
+    const failing = rows.filter((r) => r.consecutive_failures >= NOTIFY_FAILURE_STREAK_WARN);
+    if (failing.length > 0) {
+      const worst = [...failing].sort((a, b) => b.consecutive_failures - a.consecutive_failures)[0];
+      return {
+        name: "notification delivery",
+        // fail: a dead alert channel means flying blind during incidents.
+        severity: "fail",
+        message:
+          `${failing.length} notification channel(s) failing — "${worst.channel_name}" has ${worst.consecutive_failures} consecutive failures` +
+          `${worst.last_success_at ? ` (last success ${worst.last_success_at})` : " (never delivered)"}${worst.last_error ? `: ${worst.last_error}` : ""}`,
+        hint: "your alerts/digests may not be reaching you — verify the channel URL with `tradekit notify test`, then fix config.notifications.channels",
+      };
+    }
+    const healthy = rows.filter((r) => r.last_success_at != null).length;
+    return { name: "notification delivery", severity: "ok", message: `${healthy}/${rows.length} channel(s) delivering` };
+  } catch (e) {
+    return { name: "notification delivery", severity: "warn", message: `check failed: ${(e as Error).message}` };
+  }
+}
+
 /** v38: a long-standing engine lock (especially one engaged by
  *  panic) means automation is FULLY stopped — easy to forget after
  *  the incident that caused it. */
@@ -1456,6 +1490,7 @@ export async function runDoctor(opts: DoctorOptions): Promise<{ timestamp: strin
   results.push(await checkPausedForgotten());
   results.push(await checkSignalReadiness());
   results.push(await checkPendingIntents());
+  results.push(await checkNotificationDelivery());
 
   // RPCs (parallel)
   results.push(...(await Promise.all(chains.map((c) => checkRpc(c, opts.logger)))));
