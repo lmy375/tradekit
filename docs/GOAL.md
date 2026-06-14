@@ -33,6 +33,20 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 54 — 交易前限额投影（pre-trade limit projection — "will this trade actually be ADMITTED, or bounce off a limit?"）** ✅
+- 修复**最重要的交易决策工具**的"沉默不完整"：`trade preview` / `preview_trade` 只跑**廉价子集**（`enforcePreflightSafety` = slippage 上限 + token 白/黑名单，iter405 拆分）。**状态相关**的执行护栏——per-tx / daily USD 上限、contract whitelist、per-strategy 预算、净敞口 position cap、交易限频、gas 预算——只在**执行时**才触发。结果：agent 读到 `safety.passes=true`，调 buy，却吃一个它**无法预见**的 `SAFEGUARD_TRIGGERED` / `STRATEGY_BUDGET_EXCEEDED` / `POSITION_CAP_EXCEEDED` 拒绝
+- 新模块 `tradeAdmissibility.ts`（~200 行）：`projectTradeLimits()` 为一笔**预期交易**投影完整的执行护栏。**关键设计——零偏差**：它在 try/catch 里跑**真正的抛错 enforcer**（`enforceSafety` / `enforceRateLimit` / `enforceStrategyBudget` / `enforcePositionCap` / `enforceGasBudget`），而**不是**重新推导阈值——所以投影**永远不可能**与执行实际行为不一致。一个"会撒谎的 preview"比没有 preview 更糟；复用执行代码让撒谎不可能
+- 返回 `{ admissible, checks[], blocking[] }`：每个护栏的 pass/fail + 失败时的结构化 ToolError code（AMOUNT_EXCEEDS_LIMIT / SAFEGUARD_TRIGGERED / STRATEGY_BUDGET_EXCEEDED / POSITION_CAP_EXCEEDED / GAS_BUDGET_EXCEEDED）+ agent 在执行时会看到的**原文 message**
+- 集成（纯加法，全部 best-effort 不阻断 preview）：
+  - `previewTrade`：新增可选 `strategy` 参数 + 新 `limits` 字段（用真 enforcer 投影；买单的 base 收到量来自 amountOut，gas 来自 metrics）。`safety` 字段语义**完全不变**——`limits` 是补充的完整图景
+  - `preview_trade` MCP：新 `strategy` 参数 + 描述说明 `limits.admissible=false` 即"buy/sell 会在执行时被拒"
+  - `preflight_trade` 复合 verdict：preview 已带 `limits` → 组合器新增 `limit_would_reject`（critical → **no_go**）。agent 分支于 verdict 即可自动拒绝会被护栏弹回的交易
+  - CLI `trade preview [--strategy]`：渲染 `Limit projection: 🟢 ADMISSIBLE / 🔴 WOULD REJECT` + 每条 blocking；`--strict` 现在也在 `limits.admissible===false` 时退出 1（pipeline gate 完整）
+- 与 v53 headroom 的分工：headroom 答"还剩多少空间"（当前状态快照），admissibility 答"这笔**具体**交易过不过"（含交易量的前向投影 + 零偏差执行语义）
+- 测试覆盖：`tradeAdmissibility.test.ts` 12 case（真 enforcer + seeded DB——per-tx/daily AMOUNT_EXCEEDS_LIMIT / 限频 SAFEGUARD_TRIGGERED + ready / 预算 STRATEGY_BUDGET_EXCEEDED + 无 tag 跳过 / position cap POSITION_CAP_EXCEEDED + sell 跳过 / gas GAS_BUDGET_EXCEEDED / 全过 admissible / 多限同时失败全进 blocking）+ `preflight.test.ts` +2（limit_would_reject → no_go / admissible 不加 reason）
+- 向后兼容：纯加法——无 schema migration；`safety` 字段语义不变；`limits` 仅在投影成功时出现；不传 `strategy` 则只投影非 tag 限额（core/rate/gas）。现有 preview/preflight 调用者零行为变化
+- v1 限制：`limits` 投影 token-safety honeypot 探测**不**在内（那是 preflight 的独立 source，已是 no_go）；position cap 用 real 成交（paper=false）；core_safety 会**重跑** slippage+token（与 preview.safety 冗余但无害——`limits.admissible` 因此是单一的"会不会过"完整布尔）；投影是当下状态的前向投影，不预测"连发 N 笔后第 N 笔"（agent 拿 headroom 自己推）
+
 **Phase 53 — 运行时安全余量（safety headroom — "how much room is left, and what's my binding constraint right now?"）** ✅
 - 安全投资的**第三种用法**，而非第四道护栏：v51 safety_review 让**静态配置态势**对运营商可读；v52 promote safety-preflight 让它在 go-live 时**起闸**；v53 让**运行时余量**在决策时对 **agent** 可读
 - 痛点：一个自主 agent 在动手交易前，应该知道自己**还剩多少空间**——今天日限额还剩 $50、离某个 position cap 还有 80%、离 drawdown trip 还差 5%——这样它能**聪明地 size 下一笔交易**，而不是盲发然后撞上 SAFEGUARD_TRIGGERED 被拒。运营商也获得一句话的"我的 agent 离限额多近？"

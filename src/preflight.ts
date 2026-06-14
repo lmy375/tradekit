@@ -44,6 +44,7 @@ export interface PreflightReason {
     | "price_extreme_divergence"
     | "price_suspicious_divergence"
     | "preview_safety_failed"
+    | "limit_would_reject"
     | "high_realized_slippage_history"
     | "gas_pct_high"
     | "balance_fraction_high"
@@ -185,6 +186,22 @@ export function combinePreflightVerdict(args: {
       });
     }
 
+    // v54: state-dependent limit projection (per-tx/daily USD, rate limit,
+    // strategy budget, position cap, gas budget). A trade that would bounce
+    // off one of these at execution is a no_go — the agent shouldn't fire it
+    // only to eat a SAFEGUARD_TRIGGERED / STRATEGY_BUDGET_EXCEEDED reject.
+    if (args.preview.limits && !args.preview.limits.admissible) {
+      const blocked = args.preview.limits.blocking
+        .map((b) => `${b.label}${b.code ? ` (${b.code})` : ""}`)
+        .join("; ");
+      reasons.push({
+        code: "limit_would_reject",
+        severity: "critical",
+        message: `A configured guardrail would REJECT this trade at execution: ${blocked}. ${args.preview.limits.blocking[0]?.message ?? ""}`.trim(),
+        source: "preview",
+      });
+    }
+
     // Lower-severity preview signals — gas % and balance fraction.
     const gasPct = args.preview.metrics.gasPctOfInput;
     if (gasPct != null && gasPct > 10) {
@@ -294,6 +311,10 @@ export interface PreflightRequest {
   skipPriceCheck?: boolean;
   /** Skip the iter619 historical-quality lookup (DB-bound, cheap). */
   skipHistory?: boolean;
+  /** v54: strategy tag — when set, the preview's limit projection also
+   *  evaluates the per-strategy budget + position cap that would gate a
+   *  tagged agent trade, so the verdict reflects them. */
+  strategy?: string | null;
 }
 
 /**
@@ -339,6 +360,7 @@ export async function runPreflight(args: {
     config: args.config,
     logger: args.logger,
     account: args.accountLabel,
+    strategy: args.req.strategy ?? null,
   }).catch((e) => ({ error: (e as Error).message }) as { error: string });
 
   const tokenSafetyP = args.req.skipHoneypot

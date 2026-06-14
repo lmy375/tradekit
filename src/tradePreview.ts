@@ -128,6 +128,15 @@ export interface TradePreviewReport {
     dominantLastSeen?: string;
     suggestedActions?: import("./errors.js").NextAction[];
   };
+  /** v54: projection of the STATE-DEPENDENT execution guardrails (per-tx/
+   *  daily USD, contract whitelist, rate limit, per-strategy budget,
+   *  net-exposure position cap, gas budget) for THIS prospective trade.
+   *  Where `safety` covers only the cheap slippage+token subset, this is
+   *  the complete "would buy/sell actually be admitted?" picture — so the
+   *  agent never gets a "go" here then a SAFEGUARD_TRIGGERED at execution.
+   *  Computed via the real enforcers (zero divergence). Absent only when
+   *  the projection itself errors (best-effort, never blocks the preview). */
+  limits?: import("./tradeAdmissibility.js").TradeLimitProjection;
 }
 
 /**
@@ -255,6 +264,10 @@ export async function previewTrade(args: {
   profile: ChainProfile;
   config: Config;
   logger: Logger;
+  /** v54: optional strategy tag. When set, the limit projection also
+   *  evaluates the per-strategy budget + net-exposure position cap that
+   *  would gate a tagged agent trade at execution. */
+  strategy?: string | null;
 }): Promise<TradePreviewReport> {
   const baseIsNative = args.base === NATIVE_TOKEN;
   const quoteIsNative = args.quote === NATIVE_TOKEN;
@@ -437,6 +450,48 @@ export async function previewTrade(args: {
     args.logger.debug(`iter694 pattern check failed: ${(e as Error).message}`);
   }
 
+  // v54: project the full state-dependent execution gauntlet for THIS
+  // trade so the agent's pre-trade read is complete (not just the cheap
+  // slippage+token subset in `safety`). Best-effort — a projection error
+  // never breaks the preview, matching the recentFailurePattern stance.
+  let limits: TradePreviewReport["limits"];
+  try {
+    const { projectTradeLimits } = await import("./tradeAdmissibility.js");
+    // For a buy, the base received is the output amount; the quote spent
+    // is the input USD. Sells reduce exposure → no position-cap projection.
+    const addBaseAmount = args.direction === "buy" ? Number(metrics.amountOut) : null;
+    const addCostQuote = args.direction === "buy" ? metrics.inputUsd : null;
+    const gas =
+      metrics.estimatedGasNative != null
+        ? {
+            chain: args.profile.name,
+            estimatedGasNative: Number(metrics.estimatedGasNative),
+            estimatedGasUsd: metrics.estimatedGasUsd ?? undefined,
+            estimatedTradeUsd: metrics.inputUsd ?? undefined,
+          }
+        : null;
+    limits = projectTradeLimits({
+      config: args.config,
+      logger: args.logger,
+      chain: args.profile.name,
+      account: args.account,
+      tokenIn,
+      tokenOut,
+      toContract: quote.to,
+      estimatedUsd: metrics.inputUsd,
+      slippageBps: args.slippageBps,
+      direction: args.direction,
+      strategy: args.strategy ?? null,
+      baseToken: args.base,
+      baseSymbol: baseMeta.symbol,
+      addBaseAmount,
+      addCostQuote,
+      gas,
+    });
+  } catch (e) {
+    args.logger.debug(`v54 limit projection failed: ${(e as Error).message}`);
+  }
+
   return {
     chain: args.profile.name,
     direction: args.direction,
@@ -452,6 +507,7 @@ export async function previewTrade(args: {
     safety,
     timestamp: new Date().toISOString(),
     ...(recentFailurePattern ? { recentFailurePattern } : {}),
+    ...(limits ? { limits } : {}),
   };
 }
 

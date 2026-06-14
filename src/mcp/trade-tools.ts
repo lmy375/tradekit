@@ -430,7 +430,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
   // verify the trade is safe and economical to submit.
   server.tool(
     "preview_trade",
-    "Unified read-only pre-trade analysis. Returns { ok, chain, direction, baseToken, baseSymbol, quoteToken, quoteSymbol, provider, alternatives?, to, allowanceTarget, metrics, safety, timestamp, recentFailurePattern? }. metrics carries amountIn/amountOut/amountOutMinimum (decimal), inputUsd/outputUsd/outputUsdFloor, slippageCushionBps, effectivePrice, estimatedGasNative/estimatedGasUsd/gasPctOfInput (flag when >5% — gas-dominated trade), walletBalance/balanceFractionPct (catches fat-finger amount typos), currentAllowance/hasSufficientAllowance (signals whether an approve is needed first). safety.passes = would enforcePreflightSafety allow this trade? When safety.passes=false the rejection field carries the typed code/message/details so the agent can fix the issue (SLIPPAGE_TOO_HIGH, TOKEN_BLOCKED, CONTRACT_BLOCKED, AMOUNT_EXCEEDS_LIMIT) without re-quoting just to learn what failed. `recentFailurePattern` (iter694 — same shape as quote/buy/sell) surfaces when ≥3 trades on this base/quote pair failed in last 7d with one dominant reason at ≥50% share; suggestedActions field carries the iter686 classifier-derived next steps. Pass quoteAmount for buy direction or baseAmount for sell. Errors mirror quote: INVALID_PARAMS (missing/wrong amount field), UNKNOWN_TOKEN, UNKNOWN_CHAIN, AGGREGATOR_FAILED.",
+    "Unified read-only pre-trade analysis. Returns { ok, chain, direction, baseToken, baseSymbol, quoteToken, quoteSymbol, provider, alternatives?, to, allowanceTarget, metrics, safety, timestamp, recentFailurePattern? }. metrics carries amountIn/amountOut/amountOutMinimum (decimal), inputUsd/outputUsd/outputUsdFloor, slippageCushionBps, effectivePrice, estimatedGasNative/estimatedGasUsd/gasPctOfInput (flag when >5% — gas-dominated trade), walletBalance/balanceFractionPct (catches fat-finger amount typos), currentAllowance/hasSufficientAllowance (signals whether an approve is needed first). safety.passes = would enforcePreflightSafety allow this trade? When safety.passes=false the rejection field carries the typed code/message/details so the agent can fix the issue (SLIPPAGE_TOO_HIGH, TOKEN_BLOCKED, CONTRACT_BLOCKED, AMOUNT_EXCEEDS_LIMIT) without re-quoting just to learn what failed. `recentFailurePattern` (iter694 — same shape as quote/buy/sell) surfaces when ≥3 trades on this base/quote pair failed in last 7d with one dominant reason at ≥50% share; suggestedActions field carries the iter686 classifier-derived next steps. v54: `limits` projects the STATE-DEPENDENT execution guardrails (per-tx/daily USD, contract whitelist, rate limit, per-strategy budget, position cap, gas budget) for THIS trade via the real enforcers — `limits.admissible=false` + `limits.blocking[]` means buy/sell WOULD be rejected at execution even though `safety.passes` (the cheap slippage+token subset) is true. Pass `strategy` to include the per-strategy budget + position-cap checks. Pass quoteAmount for buy direction or baseAmount for sell. Errors mirror quote: INVALID_PARAMS (missing/wrong amount field), UNKNOWN_TOKEN, UNKNOWN_CHAIN, AGGREGATOR_FAILED.",
     {
       direction: z.enum(["buy", "sell"]).describe("buy = spend quote, sell = sell base"),
       chain: z.string().optional(),
@@ -443,11 +443,14 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       autoSlippage: z.boolean().optional().describe(
         "Iter645: derive slippage from realized history on the pair (same logic as buy/sell autoSlippage). When set + slippageBps undefined, replaces default. Response carries `slippageSuggestion` so the caller can verify what was used.",
       ),
+      strategy: z.string().max(100).optional().describe(
+        "v54: strategy tag the trade would be stamped with. When set, the `limits` projection also evaluates the per-strategy budget + net-exposure position cap that gate a tagged trade at execution — so a tagged agent trade's `limits.admissible` is complete.",
+      ),
     },
-    async ({ direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, autoSlippage }) => {
+    async ({ direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, autoSlippage, strategy }) => {
       try {
         return ok(
-          await runTool("preview_trade", rt.opts, { direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, autoSlippage }, chain, async () => {
+          await runTool("preview_trade", rt.opts, { direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, autoSlippage, strategy }, chain, async () => {
             const config = rt.getConfig();
             const wallet = await rt.getContext(chain, account);
             const { resolveProfile: rp } = await import("../config.js");
@@ -524,6 +527,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
               profile,
               config,
               logger: rt.opts.logger,
+              strategy,
             });
             return { ok: true, ...report, ...(slippageSuggestion ? { slippageSuggestion } : {}) };
           }),
@@ -541,7 +545,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
   // catch issues in one call.
   server.tool(
     "preflight_trade",
-    "Composite pre-trade safety check. Returns { ok, chain, direction, baseSymbol, quoteSymbol, timestamp, verdict, reasons[], preview?, tokenSafety?, priceCrossCheck?, history? }. verdict ∈ 'go' / 'caution' / 'no_go'. Reasons each have a stable code ('token_honeypot', 'token_suspicious', 'price_extreme_divergence', 'price_suspicious_divergence', 'preview_safety_failed', 'high_realized_slippage_history', 'gas_pct_high', 'balance_fraction_high', 'approval_needed', 'preview_ok', 'token_ok', 'price_ok', 'history_ok', 'check_skipped') + severity (critical/warn/info) + source. no_go fires on critical findings (honeypot, extreme price divergence, preview-safety failure); caution fires on warns; otherwise go. Source reports embedded for callers who want details. Skip-flags let agents bypass expensive checks: skipHoneypot avoids the ~4-RPC round-trip probe, skipPriceCheck avoids the CoinGecko+DexScreener fan-out, skipHistory avoids DB+RPC for analyzing past trades. Use before dispatching buy/sell — agents branching on report.verdict can refuse no_go automatically.",
+    "Composite pre-trade safety check. Returns { ok, chain, direction, baseSymbol, quoteSymbol, timestamp, verdict, reasons[], preview?, tokenSafety?, priceCrossCheck?, history? }. verdict ∈ 'go' / 'caution' / 'no_go'. Reasons each have a stable code ('token_honeypot', 'token_suspicious', 'price_extreme_divergence', 'price_suspicious_divergence', 'preview_safety_failed', 'limit_would_reject', 'high_realized_slippage_history', 'gas_pct_high', 'balance_fraction_high', 'approval_needed', 'preview_ok', 'token_ok', 'price_ok', 'history_ok', 'check_skipped') + severity (critical/warn/info) + source. no_go fires on critical findings (honeypot, extreme price divergence, preview-safety failure, or v54 'limit_would_reject' — a configured per-tx/daily/budget/cap/rate guardrail that would reject the trade at execution); caution fires on warns; otherwise go. Source reports embedded for callers who want details. Skip-flags let agents bypass expensive checks: skipHoneypot avoids the ~4-RPC round-trip probe, skipPriceCheck avoids the CoinGecko+DexScreener fan-out, skipHistory avoids DB+RPC for analyzing past trades. Use before dispatching buy/sell — agents branching on report.verdict can refuse no_go automatically.",
     {
       direction: z.enum(["buy", "sell"]),
       chain: z.string().optional(),
@@ -557,6 +561,9 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       autoSlippage: z.boolean().optional().describe(
         "Iter645: derive slippage from realized history for the pair. Same data-driven recommendation as buy/sell autoSlippage. Response includes slippageSuggestion field.",
       ),
+      strategy: z.string().max(100).optional().describe(
+        "v54: strategy tag the trade would carry. When set, the verdict also reflects the per-strategy budget + net-exposure position cap (a configured limit that would reject the trade → no_go with code 'limit_would_reject').",
+      ),
     },
     async ({
       direction,
@@ -571,13 +578,14 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       skipPriceCheck,
       skipHistory,
       autoSlippage,
+      strategy,
     }) => {
       try {
         return ok(
           await runTool(
             "preflight_trade",
             rt.opts,
-            { direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, skipHoneypot, skipPriceCheck, skipHistory },
+            { direction, chain, base, quote: quoteSym, baseAmount, quoteAmount, slippageBps, account, skipHoneypot, skipPriceCheck, skipHistory, strategy },
             chain,
             async () => {
               const config = rt.getConfig();
@@ -651,6 +659,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                   skipHoneypot,
                   skipPriceCheck,
                   skipHistory,
+                  strategy,
                 },
                 publicClient: wallet.publicClient,
                 walletAddress: wallet.account.address as `0x${string}`,

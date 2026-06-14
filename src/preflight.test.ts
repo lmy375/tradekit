@@ -157,6 +157,32 @@ describe("combinePreflightVerdict — no_go path (critical findings)", () => {
     const criticals = r.reasons.filter((x) => x.severity === "critical");
     expect(criticals.length).toBe(3);
   });
+
+  // v54: a configured execution limit that would reject the trade is a
+  // no_go even when the cheap safety subset (slippage+tokens) passes.
+  it("limit projection would reject → no_go with limit_would_reject", () => {
+    const r = combinePreflightVerdict({
+      preview: {
+        ...makePreview(), // safety.passes = true
+        limits: {
+          admissible: false,
+          checks: [{ name: "strategy_budget", label: "Per-strategy budget", passes: false, code: "STRATEGY_BUDGET_EXCEEDED", message: "over the lifetime cap" }],
+          blocking: [{ name: "strategy_budget", label: "Per-strategy budget", passes: false, code: "STRATEGY_BUDGET_EXCEEDED", message: "over the lifetime cap" }],
+        },
+      },
+    });
+    expect(r.verdict).toBe("no_go");
+    const reason = r.reasons.find((x) => x.code === "limit_would_reject");
+    expect(reason?.severity).toBe("critical");
+    expect(reason?.message).toMatch(/Per-strategy budget.*STRATEGY_BUDGET_EXCEEDED/);
+  });
+
+  it("admissible limit projection adds no limit_would_reject reason", () => {
+    const r = combinePreflightVerdict({
+      preview: { ...makePreview(), limits: { admissible: true, checks: [{ name: "core_safety", label: "x", passes: true }], blocking: [] } },
+    });
+    expect(r.reasons.some((x) => x.code === "limit_would_reject")).toBe(false);
+  });
 });
 
 describe("combinePreflightVerdict — caution path (warn findings)", () => {

@@ -305,6 +305,7 @@ export async function tradePreviewCommand(
       profile,
       config,
       logger,
+      strategy: flags["strategy"] ?? null,
     });
 
     // Iter798: --strict exit-code gate. Triggers when safety.passes is false
@@ -318,7 +319,7 @@ export async function tradePreviewCommand(
 
     if (flags["json"] === "true") {
       printJson({ ok: true, ...report, ...(slippageSuggestion ? { slippageSuggestion } : {}) });
-      if (strict && !report.safety.passes) process.exitCode = 1;
+      if (strict && (!report.safety.passes || report.limits?.admissible === false)) process.exitCode = 1;
       return;
     }
 
@@ -383,6 +384,17 @@ export async function tradePreviewCommand(
     if (!report.safety.passes && report.safety.rejection) {
       console.log(`    ${report.safety.rejection.code}: ${report.safety.rejection.message}`);
     }
+    // v54: full execution-limit projection — the state-dependent guardrails
+    // that `safety` (cheap slippage+token subset) doesn't cover.
+    if (report.limits) {
+      const adm = report.limits.admissible ? "🟢 ADMISSIBLE" : "🔴 WOULD REJECT";
+      console.log(`  Limit projection:  ${adm}`);
+      if (!report.limits.admissible) {
+        for (const b of report.limits.blocking) {
+          console.log(`    ✗ ${b.label}${b.code ? ` [${b.code}]` : ""}: ${b.message ?? ""}`);
+        }
+      }
+    }
     if (report.alternatives && report.alternatives.length > 0) {
       console.log("");
       console.log(`  Aggregator alternatives (best-of-N race):`);
@@ -394,8 +406,9 @@ export async function tradePreviewCommand(
         }
       }
     }
-    // Iter798: strict gate (text-mode path).
-    if (strict && !report.safety.passes) process.exitCode = 1;
+    // Iter798: strict gate (text-mode path). v54: also fail when a
+    // configured execution limit would reject the trade.
+    if (strict && (!report.safety.passes || report.limits?.admissible === false)) process.exitCode = 1;
   } finally {
     logger.close();
   }
