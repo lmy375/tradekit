@@ -33,6 +33,17 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 78 — 统一风险态势（unified risk posture — one "is my book in danger RIGHT NOW?" verdict, synthesis not piling）** ✅
+- **合成而非再加检测面**：v53/v72/v76/v77 各加了一个运行时风险信号——敞口余量、组合集中度、裸仓价值、MEV 暴露——但分散在不同命令里。运营商（或 agent 自己）**没有一个地方**说"你的风险是 critical/elevated/ok"并排序原因。连续多期加检测器后，最该做的是**把它们合成一个答案**，而非再加第 N 个检测器
+- 为什么是最重要的：自主 agent 托管真钱，运营商最需要的是"现在安不安全"的**单一可分支信号**——监控 cron 可以在 `risk=critical` 时告警/page，agent 可以在自己的 book 转危时**自动停手**。此前要轮询 headroom + concentration + protection + mev 四个命令各自判断；现在一次调用得到一个裁决
+- 实现（纯合成，零新分析）：纯函数 `combineRiskPosture({ headroom, concentration, protection, mev })` → { verdict (ok/elevated/critical), concerns[]（worst-first，{severity, code, message, source}）, checked[], skipped[], summary }。映射：任一限额 tripped/exhausted（不能交易的状态，含 drawdown 熔断）→ critical；集中度 warn / 裸仓 >50% book / 限额 approaching / MEV exposed → elevated（warn）；否则 ok。每个组件来自**既有 gatherer**（headroom v53 / portfolio.concentrationRisk v72 / positionProtection v76 / assessMevExposure v77）
+- `gatherRiskPosture` 做 IO：headroom（DB 便宜）+ concentration（aggregatePortfolio，链上）+ protection（open positions + orders）+ mev（纯配置）。**每个 best-effort**——某组件 RPC 失败降级进 `skipped[]`（不伪造、不拖垮整体裁决）
+- 与 health 区分：health 是宽的运维仪表盘（portfolio+pnl+trades+approvals）；risk 是**聚焦的危险裁决**——单一可分支 verdict，给监控/halt 用
+- Surfaces：CLI `risk [--strict --strict-elevated]`（verdict 徽章 + 排序 concerns + checked/skipped；--strict 在 critical 退 1 供 cron page 门，--strict-elevated 在 elevated 也退 1）+ MCP `risk_posture`。MCP_TOOLS 不变量加 `risk_posture`
+- 测试覆盖：`riskPosture.test.ts` 9——无问题→ok / tripped→critical / exhausted→critical / approaching+集中度+mev→elevated 三 concern / 裸仓 >50%→elevated 带 60% 文案 / 裸仓低于阈值→无 concern / critical 排在 warn 前（不论输入序）/ 记录 checked 维度 / 全空→ok 诚实 summary；CLI 离线烟雾（fresh→🟢OK 4 维 / ethereum 激活→🟡ELEVATED mev concern / --strict 对 elevated 退 0）
+- 向后兼容：纯加法——新模块、新 CLI 命令、新 MCP 工具；纯合成只读（不碰执行）；3406 测试全绿（+9）
+- v1 限制：concentration 用链上 holdings、protection 用 trade-derived 持仓（两个口径，已注释）；裸仓"critical"未设（保留 critical 给 tripped/exhausted 这类不能交易状态，裸仓是 posture 选择→elevated）；重维度需链上读，失败降级 skipped
+
 **Phase 77 — MEV 暴露进决策点（MEV/sandwich exposure surfaced at the pre-trade decision — stop the silent 0.5-3%/trade leak）** ✅
 - **换轴：执行路径的钱漏，而非又一个仓位/组合检测面**：连续多期在仓位/组合风险检测。本期转向一个真实且持续的**钱漏**：MEV/三明治攻击。在公共内存池链（尤其 Ethereum 主网）上，裸提交的交易会被 MEV bot 夹击套利，典型损失每笔 0.5-3%、illiquid 对更高。tradekit **早有** MEV 保护（mev.ts 私有中继传输 Flashbots/MEV Blocker），但保护状态**只在 safety review 的滑点脚注里提了一句**，**preflight/preview 完全不提**——agent 在主网无保护下单时拿到的是"GO"，毫无即将漏给夹击 bot 的提示
 - 为什么是最重要的：安全 = 不因可预防的错误亏钱。MEV 是**每笔交易**的隐形复利损失。over-concentration/over-sizing/裸仓是组合级爆仓源；MEV 是**执行级**的持续失血。把它放进 agent 的下单决策点（preflight 裁决），让坏的执行路径在下单前就被看见

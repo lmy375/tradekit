@@ -982,6 +982,15 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
         v67: --context adds per-position price context (range position + Nd trend) — is the
         price near a recent high (good exit) or low? — for a one-read exit-decision view
         (off by default; fetches a price series per token, cached). MCP: open_positions.
+  risk [--account L] [--chain X] [--strict] [--strict-elevated] [--json]
+        v78: unified runtime RISK POSTURE — one verdict (ok/elevated/critical)
+        synthesizing exposure headroom (tripped/exhausted limits incl. drawdown),
+        concentration (v72), unprotected value-at-risk (v76), and MEV exposure
+        (v77), with ranked concerns. The single "is my book in danger right now?"
+        answer — instead of polling headroom + concentration + protection + mev
+        separately. Adds no new analysis (pure synthesis). --strict exits 1 on
+        critical (cron page gate); --strict-elevated exits 1 on elevated too.
+        MCP: risk_posture.
   positions --protection [--account L] [--chain X] [--paper] [--strict] [--json]
         v76: PROTECTION AUDIT — cross-references open positions against active stop /
         trailing SELL orders. Per position: held vs protected vs unprotected amount +

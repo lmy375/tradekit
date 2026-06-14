@@ -407,6 +407,15 @@ async function main() {
         break;
       }
 
+      // v78: `tradekit risk` — unified runtime risk posture (one verdict
+      // synthesizing exposure headroom + concentration + unprotected value +
+      // MEV). --strict exits 1 on critical for cron risk gating.
+      case "risk": {
+        const { riskPostureCommand } = await import("./cli/inspect.js");
+        await riskPostureCommand(flags);
+        break;
+      }
+
       // Iter613: `tradekit price-check <token>` — cross-source price sanity
       // probe. Compares CoinGecko and DexScreener; flags divergence (likely
       // pool manipulation, stale liquidity, or honeypot pricing trick).
@@ -833,7 +842,7 @@ async function main() {
         // first so the operator sees the likely fix without scrolling.
         const known = [
           "wallet", "account", "address", "config", "chains", "chain", "quote", "trade", "trades",
-          "holdings", "portfolio", "positions", "trending", "pnl", "audit", "price", "price-check",
+          "holdings", "portfolio", "positions", "risk", "trending", "pnl", "audit", "price", "price-check",
           "doctor", "verify", "reconcile", "pending", "health", "init",
           "logs", "gas", "allowances", "approve", "revoke", "transfer", "sweep", "token", "viewTx",
           "aggregator", "pairs", "slippage", "strategies", "strategy", "backup", "tx", "order", "notify", "schedule", "engine", "rebalance", "backtest", "playbook", "safety", "paper", "timeline", "bulk", "db", "status", "digest", "metrics", "runway", "panic", "equity", "signal", "export", "note", "incident", "execution", "intents",

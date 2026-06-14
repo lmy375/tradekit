@@ -2861,6 +2861,33 @@ export async function openPositionsCommand(flags: Record<string, string>) {
   }
 }
 
+// v78: unified runtime risk posture — one verdict synthesizing exposure
+// headroom + concentration + unprotected value + MEV. The single "is my book
+// in danger right now?" answer; --strict exits 1 on critical for cron gating.
+export async function riskPostureCommand(flags: Record<string, string>) {
+  const logger = makeCliLogger(flags);
+  try {
+    const config = loadConfig();
+    const { gatherRiskPosture, renderRiskPosture } = await import("../riskPosture.js");
+    const report = await gatherRiskPosture({
+      config,
+      logger,
+      account: flags["account"],
+      chain: flags["chain"],
+    });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...report });
+    } else {
+      console.log(renderRiskPosture(report));
+    }
+    // --strict: non-zero exit on critical (page-worthy); optionally on elevated.
+    if (flags["strict"] === "true" && report.verdict === "critical") process.exitCode = 1;
+    else if (flags["strict-elevated"] === "true" && report.verdict !== "ok") process.exitCode = 1;
+  } finally {
+    logger.close();
+  }
+}
+
 // v64: recent price range / trend / position — entry-timing context the
 // spot lookup can't give. Reuses the backtester's CoinGecko series fetch.
 async function priceContextCommand(flags: Record<string, string>, positional: string[]) {

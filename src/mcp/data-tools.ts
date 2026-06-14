@@ -543,6 +543,31 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── risk_posture (v78) ────────────────────────────────────
+  // Unified runtime risk verdict: synthesizes exposure headroom + portfolio
+  // concentration + unprotected value-at-risk + MEV exposure into ONE
+  // branchable signal so an agent can halt when its own book turns dangerous.
+  server.tool(
+    "risk_posture",
+    "v78: the single 'is my book in danger RIGHT NOW?' verdict. Synthesizes the runtime risk signals — exposure headroom (v53: tripped/exhausted/approaching limits incl. the drawdown breaker), portfolio concentration (v72), unprotected value-at-risk (v76), and MEV exposure (v77) — into ONE verdict + ranked concerns. Returns { ok, verdict ('ok'|'elevated'|'critical'), concerns: [{ severity ('critical'|'warn'), code, message, source }] (worst-first), checked[] (dimensions evaluated), skipped[] (dimensions that errored — e.g. RPC down), summary }. verdict is 'critical' when any limit is tripped/exhausted (a can't-trade state), 'elevated' on concentration / >50%-unprotected / approaching-limit / MEV warnings, else 'ok'. Adds NO new analysis — pure synthesis of the existing signals, each best-effort. Use as a monitoring gate (halt/page on verdict='critical') or an agent self-check before a trading session — one call instead of polling headroom + concentration + protection + mev separately. Heavier dimensions (concentration, protection) need on-chain reads; a failure degrades that dimension into skipped[], never fabricated.",
+    {
+      account: z.string().optional(),
+      chain: z.string().optional(),
+    },
+    async ({ account, chain }) => {
+      try {
+        return ok(
+          await runTool("risk_posture", rt.opts, { account, chain }, chain, async () => {
+            const { gatherRiskPosture } = await import("../riskPosture.js");
+            return { ok: true, ...(await gatherRiskPosture({ config: rt.getConfig(), logger: rt.opts.logger, account, chain })) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── portfolio_snapshot / portfolio_history / portfolio_diff (iter618) ──
   // Persist + compare portfolio states over time. PnL captures realized trades
   // only; these capture the FULL position view (priced + unpriced, all
