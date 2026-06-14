@@ -6,12 +6,17 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkEnv } from "./doctor.js";
 
-// Iter740: tmp data dir for the bookmark check (touches the DB). Set BEFORE
-// the dynamic db import inside the test block.
+// Iter740/v63: tmp data dir for the bookmark check (touches the DB). This MUST
+// be set before ANY config-touching import resolves constants.DATA_DIR.
+// checkEnv comes from doctor.js, which transitively imports constants — so it
+// is imported DYNAMICALLY below, AFTER this assignment. (A static
+// `import { checkEnv } from "./doctor.js"` would hoist above this line and
+// resolve DATA_DIR to the real ~/.tradekit, making the suite read/write the
+// operator's real config. v63 added a global setupFile floor as a backstop.)
 const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-doctor-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
+const { checkEnv } = await import("./doctor.js");
 
 afterAll(async () => {
   const { closeDb } = await import("./db.js");

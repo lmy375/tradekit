@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 63 — 测试隔离修复：测试套件不再读写真实配置（test-isolation: stop the suite touching the operator's real ~/.tradekit）** ✅
+- **修复一个真实、已证实的危害**：v62 的调试暴露出测试套件在**写我的真实 `~/.tradekit/config.json`**（我的真实 config 里被写进了 `scheduleCircuitBreaker`/`rebalanceCircuitBreaker`——测试干的）。对一个"生产级"框架，测试污染运营商的真实配置文件是不可接受的，且会破坏真实部署、让那些测试非确定（依赖真实 config 内容）、并埋雷（任何 schema 变更都可能经真实 config 炸测试）
+- 根因：`constants.ts` 的 `DATA_DIR = env.TRADEKIT_DATA_DIR || ~/.tradekit` 在**首次 import 时解析一次**。多数测试在模块顶部、import db/config **之前**设好临时目录——但 `doctor.test.ts` 第 9 行有个**静态** `import { checkEnv } from "./doctor.js"`，它**被提升到第 14 行的 env 赋值之上**（ESM import hoisting），且 doctor.js 间接 import constants → DATA_DIR 在临时目录设好前就解析成了真实 home。注释甚至写着"在 dynamic db import 之前设置"——但漏看了这个静态 import 会 hoist
+- 系统性防护（覆盖整类 bug，不止 doctor.test）：新增 `vitest.setup.ts` + `vitest.config.ts setupFiles`。setupFile 在**任何测试模块（含其 hoisted import）求值之前**运行——当 env 未设时把 `TRADEKIT_DATA_DIR` 设成临时目录，把危险的 (未设→home) 变成 (未设→temp)。不覆盖自设临时目录的文件（它们的顶部赋值在此之后、其 dynamic import 之前生效，per-file 隔离保留）——这是一道"地板"，只挡住真实 home
+- 根因修复（demonstrated offender）：`doctor.test.ts` 的静态 `checkEnv` import 改为 env 赋值**之后**的 top-level `await import`（用它自己的临时目录，干净隔离）
+- 永久回归守卫：新 `dataDirIsolation.test.ts`——故意不设自己的 env + 静态 import constants（正是出事的模式），断言 `DATA_DIR !== ~/.tradekit`。谁移除 floor，这个测试立刻失败，把整类"测试碰真实配置"的 bug 暴露出来
+- 实证验证：快照真实 config 的 mtime → 单独跑 doctor.test（原始 offender）→ mtime **未变**（✓ 真实配置 untouched）。审计了另外 4 个有同款静态-import 模式的文件（addressBook/activitySync/metrics/wallet）——floor 一并覆盖
+- 全套绿：125 files / 3279 tests，零回归、零未捕获异常
+- v1 限制：未清理我真实 config 里已被写入的 scheduleCircuitBreaker/rebalanceCircuitBreaker 两个 key（它们现在是合法的默认值、无害；刻意不动用户的真实文件）；floor 用 `||=` 语义（仅在未设时兜底），自设临时目录的文件不受影响
+
 **Phase 62 — 再平衡失败熔断 + 共享熔断器（circuit-breaker generalized to rebalances）** ✅
 - 完成 v61 显式留的对称跟进：**rebalance plans 和 schedules 一样在 cron 上永久 fire**——一个持续失败的再平衡计划（每 tick 的修正交易都 revert）同样无限烧 gas，同样无自动暂停。把熔断器扩到这另一个"永久 fire"原语
 - **抽出共享 helper `circuitBreaker.ts` 的 `tripCircuitBreakerIfNeeded`**：schedules 和 rebalance 都走它（注入 pause fn + breaker config），机制/消息/dedup 形状不会发散。这让本迭代是真正的"提炼复用"而非复制粘贴——v61 schedules.ts 的内联闭包重构为调用共享 helper（行为不变，v61 的 4 个测试验证）
