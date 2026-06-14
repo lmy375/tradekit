@@ -29,6 +29,7 @@ import { Execution } from "./pages/Execution";
 import { Safety } from "./pages/Safety";
 import { Risk } from "./pages/Risk";
 import { Approvals } from "./pages/Approvals";
+import { Intents } from "./pages/Intents";
 import { Audit } from "./pages/Audit";
 import { ConfigPage } from "./pages/Config";
 
@@ -51,6 +52,7 @@ const TABS = [
   { value: "execution", label: "Execution", el: Execution },
   { value: "safety", label: "Safety", el: Safety },
   { value: "risk", label: "Risk", el: Risk },
+  { value: "intents", label: "Approval queue", el: Intents },
   { value: "approvals", label: "Approvals", el: Approvals },
   { value: "audit", label: "Audit", el: Audit },
   { value: "config", label: "Config", el: ConfigPage },

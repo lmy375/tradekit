@@ -565,23 +565,52 @@ export function registerAutomationRoutes(app: Express): void {
         status: status as never,
         limit: qInt(req, "limit", { min: 1, max: 200, fallback: 50 }),
       });
+      // v102: a safe JSON parse for the persisted blobs — a corrupt row must
+      // never 500 the whole queue view.
+      const safeParse = (s: string | null): unknown => {
+        if (!s) return null;
+        try { return JSON.parse(s); } catch { return null; }
+      };
       res.json({
         ok: true,
         count: rows.length,
         pending: rows.filter((r) => r.status === "pending").length,
-        intents: rows.map((r) => ({
-          id: r.id,
-          status: r.status,
-          tool: r.tool,
-          chain: r.chain,
-          account: r.account,
-          est_usd: r.est_usd,
-          reason: r.reason,
-          created_at: r.created_at,
-          expires_at: r.expires_at,
-          decided_at: r.decided_at,
-          decided_note: r.decided_note,
-        })),
+        intents: rows.map((r) => {
+          const request = safeParse(r.request_json) as Record<string, unknown> | null;
+          const preview = safeParse(r.preview_json) as Record<string, unknown> | null;
+          return {
+            id: r.id,
+            status: r.status,
+            tool: r.tool,
+            chain: r.chain,
+            account: r.account,
+            est_usd: r.est_usd,
+            reason: r.reason,
+            created_at: r.created_at,
+            expires_at: r.expires_at,
+            decided_at: r.decided_at,
+            decided_note: r.decided_note,
+            // v102: full review context so the operator can vet the proposed
+            // trade ON THE WEB, then run the CLI approve (approve stays
+            // CLI-only by design). v101 approvalReasons = WHY it was gated.
+            approvalReasons: (safeParse(r.approval_reasons_json) as string[] | null) ?? [],
+            base: (request?.base as string | undefined) ?? null,
+            quote: (request?.quote as string | undefined) ?? null,
+            preview: preview
+              ? {
+                  price: preview.price ?? null,
+                  baseAmount: preview.baseAmount ?? null,
+                  quoteAmount: preview.quoteAmount ?? null,
+                  baseSymbol: preview.baseSymbol ?? null,
+                  quoteSymbol: preview.quoteSymbol ?? null,
+                  aggregator: preview.aggregator ?? null,
+                }
+              : null,
+            // The exact CLI commands — the web is read-only for the decision.
+            approveCmd: `tradekit intents approve ${r.id}`,
+            rejectCmd: `tradekit intents reject ${r.id} --note "..."`,
+          };
+        }),
       });
     }),
   );

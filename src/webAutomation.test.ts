@@ -743,6 +743,43 @@ describe("/api/intents", () => {
     expect((await get("/api/intents?status=pending")).status).toBe(200);
     expect((await get("/api/intents?status=bogus")).status).toBe(400);
   });
+
+  // v102: the web review payload — full context so the operator can vet a
+  // proposal on the dashboard, plus the v101 approval-reasons + CLI commands.
+  it("includes review context: preview, base/quote, approvalReasons, and CLI commands", async () => {
+    const { insertTradeIntent } = await import("./db.js");
+    const id = insertTradeIntent({
+      createdAt: new Date().toISOString(), tool: "buy", chain: "base", account: "default",
+      requestJson: JSON.stringify({ base: "0xWETH", quote: "0xUSDC", quoteAmount: "1000" }),
+      previewJson: JSON.stringify({ price: "2000", baseAmount: "0.5", quoteAmount: "1000", baseSymbol: "WETH", quoteSymbol: "USDC", aggregator: "kyberswap" }),
+      estUsd: 1000, reason: "breakout",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      approvalReasons: ["trade ≈ $1000.00 ≥ $500 approval threshold", "first BUY of this token on this account/chain — never traded before (new-token risk)"],
+    });
+    const r = await get("/api/intents");
+    const row = (r.body.intents as Array<Record<string, unknown>>).find((x) => x.id === id)!;
+    expect(row.base).toBe("0xWETH");
+    expect(row.quote).toBe("0xUSDC");
+    expect((row.preview as Record<string, unknown>).aggregator).toBe("kyberswap");
+    expect((row.preview as Record<string, unknown>).baseSymbol).toBe("WETH");
+    expect((row.approvalReasons as string[]).length).toBe(2);
+    expect((row.approvalReasons as string[]).some((x) => /new-token risk/.test(x))).toBe(true);
+    expect(row.approveCmd).toBe(`tradekit intents approve ${id}`);
+    expect(row.rejectCmd).toMatch(new RegExp(`tradekit intents reject ${id}`));
+  });
+
+  it("survives a corrupt preview/reasons blob — no 500, fields degrade to null/[]", async () => {
+    const { openDb } = await import("./db.js");
+    openDb()
+      .prepare(`INSERT INTO trade_intents (created_at, status, tool, chain, account, request_json, preview_json, est_usd, reason, expires_at, approval_reasons_json) VALUES (?, 'pending', 'buy', 'base', 'default', ?, ?, 5, NULL, ?, ?)`)
+      .run(new Date().toISOString(), "{not json", "{also bad", new Date(Date.now() + 3_600_000).toISOString(), "[broken");
+    const r = await get("/api/intents");
+    expect(r.status).toBe(200);
+    const row = (r.body.intents as Array<Record<string, unknown>>).find((x) => x.est_usd === 5)!;
+    expect(row.preview).toBeNull();
+    expect(row.base).toBeNull();
+    expect(row.approvalReasons).toEqual([]);
+  });
 });
 
 describe("/api/safety", () => {

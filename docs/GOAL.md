@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 102 — 审批队列上 Web：运营商在主监控界面就能审阅 agent 提案（trade-approval queue on the dashboard — review proposals where the operator already watches）** ✅
+- **把人在回路控制接到运营商真正盯着的界面**：v47 审批门（agent 提案/人决定）是自主交易最关键的人在回路控制。但 Web 上只有 Overview 的一个**计数横幅**（"N 笔交易待批"）——要真正看 agent 想干什么（交易内容、preview、v101 的 WHY-gated 理由），运营商必须切到 CLI。`/api/intents` 连 preview/request/approval_reasons 都不返回，光有计数。Web 是运营商的主监控面，"看都看不到要批什么"是真实摩擦
+- 为什么是最重要的：审批队列是阻塞 agent、等待人决策的地方——延迟决策=agent 卡住。把提案审阅放到运营商已经在盯的界面（而非强制切 CLF），缩短决策延迟，直接服务"人保持对自主交易的控制"。这是 v86/87 确立的"把关键信号搬上滞后的 Web 界面"模式，这次搬的是最关键的控制面
+- 关键安全边界：**审阅在 Web、决定在 CLI**。approve/reject 故意保持 CLI-only（prompt-injection 的 agent——或认证更弱的 Web 会话——绝不能批准 agent 自己的花费，同 backup/panic 边界）。Web 页只读：展示提案全貌 + 一键复制 CLI approve/reject 命令，运营商在终端执行
+- 实现：后端 `/api/intents` 补全审阅上下文——解析 preview_json（价格/数量/聚合器/符号）、request（base/quote）、v101 `approval_reasons_json`（为何 gated）、approveCmd/rejectCmd（精确 CLI 命令）；安全解析（坏 blob 降级 null/[]，绝不 500 整个队列）。前端新 `Intents.tsx`（"Approval queue" tab）：pending 卡片显示 buy/sell+pair+~USD+到期倒计时、⚠ gated 理由、preview、agent reason、复制 approve/reject 命令按钮；下方"Recent decisions"表。Overview 横幅改为指向新 tab
+- 测试覆盖：webAutomation.test.ts +2（审阅上下文：preview/base/quote/approvalReasons/CLI 命令齐全；坏 blob 不 500、降级 null/[]）；3531 后端测试全绿（+2）；webui `tsc -b && vite build` 干净通过（801 模块）
+- 向后兼容：纯加法——`/api/intents` 仅增字段（既有计数/列表不变）；新只读页；不改审批 enforce/CLI 决策路径；安全边界不变（approve 仍 CLI-only）
+
 **Phase 101 — 风险感知审批门：把"该让人看的交易"路由给人，而非只看金额（risk-aware approval gate — route trades to the human by NOVELTY, not just size）** ✅
 - **修复审批门的"风险盲区"**：v47 人在回路审批门只看一个维度——USD 金额（`thresholdUsd` 之上才需人批）。但这是**风险盲的**：一笔 \$20 买入一个全新未知代币（prompt-injection 抽资的经典手法——给攻击者代币的池子打钱）轻松溜过阈值，而一笔 \$500 买你天天交易的 USDC 却要人批。金额≠风险，门却只认金额
 - 为什么是最重要的：审批门是自主交易最关键的人在回路控制——它决定**哪些交易该惊动人**。产品投了大量精力做风险检测（preflight/honeypot/allowlist），但这些信号从不影响"谁来决定这笔交易"。让门按风险（而非仅金额）路由，意味着人只为真正该看的交易被打扰——新代币——而例行安全交易无论金额自动执行。这直接服务"安全自主交易"，且把已有的风险信号接进了控制平面

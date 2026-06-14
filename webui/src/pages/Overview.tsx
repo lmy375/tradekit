@@ -31,8 +31,9 @@ export function Overview({ status: initial }: PageProps) {
     <Stack>
       {pendingIntents > 0 && (
         <Alert color="yellow" title={`${pendingIntents} agent trade${pendingIntents === 1 ? "" : "s"} awaiting your approval`}>
-          An agent proposed a trade gated by safety.tradeApproval. Review and decide on the CLI:{" "}
-          <Code>tradekit intents list</Code> → <Code>tradekit intents approve|reject &lt;id&gt;</Code> (approval is CLI-only by design).
+          An agent proposed a trade gated by safety.tradeApproval. Review the proposal + why it was
+          gated on the <b>Approval queue</b> tab, then decide on the CLI:{" "}
+          <Code>tradekit intents approve|reject &lt;id&gt;</Code> (approval is CLI-only by design).
         </Alert>
       )}
       <Card withBorder>
