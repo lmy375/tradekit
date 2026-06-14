@@ -32,6 +32,14 @@ import { ToolError } from "./errors.js";
 import type { Config } from "./config.js";
 import { loadConfig } from "./config.js";
 import {
+  applyBuy,
+  applySell,
+  computeEdge,
+  type CostBasisState,
+  type EdgeMetrics,
+} from "./costBasis.js";
+import { MIN_CLOSES_FOR_EDGE, WEAK_PROFIT_FACTOR_CAUTION } from "./promoteCheck.js";
+import {
   getPlaybookById,
   listPaperTrades,
   recentTrades,
@@ -50,6 +58,11 @@ export const CADENCE_CAUTION_PCT = 50;
 export const CADENCE_MIN_REAL_DAYS = 2;
 /** Real median slippage above this multiple of paper's assumption → flag. */
 export const SLIPPAGE_DIVERGENCE_RATIO = 1.5;
+/** Live profit factor below this share of paper's (both with enough closes, and
+ *  paper's edge was genuinely positive) → the edge SHAPE degraded → flag. The
+ *  per-fill check catches a falling AVERAGE; this catches a collapsing CUSHION
+ *  (profit factor 3.0 → 1.1) the average can hide — one bad trade from bleeding. */
+export const EDGE_DEGRADE_RATIO_PCT = 60;
 
 export type OutcomeVerdict =
   | "on_track"
@@ -80,6 +93,12 @@ export interface OutcomeEra {
   avgGasNative: number | null;
   /** Real only: gas per fill in USD (needs nativeUsd). Null otherwise. */
   gasUsdPerFill: number | null;
+  /** v122: trade EDGE on this era's closed round-trips (profit factor / payoff
+   *  / win rate / expectancy), via the SAME shared computeEdge every other
+   *  trust gate uses. Lets the backward gate compare edge SHAPE, not just the
+   *  per-fill average — a collapsing profit factor is the cleanest "the edge
+   *  didn't survive real execution" signal, and the average can mask it. */
+  edge: EdgeMetrics;
 }
 
 export interface PromoteOutcomeReport {
@@ -104,6 +123,11 @@ export interface PromoteOutcomeReport {
     /** real median − paper assumed. Null when either unknown. */
     slippageDeltaBps: number | null;
     slippageRatioPct: number | null;
+    /** v122: paper / live profit factor + the live/paper ratio. Null when an
+     *  era lacks a defined profit factor (no losses, or no closes). */
+    paperProfitFactor: number | null;
+    liveProfitFactor: number | null;
+    profitFactorRatioPct: number | null;
     /** True when the paper baseline actually realized PnL (had closing
      *  sells). When false, the PnL comparison is moot — verdict rests on
      *  execution quality + cadence and a reason says so. */
@@ -130,6 +154,51 @@ function median(values: number[]): number | null {
 
 const DAY_MS = 86_400_000;
 
+/** Minimal row shape the edge walk needs (paper + MTM-normalized real both fit). */
+interface EdgeRowLite {
+  direction: string;
+  base_amount: string;
+  quote_amount: string;
+  base_token: string;
+  base_symbol: string | null;
+  chain: string;
+  timestamp: string;
+}
+
+/**
+ * v122: per-era trade EDGE. Walks the era's fills through the SAME cost-basis
+ * reducer + computeEdge the live strategy-comparison, promote-check, and
+ * backtest use (so "edge" means the same thing at every trust gate), collecting
+ * the realized $ of each closed round-trip. Quote is treated as USD — real
+ * fills arrive MTM-normalized (toMtmRows folds value_usd into quote_amount), so
+ * this stays coherent with the era's realizedQuote. Grouped per token within
+ * the single strategy tag, exactly like computeStrategyComparison.
+ */
+function eraEdge(rows: readonly EdgeRowLite[]): EdgeMetrics {
+  const sorted = [...rows].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const positions = new Map<string, CostBasisState>();
+  const realizedCloses: number[] = [];
+  for (const r of sorted) {
+    const base = parseFloat(r.base_amount);
+    const quote = parseFloat(r.quote_amount);
+    if (!Number.isFinite(base) || !Number.isFinite(quote) || base <= 0 || quote <= 0) continue;
+    const key = `${r.chain}:${(r.base_symbol ?? r.base_token).toUpperCase()}`;
+    let pos = positions.get(key);
+    if (!pos) {
+      pos = { amount: 0, cost: 0 };
+      positions.set(key, pos);
+    }
+    if (r.direction === "sell") {
+      const sellPx = quote / base;
+      const { avgCost, sold } = applySell(pos, base);
+      if (sold > 0) realizedCloses.push((sellPx - avgCost) * sold);
+    } else {
+      applyBuy(pos, base, quote);
+    }
+  }
+  return computeEdge(realizedCloses);
+}
+
 /** Build an era summary from a set of fills already run through the
  *  cost-basis walker. `realizedQuote`/`totalQuote` come from the walker;
  *  the cadence + execution-quality fields come from the raw rows. */
@@ -141,6 +210,7 @@ function summarizeEra(args: {
   slippageBps: number[];
   gasNatives: number[];
   nativeUsd: number | null;
+  edge: EdgeMetrics;
 }): OutcomeEra {
   const fills = args.timestamps.length;
   const sorted = [...args.timestamps].sort();
@@ -171,6 +241,7 @@ function summarizeEra(args: {
       avgGasNative != null && args.nativeUsd != null && args.nativeUsd > 0
         ? avgGasNative * args.nativeUsd
         : null,
+    edge: args.edge,
   };
 }
 
@@ -235,12 +306,14 @@ export async function gatherPromoteOutcome(args: {
         .filter((v): v is number => v != null && Number.isFinite(v)),
       gasNatives: [],
       nativeUsd,
+      edge: eraEdge(paperFills),
     });
   }
 
   let real: OutcomeEra | null = null;
   if (realFills.length > 0) {
-    const { realized, total } = await walkRealized(toMtmRows(realFills));
+    const mtmReal = toMtmRows(realFills);
+    const { realized, total } = await walkRealized(mtmReal);
     real = summarizeEra({
       timestamps: realFills.map((f) => f.timestamp),
       realizedQuote: realized,
@@ -256,6 +329,7 @@ export async function gatherPromoteOutcome(args: {
         .map((f) => (f.gas_cost_native != null ? parseFloat(f.gas_cost_native) : NaN))
         .filter((v) => Number.isFinite(v) && v >= 0),
       nativeUsd,
+      edge: eraEdge(mtmReal),
     });
   }
 
@@ -278,12 +352,19 @@ export async function gatherPromoteOutcome(args: {
       paper.medianSlippageBps != null && paper.medianSlippageBps > 0 && real.medianSlippageBps != null
         ? (real.medianSlippageBps / paper.medianSlippageBps) * 100
         : null;
+    const paperPf = paper.edge.profitFactor;
+    const livePf = real.edge.profitFactor;
+    const profitFactorRatioPct =
+      paperPf != null && paperPf > 0 && livePf != null ? (livePf / paperPf) * 100 : null;
     comparison = {
       realizedPerFillDeltaQuote: real.perFillRealizedQuote - paper.perFillRealizedQuote,
       realizedPerFillRatioPct,
       cadenceRatioPct,
       slippageDeltaBps,
       slippageRatioPct,
+      paperProfitFactor: paperPf,
+      liveProfitFactor: livePf,
+      profitFactorRatioPct,
       hasRealizedSignal,
     };
   }
@@ -354,6 +435,27 @@ export async function gatherPromoteOutcome(args: {
     escalate(
       "underperforming",
       `live cadence ${real.fillsPerWeek?.toFixed(1)}/week is ${c.cadenceRatioPct.toFixed(0)}% of the paper ${paper.fillsPerWeek?.toFixed(1)}/week — the strategy is firing less live than on paper, so the projected returns won't materialize`,
+    );
+  }
+
+  // v122: edge SHAPE degradation. The per-fill check above catches a falling
+  // AVERAGE; this catches a collapsing CUSHION the average can hide — paper
+  // profit factor 3.0 → live 1.1 means the strategy is now one bad trade from
+  // bleeding even if per-fill PnL still reads positive. Only meaningful when
+  // both eras have enough closes for a stable profit factor AND paper's edge
+  // was genuinely positive to begin with (else there's nothing to degrade from).
+  if (
+    paper.edge.profitFactor != null &&
+    real.edge.profitFactor != null &&
+    paper.edge.closes >= MIN_CLOSES_FOR_EDGE &&
+    real.edge.closes >= MIN_CLOSES_FOR_EDGE &&
+    paper.edge.profitFactor >= WEAK_PROFIT_FACTOR_CAUTION &&
+    c.profitFactorRatioPct != null &&
+    c.profitFactorRatioPct < EDGE_DEGRADE_RATIO_PCT
+  ) {
+    escalate(
+      "underperforming",
+      `live profit factor ${real.edge.profitFactor.toFixed(2)} is ${c.profitFactorRatioPct.toFixed(0)}% of the paper ${paper.edge.profitFactor.toFixed(2)} (< ${EDGE_DEGRADE_RATIO_PCT}%) — the win/loss CUSHION that justified the promote shrank in production. The strategy is far closer to bleeding than the paper run promised (one bad trade from negative), even if per-fill PnL still reads positive.`,
     );
   }
 
@@ -441,6 +543,17 @@ export function renderPromoteOutcome(r: PromoteOutcomeReport): string {
     const slip = e.medianSlippageBps != null ? `${e.medianSlippageBps.toFixed(1)}bps` : "—";
     const gas = e.gasUsdPerFill != null ? ` · gas $${e.gasUsdPerFill.toFixed(2)}/fill` : e.avgGasNative != null ? ` · gas ${e.avgGasNative.toPrecision(2)} native/fill` : "";
     lines.push(`          ${label === "Paper" ? "assumed" : "real"} slippage ${slip}${gas}${e.avgFillUsd != null ? ` · ~$${e.avgFillUsd.toFixed(0)}/fill notional` : ""}`);
+    // v122: edge shape — only when something closed (else all-null).
+    if (e.edge.closes > 0) {
+      const pf =
+        e.edge.profitFactor != null
+          ? e.edge.profitFactor.toFixed(2)
+          : e.edge.losses === 0 && e.edge.wins > 0
+            ? "∞ (no losses)"
+            : "—";
+      const wr = e.edge.winRatePct != null ? `${e.edge.winRatePct.toFixed(0)}%` : "—";
+      lines.push(`          edge: profit factor ${pf} · win rate ${wr} (${e.edge.wins}/${e.edge.wins + e.edge.losses}) over ${e.edge.closes} closes`);
+    }
   };
   era("Paper", r.paper);
   era("Real", r.real);
@@ -456,6 +569,9 @@ export function renderPromoteOutcome(r: PromoteOutcomeReport): string {
     }
     if (c.slippageRatioPct != null) {
       lines.push(`  Slippage:          live is ${(c.slippageRatioPct / 100).toFixed(1)}× paper-assumed`);
+    }
+    if (c.profitFactorRatioPct != null && c.liveProfitFactor != null && c.paperProfitFactor != null) {
+      lines.push(`  Profit factor:     live is ${c.profitFactorRatioPct.toFixed(0)}% of paper (${c.liveProfitFactor.toFixed(2)} vs ${c.paperProfitFactor.toFixed(2)})`);
     }
   }
   // v98: the RESPONSE — what to do about this verdict.

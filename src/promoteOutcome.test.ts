@@ -28,6 +28,7 @@ const {
   renderPromoteOutcome,
   MIN_REAL_FILLS,
   UNDERPERFORM_RATIO_PCT,
+  EDGE_DEGRADE_RATIO_PCT,
 } = await import("./promoteOutcome.js");
 const { openDb, closeDb, insertPlaybook, updatePlaybookStatus, recordPaperTrade, insertTrade } =
   await import("./db.js");
@@ -232,6 +233,106 @@ describe("verdict — paper vs live performance", () => {
     expect(r.comparison!.hasRealizedSignal).toBe(false);
     expect(r.verdict).toBe("on_track");
     expect(r.reasons.some((x) => /never closed a position/.test(x))).toBe(true);
+  });
+});
+
+// v122: seed an explicit list of round-trips (varying win/loss) so we can
+// shape the per-era profit factor. Each trip = one buy then one sell, fully
+// closing — realized/close = (sellPx − buyPx) × amount.
+function seedTrips(opts: {
+  id: number;
+  table: "paper" | "real";
+  trips: Array<{ buyPx: number; sellPx: number }>;
+  amount?: number;
+  slippageBps?: number;
+  spreadDays?: number;
+}): void {
+  const amount = opts.amount ?? 0.05;
+  const slip = opts.slippageBps ?? 30;
+  const spread = opts.spreadDays ?? 8;
+  const total = opts.trips.length * 2;
+  let n = 0;
+  for (const trip of opts.trips) {
+    for (const [dir, px] of [["buy", trip.buyPx], ["sell", trip.sellPx]] as const) {
+      const timestamp = new Date(NOW.getTime() - (total - n) * (spread / total) * 86_400_000).toISOString();
+      if (opts.table === "paper") {
+        recordPaperTrade({
+          timestamp, source_type: "schedule", source_id: 1,
+          chain: "base", account: "default", direction: dir,
+          base_token: WETH, base_symbol: "WETH", base_amount: String(amount),
+          quote_token: USDC, quote_symbol: "USDC", quote_amount: String(px * amount),
+          price: String(px), slippage_bps: slip, strategy: `playbook:${opts.id}`, notes: null,
+        });
+      } else {
+        insertTrade({
+          timestamp, chain: "base", account: "default", direction: dir,
+          base_token: WETH, base_symbol: "WETH", base_amount: String(amount),
+          quote_token: USDC, quote_symbol: "USDC", quote_amount: String(px * amount),
+          price: String(px), tx_hash: `0xet${n}${Math.random().toString(16).slice(2)}`, status: "success",
+          gas_used: null, gas_price_wei: null, gas_cost_native: "0.001",
+          aggregator: "kyberswap", fee_tier: null, notes: null,
+          strategy: `playbook:${opts.id}`, realized_slippage_bps: slip,
+        });
+      }
+      n++;
+    }
+  }
+}
+
+describe("v122 — edge SHAPE degradation (profit factor), backward gate symmetry", () => {
+  // Win = +$10 (sellPx 2200), loss = −$5 (sellPx 1900), buy 2000, amount 0.05.
+  const W = { buyPx: 2000, sellPx: 2200 }; // +$10
+  const L = { buyPx: 2000, sellPx: 1900 }; // −$5
+  // Live win = +$21 (sellPx 2420), live loss = −$14 (sellPx 1720).
+  const LW = { buyPx: 2000, sellPx: 2420 }; // +$21
+  const LL = { buyPx: 2000, sellPx: 1720 }; // −$14
+
+  it("live profit factor collapses while per-fill average holds → underperforming on edge alone", async () => {
+    const id = mkPlaybook();
+    // Paper: 4 wins + 2 losses → grossWin 40 / grossLoss 10 → PF 4.0, $30 over 6 closes.
+    seedTrips({ id, table: "paper", trips: [W, W, W, W, L, L] });
+    // Live: 3 wins + 3 losses → grossWin 63 / grossLoss 42 → PF 1.5, $21 over 6 closes.
+    // Per-fill: live $1.75 vs paper $2.50 = 70% (≥60, per-fill check does NOT fire).
+    // Profit factor: 1.5 / 4.0 = 37.5% (< 60, edge check DOES fire).
+    seedTrips({ id, table: "real", trips: [LW, LW, LW, LL, LL, LL] });
+    const r = await outcome(id);
+
+    expect(r.paper!.edge.profitFactor).toBeCloseTo(4, 5);
+    expect(r.real!.edge.profitFactor).toBeCloseTo(1.5, 5);
+    expect(r.comparison!.profitFactorRatioPct).toBeCloseTo(37.5, 4);
+    // The per-fill average is still ≥60% of paper, so ONLY the edge check fires.
+    expect(r.comparison!.realizedPerFillRatioPct).toBeGreaterThanOrEqual(60);
+    expect(r.verdict).toBe("underperforming");
+    expect(r.reasons.some((x) => /profit factor .* of the paper/.test(x))).toBe(true);
+    expect(r.reasons.some((x) => /per-fill expectation/.test(x))).toBe(false);
+    // Rendered report surfaces the profit-factor comparison line.
+    expect(renderPromoteOutcome(r)).toMatch(/Profit factor:\s+live is 38% of paper \(1\.50 vs 4\.00\)/);
+  });
+
+  it("does NOT fire when paper edge wasn't positive to begin with (nothing to degrade from)", async () => {
+    const id = mkPlaybook();
+    // Paper PF 0.5 (weak/bleeding edge) — below WEAK_PROFIT_FACTOR_CAUTION.
+    seedTrips({ id, table: "paper", trips: [W, L, L, L, L, L] }); // grossWin 10 / grossLoss 25 → PF 0.4
+    seedTrips({ id, table: "real", trips: [LW, LL, LL, LL, LL, LL] }); // PF 21/70 = 0.3
+    const r = await outcome(id);
+    expect(r.paper!.edge.profitFactor).toBeLessThan(1.2);
+    // No profit-factor degradation flag (the guard requires paper edge ≥ 1.2).
+    expect(r.reasons.some((x) => /profit factor .* of the paper/.test(x))).toBe(false);
+  });
+
+  it("does NOT fire below the closes floor (too few closes for a stable profit factor)", async () => {
+    const id = mkPlaybook();
+    // Paper strong PF over 6 closes.
+    seedTrips({ id, table: "paper", trips: [W, W, W, W, L, L] });
+    // Live PF collapsed but only 4 closes (< MIN_CLOSES_FOR_EDGE) → edge check skipped.
+    seedTrips({ id, table: "real", trips: [LW, LW, LL, LL] });
+    const r = await outcome(id);
+    expect(r.real!.edge.closes).toBe(4);
+    expect(r.reasons.some((x) => /profit factor .* of the paper/.test(x))).toBe(false);
+  });
+
+  it("EDGE_DEGRADE_RATIO_PCT is the documented 60", () => {
+    expect(EDGE_DEGRADE_RATIO_PCT).toBe(60);
   });
 });
 

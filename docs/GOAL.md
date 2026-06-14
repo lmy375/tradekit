@@ -33,6 +33,12 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 122 — 反向信任关口也看 edge：让 promote-outcome 抓住"形状塌了"而非只看"均值掉了"（edge-shape degradation in the backward trust gate — catch a collapsing profit factor, not just a falling average）** ✅
+- **背景/不对称**：信任管道有前后两个关口。前向 promote-check（v115）已经用 profit factor 把关——纸面 edge 不够稳就不让上真钱。但**反向** promote-outcome（v50，判断"上了真钱后到底兑现了纸面承诺没有"）只比 per-fill 已实现均值、滑点、节奏，**对 edge 形状一无所知**。一个策略实盘 profit factor 从 3.0 塌到 1.1（赢亏垫子崩了、离亏损只差一笔坏单），只要 per-fill 均值还勉强为正，今天就能蒙混过关——而 promote-outcome 的全部存在意义（其文档原话）就是抓"纸面光鲜、实盘暗自流血"
+- 为什么重要：这是整个信任管道**最关键的防线**（防真钱流血），而它此前漏掉了 edge 退化这个最干净的"edge 没扛住真实执行"信号。per-fill 均值会被一两笔幸运实盘单托住；profit factor 才反映赢亏的**稳健度**。补上它，让前向/反向两个关口在 edge 维度对称
+- 实现（直接复用 v121 的 computeEdge——consolidation 的价值在这里兑现）：每个 era（paper/live）新增 `edge: EdgeMetrics`，由新 `eraEdge()` 走**同一个** cost-basis reducer + computeEdge 算出（real 用 toMtmRows 归一化的 quote≈USD，与 era 的 realizedQuote 同源）。comparison 加 `paperProfitFactor/liveProfitFactor/profitFactorRatioPct`。判定新增：两 era 均 ≥5 closes、纸面 PF ≥ 1.2（复用 promoteCheck 导出的 WEAK_PROFIT_FACTOR_CAUTION/MIN_CLOSES_FOR_EDGE——edge 阈值全管道单一来源）、且 live PF < 纸面的 60%（新 `EDGE_DEGRADE_RATIO_PCT`）→ underperforming。CLI render + MCP playbook_promote_outcome 描述同步；web 不暴露此工具，无需改动
+- 测试覆盖：+4——**核心隔离用例**：构造 live PF 塌（4.0→1.5=37.5%）但 per-fill 均值仍 70%（≥60% 不触发 per-fill 检查）→ 仅 edge 检查触发、verdict underperforming、reason 命中 profit factor 而非 per-fill，render 出 "live is 38% of paper (1.50 vs 4.00)"；+ 纸面 edge 本就不正（PF<1.2）不触发的守卫；+ closes 不足 5 跳过的守卫；+ 阈值常量守卫；3619 测试全绿（+4）
+
 **Phase 121 — edge 单一来源：让"每个关口的 edge 一致"成为结构保证而非手工巧合（one edge derivation — make "edge reads identically at every trust gate" a structural invariant）** ✅
 - **背景**：edge 弧（v114 实盘对比 → v115 promote → v120 回测）把 profit factor/payoff/expectancy 铺到了每个信任关口。但**这套推导被写了两遍**——`computeStrategyComparison`（实盘，内联）和 `tradeEdgeFromFires`（回测）各算各的，靠人工对齐保持一致。这正是 costBasis.ts 当初为成本基础消灭的那类结构债：将来谁改了 flat-epsilon、改了"无亏损时 profit factor 记 null"的规则、或动了 payoff 的判空，两处就会**悄悄漂移**，而"edge 在每个关口一致可见"（整条弧的全部意义）就会无声地不再成立
 - 为什么重要：edge 弧的价值**完全建立在一致性上**——promote 用回测/纸面 edge 决定是否上真钱，如果实盘 edge 与回测 edge 用两套悄悄分叉的公式算出来，整个信任管道的判断基础就是假的。一致性必须是结构保证，不能是"目前恰好相等"
