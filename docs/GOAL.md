@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 70 — 最大可交易额求解（max admissible trade size — "how much CAN I safely trade right now, and which limit binds?"）** ✅
+- **把安全态势变成可执行的单一数字，而非加新观测面**：超额下单是自主 agent **爆仓的头号方式**之一。v54 `projectTradeLimits` 回答正向问题"这个 size 行不行"，v53 `safety_headroom` 报告"每个限额还剩多少"——但 agent **每笔交易都要面对**的问题是反向的："给定我的护栏和当前消耗，单笔最多能花多少才不会被拒？"。此前 agent 得读 headroom、手动对所有 USD 限额取 min、再换算——易错。本期直接求解这个上限并指出**绑定约束**
+- 为什么是最重要的：这是把"安全"从被动观测变成**主动的、防爆仓的下单纪律**。agent 不再猜或二分试探自己的限额；一次调用得到"现在最多买 $X TOKEN，再多就撞上 <哪个限额>"
+- **是 enforcer 的精确反函数，零分叉**：复用**同一套**消耗查询（`dailyUsdVolume`、`usdSpentUnderStrategy`、`netPosition`）——sizing 给的上限与执行时真正 gate 交易的数字完全一致。`budgetConstraints` 是 `evaluateRule` 的逐窗口反函数（perFire 静态天花板；lifetime/daily = cap − 已花，floored）
+- 折入 maxTradeUsd 的 USD 约束：per-tx 上限、daily 剩余、匹配策略预算的最紧窗口（传 `--strategy`/`strategy`）、**买入时**净敞口 position cap 的 cost 余量（传 `--token`；base-amount 维度在有价时换算 USD 折入，无价则降级为 caveat）、可选钱包余额。取 min → 绑定约束。**诚实降级**：缺 strategy/token/price、卖出跳过 position cap、限额耗尽→$0、无任何 USD 限额→null（policy 不设限）——每种都有 caveat，数字永不被悄悄过度信任；且**始终建议**对选定 size 跑 preflight
+- 实现：新模块 `tradeSizing.ts`——纯函数 `selectBindingConstraint`（取最小 cap）+ `budgetConstraints`（预算反函数）+ `gatherTradeSizing`（注入式查询 seam，确定性、默认无网络）。Surfaces：CLI `safety sizing [--direction --token --strategy --price ...]`（离线；--price 换算 token 量）+ MCP `trade_sizing`（best-effort 拉实时价换算）
+- 测试覆盖：`tradeSizing.test.ts` 17 case（selectBindingConstraint 空→null/取最小/排序；budgetConstraints perFire 静态+lifetime/daily floored；gather: per-tx 单独绑定 / daily 更紧时绑定 / 无 USD 限额→null unbounded / 策略预算最紧窗口折入 / 非匹配 tag 不折入 / 配了预算但无 tag→caveat / 买入 cost cap 绑定 / 卖出跳过 cap / base cap 无价→caveat / base cap 有价→换算折入 / 钱包余额绑定 / 价→base 量换算 / 始终 preflight caveat / 耗尽→$0+caveat）
+- 向后兼容：纯加法——新模块、新 CLI 子命令、新 MCP 工具；`trade_sizing` 入 MCP_TOOLS 不变量（iter877）；3333 测试全绿（+17）
+- v1 限制：position cap 仅约束买入（卖出降敞口）；base-amount cap 需价格换算（无价→caveat 不折入）；钱包余额 CLI 需显式 --wallet-usd / MCP v1 不拉链上余额（policy 限额是独有价值，余额 agent 可另查）；sizing 覆盖 USD 花费限额，token 安全/滑点/精确 admissibility 仍由 preflight 把关（已在 caveat 明示）
+
 **Phase 69 — 入场/退出时机进 pre-trade 决策门（market timing in the preflight verdict — "is now a good time?", not just "will it execute?"）** ✅
 - **把已有能力合流进最关键的决策时刻，而非加新 surface**：v64 给了 price_context（区间位置/趋势），但它是**独立**的一次调用——agent 要在交易前自己记得调、自己综合。`preview_trade`/`preflight_trade` 是 agent 下单前的**单一决策面**（执行 gauntlet：滑点、限额、token、失败模式），却**只回答"能不能干净成交"，不回答"现在是不是好时机"**。agent 完全可能拿到一个 go，然后买在 30 天高点 / 接飞刀
 - 为什么这是最重要的：agent 拿真钱交易，**亏钱的两大来源是 (a) 被坑（已重投：安全栈）和 (b) 时机差（买顶/卖底/接飞刀）**。(b) 此前在决策门里完全缺位。把时机读数放进 preflight 的 go/caution/no_go 裁决 → agent 分支 `report.verdict` 时**自动**把坏时机纳入考量，不必记得单独调 price_context、也不会漏判

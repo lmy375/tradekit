@@ -435,6 +435,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
   "price_context",
     // v65: open-position review (cost basis + unrealized + holding/term) for exit-timing.
     "open_positions",
+    // v70: solve for the max admissible trade size (inverse of safety_headroom).
+    "trade_sizing",
     // Iter618: portfolio history capture + diff.
     "portfolio_snapshot", "portfolio_history", "portfolio_diff",
     // Iter621: operator dashboard.

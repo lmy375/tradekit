@@ -708,6 +708,16 @@ STATEFUL SAFETY
         Where 'safety review' shows what's CONFIGURED, this shows how much is
         LEFT — call it before sizing a trade. Deterministic + offline. MCP:
         safety_headroom.
+  safety sizing [--direction buy|sell] [--token T] [--strategy TAG] [--price USD] [--account L] [--chain X] [--json]
+        v70: solve for the MAX single trade admissible right now + the binding
+        limit. The actionable inverse of 'headroom': not "room left per limit"
+        but "the LARGEST I can spend before something rejects it". Folds in the
+        per-tx cap, daily-remaining, the matching strategy budget's tightest
+        window (--strategy), and on a BUY the net-exposure position cap's cost
+        room (--token). Reuses the same consumption the enforcers use. Offline;
+        pass --price to convert maxTradeUsd to a token amount (the MCP
+        trade_sizing tool fetches the live price). Caveats flag anything not
+        folded in. MCP: trade_sizing.
   safety drawdown [--scope global] [--json]
         Show portfolio drawdown circuit-breaker state. Peak USD, last observed value, drawdown %,
         and tripped status per scope. Reveals whether the breaker would block trading right now.

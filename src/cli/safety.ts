@@ -185,6 +185,9 @@ export async function safetyCommand(
     case "headroom":
       await safetyHeadroomCommand(flags);
       break;
+    case "sizing":
+      await safetySizingCommand(flags);
+      break;
     case "drawdown":
       await safetyDrawdownCommand(flags);
       break;
@@ -192,7 +195,7 @@ export async function safetyCommand(
       await safetyResetDrawdownCommand(flags);
       break;
     default:
-      throw subcommandError("safety", action, ["review", "headroom", "drawdown", "reset-drawdown"]);
+      throw subcommandError("safety", action, ["review", "headroom", "sizing", "drawdown", "reset-drawdown"]);
   }
 }
 
@@ -220,5 +223,38 @@ async function safetyHeadroomCommand(flags: Record<string, string>) {
     printJson({ ok: true, ...report });
   } else {
     console.log(renderSafetyHeadroom(report));
+  }
+}
+
+// v70: max admissible trade size — the actionable inverse of headroom.
+// "what's the LARGEST trade I can make right now, and which limit binds?"
+// Network-free: pass --price to convert maxTradeUsd into a token amount; the
+// MCP `trade_sizing` tool fetches the live price for you.
+async function safetySizingCommand(flags: Record<string, string>) {
+  const { gatherTradeSizing, renderTradeSizing } = await import("../tradeSizing.js");
+  const directionRaw = (flags["direction"] ?? "buy").toLowerCase();
+  if (directionRaw !== "buy" && directionRaw !== "sell") {
+    throw new ToolError("INVALID_PARAMS", `--direction must be 'buy' or 'sell' (got "${directionRaw}").`);
+  }
+  const priceRaw = flags["price"];
+  let priceUsd: number | null = null;
+  if (priceRaw != null && priceRaw !== "") {
+    const p = Number(priceRaw);
+    if (!Number.isFinite(p) || p <= 0) throw new ToolError("INVALID_PARAMS", `--price must be a positive number (got "${priceRaw}").`);
+    priceUsd = p;
+  }
+  const report = gatherTradeSizing({
+    direction: directionRaw,
+    account: flags["account"],
+    chain: flags["chain"],
+    strategy: flags["strategy"] ?? null,
+    token: flags["token"] ?? null,
+    priceUsd,
+    walletUsd: flags["wallet-usd"] != null ? Number(flags["wallet-usd"]) : null,
+  });
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...report });
+  } else {
+    console.log(renderTradeSizing(report));
   }
 }

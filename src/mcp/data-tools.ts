@@ -178,6 +178,50 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── trade_sizing (v70) ────────────────────────────────────
+  // The actionable inverse of safety_headroom: not "how much room is left
+  // per limit" but "what's the LARGEST single trade admissible right now,
+  // and which limit binds". Over-sizing is a top way an autonomous agent
+  // blows up; this converts the safety posture into a concrete safe size.
+  server.tool(
+    "trade_sizing",
+    "v70: solve for the MAX single trade admissible right now. Where `preflight_trade` answers 'is THIS size OK?' and `safety_headroom` reports 'room left per limit', this answers the question every trade faces — 'what's the LARGEST I can spend before something rejects it, and which limit binds?'. Returns { ok, account, chain, direction, strategy, token, maxTradeUsd (min across all USD limits; null = unbounded by policy), binding (the tightest constraint: {kind,label,capUsd,scope,detail}), constraints[] (every USD limit considered, ascending), priceUsd, maxBaseAmount (maxTradeUsd ÷ price), caveats[] }. Folds in: per-tx cap, daily-remaining, the matching strategy budget's tightest window (per-fire/lifetime/daily — pass `strategy`), and on a BUY the net-exposure position cap's cost room (pass `token`). Reuses the SAME consumption lookups the real enforcers use (zero divergence). Best-effort base-token price → maxBaseAmount + base-amount cap conversion; caveats flag anything NOT folded in (missing strategy/token, base cap w/o price) so the number is never silently over-trusted. Always recommends preflighting the chosen size. Deterministic given consumption + price. Errors: UNKNOWN_TOKEN, UNKNOWN_CHAIN.",
+    {
+      direction: z.enum(["buy", "sell"]).describe("buy = spend quote to acquire base; sell = dispose base. Position caps only constrain buys."),
+      chain: z.string().optional(),
+      token: z.string().optional().describe("Base token symbol or address — needed to scope net-exposure position caps. Default: native (WETH for pricing)."),
+      strategy: z.string().optional().describe("Strategy tag this trade would carry — folds the matching strategy budget into the ceiling."),
+    },
+    async ({ direction, chain, token, strategy }) => {
+      try {
+        return ok(
+          await runTool("trade_sizing", rt.opts, { direction, chain, token, strategy }, chain, async () => {
+            const config = rt.getConfig();
+            const profile = resolveProfile(chain ?? config.activeChain, config);
+            const resolved = token ? resolveToken(profile, token) : profile.weth;
+            if (!resolved) throw unknownTokenError("token", token ?? "(none)", profile);
+            const priceAddr = /^0x[0-9a-fA-F]{40}$/.test(resolved) ? resolved : profile.weth;
+            // Best-effort price for the token-amount conversion — sizing is
+            // policy-limit based, so a missing price degrades to a caveat.
+            const priceUsd = await getCurrentPrice(priceAddr, rt.opts.logger).catch(() => null);
+            const { gatherTradeSizing } = await import("../tradeSizing.js");
+            const report = gatherTradeSizing({
+              direction,
+              config,
+              chain: chain ?? config.activeChain ?? undefined,
+              strategy: strategy ?? null,
+              token: token ?? (resolved === profile.weth ? profile.nativeSymbol : resolved),
+              priceUsd,
+            });
+            return { ok: true, ...report };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── holdings ──────────────────────────────────────────────
   server.tool(
     "holdings",
