@@ -961,6 +961,30 @@ export async function aggregatorTuneCommand(flags: Record<string, string>) {
 // (iter648) want to see what's been used — catches typos, surfaces
 // little-used tags, scopes follow-up `pnl --strategy X` queries.
 
+// v83: `strategies compare` — ranked performance for capital allocation
+// (which strategies make money, which bleed). Deterministic + offline.
+export async function strategiesCompareCommand(flags: Record<string, string>) {
+  const logger = makeCliLogger(flags);
+  try {
+    const days = parseIntFlag(flags["days"], "--days", { min: 1 });
+    const sinceIso = days != null && days > 0 ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+    const { gatherStrategyComparison, renderStrategyComparison } = await import("../strategyCompare.js");
+    const report = gatherStrategyComparison({
+      mode: flags["paper"] === "true" ? "paper" : "real",
+      account: flags["account"],
+      chain: flags["chain"],
+      sinceIso,
+    });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...report });
+    } else {
+      console.log(renderStrategyComparison(report));
+    }
+  } finally {
+    logger.close();
+  }
+}
+
 export async function strategiesListCommand(flags: Record<string, string>) {
   const config = loadConfig();
   const logger = makeCliLogger(flags);

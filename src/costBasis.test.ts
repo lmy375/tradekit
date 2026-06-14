@@ -224,7 +224,7 @@ describe("coherence: tax export ≡ MTM walker realized PnL (shared cost-basis c
 
   for (const [name, fills] of Object.entries(SCENARIOS)) {
     it(name, async () => {
-      const enriched = enrichTradesForExport(exportRows(fills), quoteUsdAtTradeForExport);
+      const enriched = enrichTradesForExport(exportRows(fills), quoteUsdAtTradeForExport, new Map());
       const exportRealized = enriched.reduce((s, r) => s + (r.realized_pnl_usd ?? 0), 0);
       const walker = await walkerRealized(fills);
       expect(exportRealized).toBeCloseTo(walker, 6);

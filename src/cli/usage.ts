@@ -1079,6 +1079,13 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
         Preview the auto-slippage recommendation for a pair (p95 of realized history + 25% buffer, capped at safety max). Read-only counterpart to trade buy --auto-slippage
   strategies [list] [--chain X] [--account L] [--json]
         List distinct strategy tags from trades with tradeCount + first/last-used timestamps. Discovery + typo-catch for the iter648 tagging feature
+  strategies compare [--paper] [--days N] [--chain X] [--account L] [--json]
+        v83: RANK strategies by realized P&L for capital allocation — scale winners,
+        cut bleeders. Per strategy: realized $, win rate (wins/losses), closes, trade
+        count, volume; flags negative-realized strategies as "bleeding". Win rate
+        matters as much as total P&L (lucky vs consistent). Deterministic + offline
+        (shared cost-basis reducer + stablecoin-$1 model — no marks/RPC). Realized-only;
+        non-stablecoin-quoted trades excluded. MCP: strategy_compare.
   strategies --budget [--tag X] [--json]
         Per-strategy budget consumption view. Shows lifetime + 24h spend against each
         configured cap in safety.strategyBudgets, with remaining USD headroom. --tag X

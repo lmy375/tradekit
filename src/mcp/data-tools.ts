@@ -1332,6 +1332,34 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── strategy_compare (v83) ────────────────────────────────
+  // Ranked per-strategy performance for capital allocation — which strategies
+  // make money, which bleed. The effectiveness counterpart to strategies_list
+  // (discovery) and strategy_report (single-strategy deep-dive).
+  server.tool(
+    "strategy_compare",
+    "v83: RANK strategies by realized performance for capital allocation — scale the winners, cut the bleeders. Returns { ok, strategies: [{ strategy, realizedUsd, tradeCount, closes, wins, losses, winRatePct, volumeUsd, avgRealizedPerClose, lastTradeAt }] (ranked realized desc), totalRealizedUsd, best, worst, bleeding[] (negative-realized strategies), unpricedTrades, summary }. The effectiveness counterpart to strategies_list (discovery) + strategy_report (one-strategy deep-dive): this is the side-by-side comparison that answers 'where do I put more capital?'. WIN RATE matters as much as total P&L — +$100 over 2 lucky trades vs 50 steady ones are very different bets, and this surfaces both. Deterministic + offline: uses the shared cost-basis reducer (same core every P&L surface shares post-v82, so it can't diverge) + a stablecoin-$1 quote model — no marks, no RPC, same answer every run. Realized-only (closed-trade bottom line); non-stablecoin-quoted trades are excluded from P&L (unpricedTrades) since they can't be valued deterministically — run `pnl` for live-priced unrealized + gas. mode='real' (default, success trades) or 'paper'. `days` scopes a lookback window.",
+    {
+      mode: z.enum(["real", "paper"]).optional().describe("Default real (success trades). paper ranks the virtual book."),
+      account: z.string().optional(),
+      chain: z.string().optional(),
+      days: z.number().int().min(1).max(3650).optional().describe("Lookback window in days. Omit for all-time."),
+    },
+    async ({ mode, account, chain, days }) => {
+      try {
+        return ok(
+          await runTool("strategy_compare", rt.opts, { mode, account, chain, days }, chain, async () => {
+            const { gatherStrategyComparison } = await import("../strategyCompare.js");
+            const sinceIso = days != null ? new Date(Date.now() - days * 86_400_000).toISOString() : undefined;
+            return { ok: true, ...gatherStrategyComparison({ mode: mode ?? "real", account, chain, sinceIso }) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── slippage_suggest (iter644) ────────────────────────────
   // Preview the iter642 auto-slippage recommendation without executing a
   // trade. Same pure logic the trade flow uses with autoSlippage=true.

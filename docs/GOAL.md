@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 83 — 策略业绩对比（strategy comparison — rank strategies for capital allocation, the core effectiveness decision）** ✅
+- **转向被冷落的「有效性」支柱（连续 ~11 期在「安全」）**：安全做到极致后，agent 的本职是**赚钱**。多策略 agent 的核心有效性决策是**资本配置**：哪些策略赚钱（加码）、哪些流血（砍掉）。产品有 strategy_report（单策略深挖）+ pnl 里埋着的 byStrategy（仅 realized+count）——但**没有排名的横向对比**，缺了配置决策最需要的指标：realized P&L、**胜率**（一致性——2 笔运气 +$100 和 50 笔稳定 +$100 是完全不同的赌注）、交易数、成交量
+- 为什么时机正好：v82 刚把成本基准合一，**这些数字现在可信**。本期直接复用 canonical reducer（applyBuy/applySell）——按构造与所有 P&L 面同源、不可能漂移
+- 实现（纯 + 确定性，复用 v71/v82 共享 reducer）：纯函数 `computeStrategyComparison(rows)`——按 strategy 分组，组内按 (chain,token) 经共享 reducer 走 weighted-avg，累计 realized + 胜/负（卖出 realized 符号）+ volume + 成交数，按 realized 降序排名。**确定性**：用 stablecoin-$1 报价模型（同税务导出），无 marks、无 RPC——随时跑、同输入同结果。realized-only（已平仓的底线）；非稳定币计价的交易排除出 P&L（unpricedTrades，无法确定性定价）
+- 指标：realized $、winRatePct（wins/(wins+losses)）、closes、tradeCount、volumeUsd、avgRealizedPerClose、lastTradeAt；汇总 best/worst/total + **bleeding[]**（负 realized→建议复查/砍掉）
+- Surfaces：CLI `strategies compare [--paper --days N]`（排名表 + bleeding 警告）+ MCP `strategy_compare { mode, days }`。MCP_TOOLS 不变量加 `strategy_compare`。与 strategies_list（发现）、strategy_report（单策略深挖）互补
+- 测试覆盖：`strategyCompare.test.ts` 8——按 realized 排名（赢家在前）/ 胜率从平仓算 / 非稳定币计价排除 / 未打标→(none) / 无平仓→胜率 null / 空→空报告 / 策略内按 (chain,token) 隔离持仓不串味 / 集成（临时 DB paper：排名+bleeding）；CLI 离线烟雾（momentum +$800 100% 胜率居首 / dca-eth −$150 标记 bleeding）
+- 向后兼容：纯加法——新模块、新 CLI 子命令、新 MCP 工具；确定性只读（不碰执行/不加 RPC）；3433 测试全绿（+8）
+- v1 限制：realized-only（未实现/gas 仍看 live `pnl`——确定性取舍）；非稳定币计价交易排除（无法确定性定 USD，已披露 unpricedTrades）；按 (chain,token) 组合级（与 P&L 面一致）
+
 **Phase 82 — 成本基准合一收尾：真实 PnL + 税务导出（finish the cost-basis unification — the real-money & tax numbers join the shared reducer）** ✅
 - **补 v71 的遗漏，硬化最重要的数字（真钱 PnL + 报税），而非加 feature**：v71 把成本基准合一到 `costBasis.ts`，宣称"数字不可能再分歧"——但只覆盖了 paper walker + netPosition。本期发现它**漏掉了两个最要命的真钱面**：`pnl.ts`（运营商看的**头条 PnL**）和 `tradeExport.ts`（运营商**用来报税**的已实现盈亏）各有一份**独立内联**的加权平均成本基准实现。同一算法第三、第四份拷贝——正是 v71 要消灭的漂移风险，却漏在影响最大的地方
 - 为什么是最重要的：安全做到极致后，"信任的数字"是产品根基。头条 PnL 和**税务**数字来自与 paper/cap 不同的成本基准实现，可能彼此漂移——这是最坏的信任 bug（每个面单独看都自洽，报税数字却可能与 PnL 面不一致）。v71 的"不可能再分歧"承诺**实质不完整**

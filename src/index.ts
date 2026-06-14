@@ -351,10 +351,16 @@ async function main() {
       // Iter651: list distinct strategy tags from the trades table. Helps
       // operators discover their own tags + spot typos.
       case "strategies": {
+        // v83: `strategies compare` — ranked performance for capital allocation.
+        if (positional[1] === "compare" || positional[1] === "rank") {
+          const { strategiesCompareCommand } = await import("./cli/inspect.js");
+          await strategiesCompareCommand(flags);
+          break;
+        }
         if (positional[1] && positional[1] !== "list") {
           throw new (await import("./errors.js")).ToolError(
             "INVALID_PARAMS",
-            "Usage: tradekit strategies [list] [--chain X] [--account L] [--json]",
+            "Usage: tradekit strategies [list | compare] [--chain X] [--account L] [--json]",
           );
         }
         const { strategiesListCommand } = await import("./cli/inspect.js");

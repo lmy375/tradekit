@@ -463,6 +463,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "slippage_suggest",
     // Iter651: distinct strategy tags directory.
     "strategies_list",
+    // v83: ranked per-strategy performance comparison for capital allocation.
+    "strategy_compare",
     // trade-tools.ts: quote, buy, sell, import_trade, transfer, preview_trade, preflight_trade, sweep_balances
     "quote", "buy", "sell", "import_trade", "transfer", "preview_trade", "preflight_trade", "sweep_balances",
     // Conditional / limit orders surface (order create/list/show/cancel/run).
