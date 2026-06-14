@@ -2,9 +2,17 @@
 // a PnL-trackable trade row. Hits all four branches: stable→non-stable buy,
 // non-stable→stable sell, pure transfer-out, incoming-only (airdrop).
 
-import { describe, it, expect } from "vitest";
-import { classify } from "./importTrade.js";
+import { describe, it, expect, vi } from "vitest";
+// v108: mock historical pricing so importValueUsd's non-stablecoin branch is
+// deterministic + offline. WETH prices at $2000; everything else is unpriceable.
+vi.mock("./price.js", () => ({
+  getHistoricalPrice: vi.fn(async (addr: string) => (addr.toLowerCase() === "0xweth" ? 2000 : null)),
+}));
+import { classify, importValueUsd } from "./importTrade.js";
 import type { DecodedTx, TokenMove } from "./decodeTx.js";
+import type { TradeRow } from "./db.js";
+import type { ChainProfile } from "./chains.js";
+import type { Logger } from "./logger.js";
 
 const HASH = "0xaaaa";
 const TOKEN_A = "0x1111111111111111111111111111111111111111";
@@ -93,5 +101,40 @@ describe("classify (importTrade)", () => {
     expect(r.chain).toBe("arbitrum");
     expect(r.account).toBe("bob");
     expect(r.timestamp).toBe(TS);
+  });
+});
+
+// v108: imported / `trades sync`-backfilled rows get a trade-time value_usd so
+// their P&L + tax + budgets match live trades (not the current-price approximation).
+describe("importValueUsd (v108)", () => {
+  const profile = { weth: "0xWETH" } as unknown as ChainProfile;
+  const logger = { debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger;
+  const row = (over: Partial<TradeRow>): TradeRow =>
+    ({ quote_symbol: "USDC", quote_amount: "100", quote_token: "0xq", timestamp: TS, direction: "buy", base_amount: "1", ...over } as TradeRow);
+
+  it("stablecoin quote → $1 × amount, NO network call", async () => {
+    const v = await importValueUsd(row({ quote_symbol: "USDC", quote_amount: "250" }), profile, logger);
+    expect(v).toBe(250);
+  });
+
+  it("non-stablecoin quote → amount × historical quote price", async () => {
+    // 0.5 WETH @ historical $2000 → $1000.
+    const v = await importValueUsd(row({ quote_symbol: "WETH", quote_token: "0xWETH", quote_amount: "0.5" }), profile, logger);
+    expect(v).toBe(1000);
+  });
+
+  it("native quote (empty token) prices via WETH", async () => {
+    const v = await importValueUsd(row({ quote_symbol: "ETH", quote_token: "", quote_amount: "0.5" }), profile, logger);
+    expect(v).toBe(1000); // priced through profile.weth
+  });
+
+  it("unpriceable non-stablecoin quote → null (fallback to approximation)", async () => {
+    const v = await importValueUsd(row({ quote_symbol: "PEPE", quote_token: "0xunknown", quote_amount: "100" }), profile, logger);
+    expect(v).toBeNull();
+  });
+
+  it("zero/airdrop quote amount → null (no cost basis)", async () => {
+    const v = await importValueUsd(row({ quote_symbol: "USDC", quote_amount: "0" }), profile, logger);
+    expect(v).toBeNull();
   });
 });

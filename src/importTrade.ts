@@ -14,6 +14,7 @@ import { sanitizeForLogLine, type Logger } from "./logger.js";
 // v85: the "which side is the stablecoin quote" check shares the one canonical
 // registry — so import classification can't disagree with the P&L surfaces.
 import { isStablecoin as isStable } from "./stablecoins.js";
+import { getHistoricalPrice } from "./price.js";
 
 export interface ImportResult {
   /** "inserted" if a new row was added, "duplicate" if already in trades by tx_hash. */
@@ -180,6 +181,28 @@ export function classify(decoded: DecodedTx, chainName: string, account: string,
   };
 }
 
+/**
+ * v108: resolve a backfilled trade's USD value AT trade time, or null when it
+ * can't be priced (→ consumers fall back to quote_amount × current price, the
+ * pre-v108 behavior). A stablecoin quote is $1 (no network). A non-stablecoin
+ * quote uses the historical price of the quote token at the block's date; a
+ * native quote prices via the chain's WETH address. Best-effort — never throws.
+ */
+export async function importValueUsd(row: TradeRow, profile: ChainProfile, logger: Logger): Promise<number | null> {
+  const quoteAmt = parseFloat(row.quote_amount);
+  if (!Number.isFinite(quoteAmt) || quoteAmt <= 0) return null; // airdrops/receive-only: no cost basis
+  if (isStable(row.quote_symbol)) return quoteAmt; // USD-pegged → $1
+  // native quote (quote_token === "") prices via WETH; ERC20 quote prices itself.
+  const quoteAddr = row.quote_token || profile.weth;
+  if (!quoteAddr) return null;
+  try {
+    const histPrice = await getHistoricalPrice(quoteAddr, row.timestamp, logger);
+    return histPrice != null && histPrice > 0 ? quoteAmt * histPrice : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Best-effort: name the router the tx went through, based on well-known addresses. */
 function classifyAggregator(to: Address | null): string {
   if (!to) return "unknown";
@@ -238,6 +261,14 @@ export async function importTradeFromTx(
   if ("skip" in classified) {
     return { status: "skipped", reason: classified.skip, decoded };
   }
+
+  // v108: stamp the trade-time USD value so imported / `trades sync`-backfilled
+  // rows feed the budgets + P&L + tax (v104/v107) with the SAME trade-time-exact
+  // dollars live trades get — not the current-price approximation. Stablecoin
+  // quote → $1 × amount (no network); else best-effort HISTORICAL quote price at
+  // the block's date (cached by coin+date). Failure → null, graceful fallback to
+  // the quote_amount × current-price approximation, exactly as before.
+  classified.value_usd = await importValueUsd(classified, profile, logger);
 
   logger.info(`Importing tx ${txHash} as ${classified.direction} via ${classified.aggregator}`);
   const rowId = insertTrade(classified);

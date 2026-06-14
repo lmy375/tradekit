@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 108 — value_usd 覆盖到回填/导入路径：所有交易来源的 P&L/税务/预算一致精确（backfill the trade-time USD value on imported / `trades sync` rows — close the value_usd story across ALL trade sources）** ✅
+- **补上 value_usd 弧的最后一块：导入/回填的交易**：v104 给实盘交易加了 value_usd，v107 让 P&L/税务用它（消除非稳定币报价的现价失真）。但 `trade import` / `trades sync`（链上回填外部/手动交易）建的行**没有 value_usd**——于是导入的历史交易在 P&L/税务/预算里仍走旧的现价近似。对**税务**尤其要命：运营商导入历史用来报税，非稳定币报价的成本基础按今天的价算就是错的
+- 为什么重要：税务/P&L 是报税、决策依赖的最核心数字，必须对所有交易来源一致。`trades sync` 全程经 importTradeFromTx（一个修复同时覆盖 import + sync 两条回填路径）。这是 v104→v107 弧的收尾——让"交易时刻精确美元"覆盖 live + import + sync 全部来源，而非只有 live
+- 实现（复用历史定价 + 同源 stablecoin 注册表，最佳努力）：importTradeFromTx 在 insert 前调 `importValueUsd(row, profile, logger)`——稳定币报价→\$1×amount（零网络）；非稳定币→该报价代币在区块日期的**历史价**（getHistoricalPrice，按 coin+date 缓存）；native 报价经 profile.weth 定价；失败/无 coinId→null（优雅回退到 v107 的现价近似，与之前完全一致，绝不让导入失败）。复用 v85 的 isStablecoin
+- 测试覆盖：+5——稳定币→amount 零网络 / 非稳定币→amount×历史价 / native 经 WETH 定价 / 不可定价→null 回退 / airdrop 零额→null（无成本基础）；3577 测试全绿（+5）；getHistoricalPrice 以 vi.mock 注入保持离线确定性
+- 向后兼容：纯改进——value_usd 失败即 null（与 pre-v108 完全相同的回退）；importTradeFromTx 本就异步+做 RPC，多一个缓存的历史价查询；不改 classify 逻辑
+
 **Phase 107 — 已实现 P&L / 税务成本基础用"交易时刻美元"：消除非稳定币报价的现价失真（realized P&L + tax cost basis use trade-time USD via v104 value_usd — kill the current-price distortion on non-stablecoin quotes）** ✅
 - **用 v104 的 value_usd 闭合一个被注释承认的 P&L 近似**：pnl.ts 一直把每笔的 USD 算成 `quote_amount × 报价代币的「当前」USD 价`（注释明说"没有历史报价价时这是最好的近似"）。对稳定币报价近似精确；但对 WETH 报价交易——成本基础被**按今天的 ETH 价重估**：WETH \$2000 时买入、现在 \$3000，成本基础凭空涨 50%，已实现/未实现 P&L 全失真。v104 刚加的 `value_usd`（交易时刻精确美元）正好提供历史价，能把近似变精确
 - 为什么重要：P&L 和税务成本基础是 agent/运营商做决策、报税依赖的最核心数字。对非稳定币报价交易（WETH 计价）系统性失真，是 v104 同类（按报价代币单位错算 USD）的延伸——只是这次是"现价 vs 历史价"而非"代币单位 vs 美元"。把最重要的数字对所有报价类型做对
