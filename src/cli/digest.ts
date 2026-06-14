@@ -231,7 +231,9 @@ function renderPaperText(p: import("../digest.js").PaperSection): string {
 
 function renderSafetyText(s: SafetyEventsSection): string {
   const lines: string[] = [];
-  const totalBlocks = s.budgetBlocks + s.positionLimitBlocks + s.honeypotBlocks + s.gasBudgetBlocks;
+  const totalBlocks =
+    s.budgetBlocks + s.positionLimitBlocks + s.honeypotBlocks + s.gasBudgetBlocks +
+    s.amountLimitBlocks + s.strategyLossBlocks + s.executionCapBlocks + s.otherGuardrailBlocks;
   const hasAnything =
     s.drawdownTrips > 0 ||
     s.drawdownCurrentlyTripped.length > 0 ||
@@ -249,10 +251,14 @@ function renderSafetyText(s: SafetyEventsSection): string {
     const pct = t.drawdownPct != null ? `, ${t.drawdownPct.toFixed(1)}% drawdown` : "";
     lines.push(`  🔴 Currently tripped: scope=${t.scope} since ${shorten(t.trippedAt)}${pct}`);
   }
+  if (s.strategyLossBlocks > 0)  lines.push(`  🔴 Strategy loss-breaker:   ${s.strategyLossBlocks} (buys blocked — strategy past loss cap)`);
+  if (s.amountLimitBlocks > 0)   lines.push(`  ⚠ Per-tx/daily cap blocks: ${s.amountLimitBlocks}`);
   if (s.budgetBlocks > 0)        lines.push(`  ⚠ Strategy budget blocks:  ${s.budgetBlocks}`);
   if (s.positionLimitBlocks > 0) lines.push(`  ⚠ Position limit blocks:   ${s.positionLimitBlocks}`);
+  if (s.executionCapBlocks > 0)  lines.push(`  ⚠ Execution-cap blocks:    ${s.executionCapBlocks} (slippage / quote-deviation)`);
   if (s.honeypotBlocks > 0)      lines.push(`  ⚠ Honeypot blocks:         ${s.honeypotBlocks}`);
   if (s.gasBudgetBlocks > 0)     lines.push(`  ⚠ Gas budget blocks:       ${s.gasBudgetBlocks}`);
+  if (s.otherGuardrailBlocks > 0) lines.push(`  ⚠ Other guardrail blocks:  ${s.otherGuardrailBlocks} (contract allow/deny, safeguard)`);
   for (const w of s.budgetWarnings) {
     lines.push(`  ⚠ Budget "${w.tag}" ${w.window} utilization ${w.utilizationPct.toFixed(0)}%`);
   }
@@ -344,10 +350,14 @@ function renderSlack(r: DigestReport): string {
   const safetyParts: string[] = [];
   if (safety.drawdownTrips > 0) safetyParts.push(`🔴 ${safety.drawdownTrips} drawdown trip${safety.drawdownTrips === 1 ? "" : "s"}`);
   if (safety.drawdownCurrentlyTripped.length > 0) safetyParts.push(`🔴 currently tripped`);
+  if (safety.strategyLossBlocks > 0) safetyParts.push(`🔴 *${safety.strategyLossBlocks} loss-breaker block${safety.strategyLossBlocks === 1 ? "" : "s"}*`);
+  if (safety.amountLimitBlocks > 0) safetyParts.push(`${safety.amountLimitBlocks} per-tx/daily-cap block${safety.amountLimitBlocks === 1 ? "" : "s"}`);
   if (safety.budgetBlocks > 0) safetyParts.push(`${safety.budgetBlocks} budget block${safety.budgetBlocks === 1 ? "" : "s"}`);
   if (safety.positionLimitBlocks > 0) safetyParts.push(`${safety.positionLimitBlocks} position-limit block${safety.positionLimitBlocks === 1 ? "" : "s"}`);
+  if (safety.executionCapBlocks > 0) safetyParts.push(`${safety.executionCapBlocks} execution-cap block${safety.executionCapBlocks === 1 ? "" : "s"}`);
   if (safety.honeypotBlocks > 0) safetyParts.push(`${safety.honeypotBlocks} honeypot block${safety.honeypotBlocks === 1 ? "" : "s"}`);
   if (safety.gasBudgetBlocks > 0) safetyParts.push(`${safety.gasBudgetBlocks} gas-budget block${safety.gasBudgetBlocks === 1 ? "" : "s"}`);
+  if (safety.otherGuardrailBlocks > 0) safetyParts.push(`${safety.otherGuardrailBlocks} other guardrail block${safety.otherGuardrailBlocks === 1 ? "" : "s"}`);
   for (const w of safety.budgetWarnings) {
     safetyParts.push(`budget \`${w.tag}\` ${w.window} ${w.utilizationPct.toFixed(0)}%`);
   }

@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 100 — digest 安全事件全覆盖：每一次护栏拦截都进运营商心跳（comprehensive guardrail-block accounting — no real-money safety event stays invisible in the digest）** ✅
+- **补上 digest 安全统计的静默漏洞**：cron digest 的安全段（运营商的主心跳）从一个硬编码 switch 里只数 5 个护栏码（drawdown / 策略预算 / 持仓 / honeypot / gas）。但护栏码这些迭代加了一堆——v84 止损熔断、AMOUNT_EXCEEDS_LIMIT（单笔/每日 USD 上限，**最基础的护栏**）、SLIPPAGE_TOO_HIGH、QUOTE_DEVIATION_EXCEEDED、POSITION_CAP_EXCEEDED、CONTRACT_BLOCKED——**全都没被数进去**。一笔被单笔上限拦下、或止损熔断拦下的真金白银安全事件，在 digest 里只会落进泛泛的"top errors"，不被识别为安全事件、不进 verdict。switch 在护栏码增长时静默落后了（和 v85 稳定币集合分叉同一类问题）
+- 为什么是最重要的：digest 是运营商对自主 agent 的主要可观测窗口。一个护栏触发=真钱被一道配置的安全策略拦下，这正是 digest 安全段存在的意义。最基础的护栏（单笔 USD 上限）和最新的（止损熔断 v84，刚在 v99 补了 headroom 预警）在心跳里**不可见**，是个真实的覆盖漏洞——v99 让"逼近"可见，本期让"已触发"可见
+- 实现（单一事实源 + 回归守卫，复用 v85/v71 合一哲学）：errors.ts 新增 `GUARDRAIL_BLOCK_CODES` 单一注册表（12 个护栏码——明确区分于 v89-92 的 agent-lockdown 安全码，那是另一类）。digest 安全段对全部护栏码计数，分桶：amountLimitBlocks（单笔/每日上限）、strategyLossBlocks（v84 止损熔断）、executionCapBlocks（滑点+报价偏离）、positionLimitBlocks（持仓上限+敞口上限合并）、otherGuardrailBlocks（合约 allow/deny + safeguard 兜底，保证完整）。全部喂进 verdict 的 safetyBlockTotal，止损熔断+单笔上限在理由里点名
+- 关键守卫：digest.test.ts 的 **回归守卫**遍历 `GUARDRAIL_BLOCK_CODES` 每个码、各塞一条 audit 行、断言 digest 的桶总和恰好+1——任何未来新增护栏码若没接进 digest 会立刻测试失败，杜绝再次静默落后（同 v85 的 src 扫描守卫）
+- 测试覆盖：digest.test.ts +5（verdict：单笔上限→attention 点名 / 止损熔断→attention 点名；gatherSafety：单笔+止损计数 / 持仓+敞口合并、滑点+报价偏离合并；**回归守卫**：每个护栏码恰好进一个桶）；3518 测试全绿（+5）；CLI text+slack 渲染补齐、MCP digest_summary 描述同步、JSON 已烟测
+- 向后兼容：纯加法——4 个新计数字段；既有 5 桶语义不变（positionLimitBlocks 仅扩容纳入 POSITION_CAP_EXCEEDED）；单一注册表供未来复用；不改护栏 enforce 逻辑
+
 **Phase 99 — 止损熔断也有提前预警：唯一的"静默悬崖"补上 headroom（strategy loss-breaker headroom — the last safety limit with no early warning gets one）** ✅
 - **补上唯一一个没有提前预警的安全限额**：safetyHeadroom（v53）的整个存在意义就是"让自主 agent 知道自己离每条红线还有多远，从而提前 size 动作"——它追踪每日 USD、单笔、策略预算、回撤熔断、限频、持仓上限，全都有 `approaching`（≥80%）预警。唯独 v84 的**策略已实现止损熔断**（maxStrategyLossUsd）不在其中：一个策略一路"正常"，直到某笔 buy 突然被 STRATEGY_LOSS_BREAKER_TRIPPED 拦下——**静默二元悬崖**，与产品"提前预警"的哲学相悖
 - 为什么是最重要的：止损熔断是真金白银的最后一道自动护栏。其他所有限额都能"看见它逼近"，唯独这一道不能，意味着 agent 无法在被拦之前主动停手——它会一直撞墙、被拒、重试，而不是"还剩 \$80 就触发，我这个策略先别买了"。把它接进 headroom，让最该提前看见的安全信号（正在亏损、逼近熔断）变得可预见，是 headroom 模块覆盖度的收尾，也直接服务"安全自主交易"

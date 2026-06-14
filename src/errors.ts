@@ -498,6 +498,35 @@ export function httpStatusForCode(code: ErrorCode): number {
 }
 
 /**
+ * v100: the SINGLE SOURCE OF TRUTH for "a configured safety guardrail blocked
+ * a trade." Every code here means: a real trade attempt was REFUSED by a policy
+ * the operator set (a USD cap, a breaker, an allow/deny rule), as opposed to a
+ * market/user error (INSUFFICIENT_BALANCE, SLIPPAGE_EXCEEDED) or an agent-
+ * lockdown event (SAFETY_CONFIG_LOCKED, TRANSFER_RECIPIENT_NOT_ALLOWED — those
+ * are the v89-92 self-protection boundary, a different category).
+ *
+ * The cron digest's safety-event accounting counts against THIS set, so a newly
+ * added guardrail can never again silently go uncounted in the operator's
+ * heartbeat (the gap that hid AMOUNT_EXCEEDS_LIMIT and STRATEGY_LOSS_BREAKER_
+ * TRIPPED for several iterations). A regression guard in digest.test.ts asserts
+ * every member maps to a digest bucket.
+ */
+export const GUARDRAIL_BLOCK_CODES: readonly ErrorCode[] = [
+  "AMOUNT_EXCEEDS_LIMIT",
+  "SLIPPAGE_TOO_HIGH",
+  "GAS_BUDGET_EXCEEDED",
+  "QUOTE_DEVIATION_EXCEEDED",
+  "POSITION_LIMIT_EXCEEDED",
+  "POSITION_CAP_EXCEEDED",
+  "STRATEGY_BUDGET_EXCEEDED",
+  "STRATEGY_LOSS_BREAKER_TRIPPED",
+  "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED",
+  "TOKEN_BLOCKED",
+  "CONTRACT_BLOCKED",
+  "SAFEGUARD_TRIGGERED",
+];
+
+/**
  * Detect a ZodError without importing zod (duck-typed). Zod errors have an `issues`
  * array of `{code, path, message, ...}` and a `name === "ZodError"`. We turn them
  * into a single human-readable line per issue so CLI/MCP users see "safety.dailyUsdLimit:

@@ -152,12 +152,27 @@ export interface SafetyEventsSection {
   drawdownCurrentlyTripped: Array<{ scope: string; trippedAt: string; drawdownPct: number | null }>;
   /** Trade attempts blocked by strategy budgets. */
   budgetBlocks: number;
-  /** Trade attempts blocked by position limits. */
+  /** Trade attempts blocked by position limits (POSITION_LIMIT_EXCEEDED +
+   *  POSITION_CAP_EXCEEDED — both are net-exposure caps). */
   positionLimitBlocks: number;
   /** Trade attempts blocked by the auto-honeypot probe. */
   honeypotBlocks: number;
   /** Trade attempts blocked by gas-budget guardrail. */
   gasBudgetBlocks: number;
+  /** v100: trade attempts blocked by the per-tx / daily USD cap
+   *  (AMOUNT_EXCEEDS_LIMIT). The most fundamental guardrail — previously
+   *  uncounted in the digest. */
+  amountLimitBlocks: number;
+  /** v100: BUYS blocked by the v84 per-strategy realized-loss breaker
+   *  (STRATEGY_LOSS_BREAKER_TRIPPED). A strategy bled past its loss cap. */
+  strategyLossBlocks: number;
+  /** v100: trades blocked by a configured execution-quality cap
+   *  (SLIPPAGE_TOO_HIGH + QUOTE_DEVIATION_EXCEEDED). */
+  executionCapBlocks: number;
+  /** v100: remaining guardrail blocks not in a named bucket above
+   *  (CONTRACT_BLOCKED + SAFEGUARD_TRIGGERED catch-all) — keeps the heartbeat
+   *  COMPLETE so no guardrail trip is ever invisible. */
+  otherGuardrailBlocks: number;
   /** Currently configured budgets utilized > 80%. */
   budgetWarnings: Array<{ tag: string; window: "lifetime" | "daily"; utilizationPct: number }>;
 }
@@ -834,16 +849,30 @@ function gatherSafety(args: {
     since: args.since,
   });
   const filtered = args.until ? auditRows.filter((r) => r.timestamp < args.until!) : auditRows;
+  // v100: count EVERY guardrail block (errors.GUARDRAIL_BLOCK_CODES), not just
+  // the original 5 — a tripped per-tx cap (AMOUNT_EXCEEDS_LIMIT) or loss breaker
+  // (STRATEGY_LOSS_BREAKER_TRIPPED) is a real-money safety event that belongs in
+  // the heartbeat. Each guardrail code maps to exactly one bucket; the
+  // otherGuardrailBlocks catch-all keeps the accounting COMPLETE (a regression
+  // guard in digest.test.ts asserts no GUARDRAIL_BLOCK_CODE is dropped).
   let drawdownTrips = 0, budgetBlocks = 0, positionLimitBlocks = 0;
   let honeypotBlocks = 0, gasBudgetBlocks = 0;
+  let amountLimitBlocks = 0, strategyLossBlocks = 0, executionCapBlocks = 0, otherGuardrailBlocks = 0;
   for (const r of filtered) {
     if (!r.error_code) continue;
     switch (r.error_code) {
       case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED": drawdownTrips++; break;
       case "STRATEGY_BUDGET_EXCEEDED":         budgetBlocks++; break;
       case "POSITION_LIMIT_EXCEEDED":          positionLimitBlocks++; break;
+      case "POSITION_CAP_EXCEEDED":            positionLimitBlocks++; break;
       case "TOKEN_BLOCKED":                    honeypotBlocks++; break;
       case "GAS_BUDGET_EXCEEDED":              gasBudgetBlocks++; break;
+      case "AMOUNT_EXCEEDS_LIMIT":             amountLimitBlocks++; break;
+      case "STRATEGY_LOSS_BREAKER_TRIPPED":    strategyLossBlocks++; break;
+      case "SLIPPAGE_TOO_HIGH":                executionCapBlocks++; break;
+      case "QUOTE_DEVIATION_EXCEEDED":         executionCapBlocks++; break;
+      case "CONTRACT_BLOCKED":                 otherGuardrailBlocks++; break;
+      case "SAFEGUARD_TRIGGERED":              otherGuardrailBlocks++; break;
     }
   }
 
@@ -879,6 +908,7 @@ function gatherSafety(args: {
   return {
     drawdownTrips, drawdownCurrentlyTripped,
     budgetBlocks, positionLimitBlocks, honeypotBlocks, gasBudgetBlocks,
+    amountLimitBlocks, strategyLossBlocks, executionCapBlocks, otherGuardrailBlocks,
     budgetWarnings,
   };
 }
@@ -1025,13 +1055,26 @@ export function classifyVerdict(args: {
     reasons.push(`budget "${w.tag}" ${w.window} utilization ${w.utilizationPct.toFixed(0)}%`);
     attention = true;
   }
+  // v100: every guardrail block counts toward the verdict — not just the
+  // original 4. Drawdown is handled above (critical); the rest are attention.
   const safetyBlockTotal =
     args.safety.budgetBlocks +
     args.safety.positionLimitBlocks +
     args.safety.honeypotBlocks +
-    args.safety.gasBudgetBlocks;
+    args.safety.gasBudgetBlocks +
+    args.safety.amountLimitBlocks +
+    args.safety.strategyLossBlocks +
+    args.safety.executionCapBlocks +
+    args.safety.otherGuardrailBlocks;
   if (safetyBlockTotal > 0) {
-    reasons.push(`${safetyBlockTotal} safety block${safetyBlockTotal === 1 ? "" : "s"} during window`);
+    // Name the loss breaker + per-tx cap explicitly — they're the most
+    // consequential and were previously invisible here.
+    const highlights: string[] = [];
+    if (args.safety.strategyLossBlocks > 0) highlights.push(`${args.safety.strategyLossBlocks} loss-breaker`);
+    if (args.safety.amountLimitBlocks > 0) highlights.push(`${args.safety.amountLimitBlocks} per-tx/daily cap`);
+    reasons.push(
+      `${safetyBlockTotal} safety block${safetyBlockTotal === 1 ? "" : "s"} during window${highlights.length > 0 ? ` (${highlights.join(", ")})` : ""}`,
+    );
     attention = true;
   }
   if (args.fires.ordersFailed > 0) {

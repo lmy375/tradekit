@@ -15,6 +15,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GUARDRAIL_BLOCK_CODES } from "./errors.js";
 
 const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-digest-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
@@ -322,6 +323,7 @@ const emptyPaper = () => ({ fills: 0, buys: 0, sells: 0, quoteVolume: 0, topStra
 const emptySafety = () => ({
   drawdownTrips: 0, drawdownCurrentlyTripped: [] as { scope: string; trippedAt: string; drawdownPct: number | null }[],
   budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0,
+  amountLimitBlocks: 0, strategyLossBlocks: 0, executionCapBlocks: 0, otherGuardrailBlocks: 0,
   budgetWarnings: [] as { tag: string; window: "lifetime" | "daily"; utilizationPct: number }[],
 });
 const emptyErrors = () => ({
@@ -417,6 +419,27 @@ describe("classifyVerdict", () => {
       errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
     });
     expect(r.verdict).toBe("attention");
+  });
+
+  // v100: the newly-counted guardrail blocks feed the verdict too.
+  it("attention on a per-tx/daily cap block (AMOUNT_EXCEEDS_LIMIT — previously uncounted)", async () => {
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(),
+      safety: { ...emptySafety(), amountLimitBlocks: 3 },
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+    });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /per-tx\/daily cap/.test(x))).toBe(true);
+  });
+
+  it("attention on a strategy loss-breaker block, named explicitly in the reason", async () => {
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(),
+      safety: { ...emptySafety(), strategyLossBlocks: 1 },
+      errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+    });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /loss-breaker/.test(x))).toBe(true);
   });
 
   it("attention on failed orders", async () => {    const r = classifyVerdict({
@@ -688,7 +711,7 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
   const base = {
     trades: { total: 0, success: 0, failed: 0, pending: 0, usdVolume: 0, successRatePct: null } as unknown as Parameters<typeof classifyVerdict>[0]["trades"],
     fires: { ordersFilled: 0, ordersFailed: 0, scheduleFireFailures: 0, rebalanceFailureCount: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["fires"],
-    safety: { drawdownTrips: 0, drawdownCurrentlyTripped: [], budgetWarnings: [], budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["safety"],
+    safety: { drawdownTrips: 0, drawdownCurrentlyTripped: [], budgetWarnings: [], budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0, amountLimitBlocks: 0, strategyLossBlocks: 0, executionCapBlocks: 0, otherGuardrailBlocks: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["safety"],
     errors: { errorRows: 0, errorRatePct: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["errors"],
     alerts: { fired: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["alerts"],
     paper: {} as unknown as Parameters<typeof classifyVerdict>[0]["paper"],
@@ -830,5 +853,50 @@ describe("gatherDigest — promote-outcome divergence section", () => {
     expect(r.promote!.flagged).toHaveLength(0);
     // promote alone doesn't escalate; the verdict is driven by other sections.
     expect(r.verdictReasons.some((x) => /promoted strateg/.test(x))).toBe(false);
+  });
+});
+
+// ── v100: comprehensive guardrail-block accounting ───────────
+describe("gatherDigest — safety guardrail-block accounting", () => {
+  const win = { windowLabel: "24h", windowMs: 24 * 3_600_000, now: new Date("2026-05-30T12:00:00Z") };
+
+  it("counts the per-tx/daily cap + loss breaker (previously uncounted)", async () => {
+    seedAudit({ timestamp: "2026-05-30T11:00:00Z", errorCode: "AMOUNT_EXCEEDS_LIMIT" });
+    seedAudit({ timestamp: "2026-05-30T11:01:00Z", errorCode: "AMOUNT_EXCEEDS_LIMIT" });
+    seedAudit({ timestamp: "2026-05-30T11:02:00Z", errorCode: "STRATEGY_LOSS_BREAKER_TRIPPED" });
+    const r = await gatherDigest(win);
+    expect(r.safety.amountLimitBlocks).toBe(2);
+    expect(r.safety.strategyLossBlocks).toBe(1);
+    // verdict is escalated (the exact tier is dominated by error-rate here since
+    // the seeded rows are all errors; the block→attention rule is pinned in the
+    // classifyVerdict unit tests). What matters: the blocks surface as a reason.
+    expect(r.verdict).not.toBe("healthy");
+    expect(r.verdictReasons.some((x) => /loss-breaker/.test(x))).toBe(true);
+  });
+
+  it("folds POSITION_CAP_EXCEEDED in with position-limit blocks, slippage+quote into execution-cap", async () => {
+    seedAudit({ timestamp: "2026-05-30T11:00:00Z", errorCode: "POSITION_LIMIT_EXCEEDED" });
+    seedAudit({ timestamp: "2026-05-30T11:01:00Z", errorCode: "POSITION_CAP_EXCEEDED" });
+    seedAudit({ timestamp: "2026-05-30T11:02:00Z", errorCode: "SLIPPAGE_TOO_HIGH" });
+    seedAudit({ timestamp: "2026-05-30T11:03:00Z", errorCode: "QUOTE_DEVIATION_EXCEEDED" });
+    const r = await gatherDigest(win);
+    expect(r.safety.positionLimitBlocks).toBe(2);
+    expect(r.safety.executionCapBlocks).toBe(2);
+  });
+
+  // The v85-style coherence guard: every guardrail code in the single-source
+  // registry must land in exactly one digest bucket — no real-money safety
+  // event can ever again silently fall out of the operator's heartbeat.
+  it("REGRESSION GUARD: every GUARDRAIL_BLOCK_CODE is counted by the digest", async () => {
+    const bucketTotal = (s: Awaited<ReturnType<typeof gatherDigest>>["safety"]) =>
+      s.drawdownTrips + s.budgetBlocks + s.positionLimitBlocks + s.honeypotBlocks +
+      s.gasBudgetBlocks + s.amountLimitBlocks + s.strategyLossBlocks +
+      s.executionCapBlocks + s.otherGuardrailBlocks;
+    for (const code of GUARDRAIL_BLOCK_CODES) {
+      openDb().exec("DELETE FROM audit_log");
+      seedAudit({ timestamp: "2026-05-30T11:00:00Z", errorCode: code });
+      const r = await gatherDigest(win);
+      expect(bucketTotal(r.safety), `guardrail code ${code} must increment exactly one digest bucket`).toBe(1);
+    }
   });
 });
