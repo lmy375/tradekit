@@ -55,6 +55,49 @@ describe("computeStrategyComparison", () => {
     expect(a.losses).toBe(1);
     expect(a.winRatePct).toBeCloseTo(66.67, 1);
     expect(a.avgRealizedPerClose).toBeCloseTo((500 + 200 - 200) / 3, 6);
+    // v114 edge metrics: grossWin 700, grossLoss 200.
+    expect(a.avgWinUsd).toBeCloseTo(350, 6); // 700 / 2 wins
+    expect(a.avgLossUsd).toBeCloseTo(200, 6); // 200 / 1 loss
+    expect(a.profitFactor).toBeCloseTo(700 / 200, 6); // 3.5 — profitable
+    expect(a.payoffRatio).toBeCloseTo(350 / 200, 6); // 1.75
+  });
+
+  // v114: the case win rate alone misses — high win rate, still bleeding.
+  it("a high-win-rate strategy with big losers shows profit factor < 1 (edge < win rate suggests)", () => {
+    const r = computeStrategyComparison([
+      fill({ strategy: "a", direction: "buy", base_amount: "4", quote_amount: "8000" }), // avg 2000
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2100" }), // +100 win
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2100" }), // +100 win
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2100" }), // +100 win
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "1400" }), // -600 loss
+    ]);
+    const a = r.strategies[0];
+    expect(a.winRatePct).toBeCloseTo(75, 6); // 3/4 wins — looks great
+    expect(a.realizedUsd).toBeCloseTo(300 - 600, 6); // but -$300 overall
+    expect(a.profitFactor).toBeCloseTo(300 / 600, 6); // 0.5 — bleeding edge
+    expect(a.profitFactor! < 1).toBe(true);
+  });
+
+  it("profitFactor is null when there are no losses (undefined ratio), payoff null too", () => {
+    const r = computeStrategyComparison([
+      fill({ strategy: "a", direction: "buy", base_amount: "2", quote_amount: "4000" }),
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2500" }), // +500 win
+      fill({ strategy: "a", direction: "sell", base_amount: "1", quote_amount: "2300" }), // +300 win
+    ]);
+    const a = r.strategies[0];
+    expect(a.losses).toBe(0);
+    expect(a.profitFactor).toBeNull();
+    expect(a.payoffRatio).toBeNull();
+    expect(a.avgWinUsd).toBeCloseTo(400, 6);
+    expect(a.avgLossUsd).toBeNull();
+  });
+
+  it("edge metrics are null when nothing has closed (buys only)", () => {
+    const a = computeStrategyComparison([fill({ strategy: "a", direction: "buy" })]).strategies[0];
+    expect(a.profitFactor).toBeNull();
+    expect(a.payoffRatio).toBeNull();
+    expect(a.avgWinUsd).toBeNull();
+    expect(a.avgLossUsd).toBeNull();
   });
 
   it("excludes non-stablecoin-quoted trades from P&L (can't value deterministically)", () => {

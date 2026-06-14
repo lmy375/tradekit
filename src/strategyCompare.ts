@@ -53,8 +53,21 @@ export interface StrategyPerformance {
   winRatePct: number | null;
   /** Total priced USD traded (buys + sells). */
   volumeUsd: number;
-  /** realizedUsd / closes. Null when nothing has closed. */
+  /** realizedUsd / closes. Null when nothing has closed. This IS the per-trade
+   *  expectancy in $ — positive means the strategy makes money on average. */
   avgRealizedPerClose: number | null;
+  /** v114: trading-EDGE metrics — answer "does this strategy actually have an
+   *  edge?", which win rate alone cannot (70% wins with big losers still
+   *  bleeds). All null until there's a win AND/OR a loss to divide by. */
+  avgWinUsd: number | null;
+  avgLossUsd: number | null;
+  /** grossWin / grossLoss. > 1 = profitable; the magnitude indicates how much
+   *  cushion the edge has. Null when there are no losses (undefined ratio) or
+   *  no wins. */
+  profitFactor: number | null;
+  /** avgWin / avgLoss — the win/loss size asymmetry. A < 1 payoff needs a high
+   *  win rate to stay profitable. Null until both a win and a loss exist. */
+  payoffRatio: number | null;
   lastTradeAt: string | null;
 }
 
@@ -93,6 +106,10 @@ export function computeStrategyComparison(
     closes: number;
     wins: number;
     losses: number;
+    /** v114: gross winning $ and gross losing $ (abs) across closes — the
+     *  basis for profit factor / avg win / avg loss / payoff ratio. */
+    grossWin: number;
+    grossLoss: number;
     volume: number;
     lastTradeAt: string | null;
     positions: Map<string, CostBasisState>;
@@ -123,7 +140,7 @@ export function computeStrategyComparison(
     const key = r.strategy?.trim() || "(none)";
     let acc = byStrategy.get(key);
     if (!acc) {
-      acc = { realized: 0, tradeCount: 0, closes: 0, wins: 0, losses: 0, volume: 0, lastTradeAt: null, positions: new Map() };
+      acc = { realized: 0, tradeCount: 0, closes: 0, wins: 0, losses: 0, grossWin: 0, grossLoss: 0, volume: 0, lastTradeAt: null, positions: new Map() };
       byStrategy.set(key, acc);
     }
     acc.tradeCount += 1;
@@ -146,8 +163,8 @@ export function computeStrategyComparison(
         const realized = (sellPricePerUnit - avgCost) * sold;
         acc.realized += realized;
         acc.closes += 1;
-        if (realized > FLAT_PNL_EPSILON) acc.wins += 1;
-        else if (realized < -FLAT_PNL_EPSILON) acc.losses += 1;
+        if (realized > FLAT_PNL_EPSILON) { acc.wins += 1; acc.grossWin += realized; }
+        else if (realized < -FLAT_PNL_EPSILON) { acc.losses += 1; acc.grossLoss += -realized; }
       }
     }
   }
@@ -163,6 +180,12 @@ export function computeStrategyComparison(
       winRatePct: a.wins + a.losses > 0 ? (a.wins / (a.wins + a.losses)) * 100 : null,
       volumeUsd: a.volume,
       avgRealizedPerClose: a.closes > 0 ? a.realized / a.closes : null,
+      avgWinUsd: a.wins > 0 ? a.grossWin / a.wins : null,
+      avgLossUsd: a.losses > 0 ? a.grossLoss / a.losses : null,
+      // Undefined when there are no losses (∞) — report null rather than a
+      // misleading huge number; a glance at wins/losses tells the rest.
+      profitFactor: a.grossLoss > FLAT_PNL_EPSILON ? a.grossWin / a.grossLoss : null,
+      payoffRatio: a.wins > 0 && a.losses > 0 ? (a.grossWin / a.wins) / (a.grossLoss / a.losses) : null,
       lastTradeAt: a.lastTradeAt,
     }))
     .sort((x, y) => y.realizedUsd - x.realizedUsd);
@@ -298,6 +321,16 @@ export function renderStrategyComparison(r: StrategyComparisonReport): string {
     lines.push(
       `  ${String(i + 1).padStart(2)}.   ${s.strategy.padEnd(18).slice(0, 18)}  ${realized.padStart(11)}  ${wr.padStart(12)}  ${String(s.closes).padStart(6)}  ${String(s.tradeCount).padStart(6)}  $${s.volumeUsd.toFixed(0).padStart(9)}  ${last}`,
     );
+    // v114: edge line — profit factor + payoff + avg win/loss + expectancy.
+    // Only when something has closed (else the metrics are all null).
+    if (s.closes > 0) {
+      const pf = s.profitFactor != null ? s.profitFactor.toFixed(2) : (s.losses === 0 && s.wins > 0 ? "∞ (no losses)" : "—");
+      const payoff = s.payoffRatio != null ? `${s.payoffRatio.toFixed(2)}×` : "—";
+      const aw = s.avgWinUsd != null ? `+$${s.avgWinUsd.toFixed(2)}` : "—";
+      const al = s.avgLossUsd != null ? `−$${s.avgLossUsd.toFixed(2)}` : "—";
+      const exp = s.avgRealizedPerClose != null ? `${s.avgRealizedPerClose >= 0 ? "+" : "−"}$${Math.abs(s.avgRealizedPerClose).toFixed(2)}` : "—";
+      lines.push(`        edge: profit factor ${pf} · payoff ${payoff} (avg win ${aw} / avg loss ${al}) · expectancy ${exp}/trade`);
+    }
   });
   if (r.bleeding.length > 0) {
     lines.push("");

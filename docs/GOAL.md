@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 114 — 策略"有没有 edge"的量化：profit factor / payoff / 期望值（trading-edge metrics — profit factor, payoff ratio, avg win/loss, expectancy answer "does this strategy actually have an edge?"）** ✅
+- **补上"胜率高 ≠ 赚钱"的盲区**：strategyCompare 报已实现 P&L + 胜率，但**胜率单独看会骗人**——一个 70% 胜率、却"小赢大亏"的策略整体是亏的。框架缺的是判断 edge 的标准交易指标：**profit factor**（毛盈/毛亏，>1 才有利可图、量级=安全垫）、**payoff ratio**（avg win / avg loss 的盈亏比）、avg win/avg loss、expectancy（每笔期望 $）。这些才回答"这策略到底有没有 edge、该不该加仓"
+- 为什么是有效性支柱最重要的一块：交易产品的核心是帮 agent/运营商判断策略是否真有边际优势。胜率 + 总 P&L 不够——一段时间的总 P&L 可能被一两笔运气主导。profit factor < 1 立刻暴露"胜率好看但在流血"的策略，是资金分配（v83 的初衷）真正需要的信号。且全部可从既有已平仓数据算出，无需新记录
+- 实现（扩展 v83 的累加器，复用同源 reducer，零新记录）：Acc 加 grossWin/grossLoss（平仓时按盈亏累加）；StrategyPerformance 加 avgWinUsd/avgLossUsd/profitFactor/payoffRatio。profitFactor 无亏损时为 null（∞ 不误导）、payoff 需同时有盈有亏。render 加 edge 行（profit factor · payoff（avg win/avg loss）· expectancy/trade）；MCP strategy_compare 描述同步
+- 测试覆盖：+3——混合盈亏算出 PF 3.5/payoff 1.75 / **75% 胜率但 PF 0.5（暴露流血）** / 无亏损→PF+payoff null / 未平仓→全 null；3592 测试全绿（+3）
+- 向后兼容：纯加法——4 个新指标字段；复用 v83 累加器 + 共享 cost-basis reducer（与所有 P&L 面一致）；不改排名/已有字段
+
 **Phase 113 — 安全网可靠性上 Web：运营商在主监控界面看到"护栏到底能不能生效"（safety-net reliability on the dashboard — engine liveness + notification delivery where the web operator watches）** ✅
 - **把"护栏能否真正生效"的信号搬到 web 操作面**：web Safety 页显示配置 posture（配了哪些护栏）+ headroom（还剩多少额度）。但护栏只有在**引擎能触发止损 + 告警能送达运营商**时才真正保护你——v103 引擎存活只在 cron digest、v106 通知投递健康只在 doctor。主要用 web 监控的运营商看不到"引擎死了→止损静默失效"或"告警通道死了→盲飞"。posture 显示"hardened"而安全网实际断了
 - 为什么重要：自主交易里运营商保持掌控的关键，是知道安全网真的在运转。把可靠性信号搬到运营商主盯的界面（v86/87/102 确立的"关键信号上滞后 web 界面"模式），让"我的护栏现在能生效吗"一眼可判。这直接服务"运营商掌控自主交易"
