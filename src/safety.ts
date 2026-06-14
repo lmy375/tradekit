@@ -190,27 +190,11 @@ export function enforceSafety(input: SafetyCheckInput, config: Config, logger: L
     );
   }
   if (input.estimatedUsd != null) {
-    if (s.perTxUsdLimit != null && input.estimatedUsd > s.perTxUsdLimit) {
-      throw new ToolError(
-        "AMOUNT_EXCEEDS_LIMIT",
-        `Trade size $${input.estimatedUsd.toFixed(2)} exceeds per-tx limit $${s.perTxUsdLimit.toFixed(2)}.`,
-        {
-          details: { estimatedUsd: input.estimatedUsd, perTxUsdLimit: s.perTxUsdLimit },
-          // Iter307: actionable next-action for an agent that hits the per-tx limit.
-          // Don't suggest raising the limit — that would encourage bypassing the safety
-          // the operator opted into. Suggest splitting instead.
-          nextActions: [
-            {
-              // Iter587: `quote` instead of nonexistent `trade` umbrella — verify
-              // the resized amount lands inside the cap with a read-only quote
-              // before dispatching buy/sell.
-              tool: "quote",
-              reason: `Reduce the trade amount to keep estimated value ≤ $${s.perTxUsdLimit.toFixed(2)}, or split into multiple smaller trades. Quote first to verify the resized amount.`,
-            },
-          ],
-        },
-      );
-    }
+    // 4. Per-tx USD limit — extracted to enforcePerTxUsdLimit (iter; v125) so
+    // executePaperTrade can run the SAME check (the dry-run must reject exactly
+    // where real would). Stateless (this trade vs the cap), so it's safe to
+    // share verbatim.
+    enforcePerTxUsdLimit(input.estimatedUsd, config);
     // 5. Daily USD limit (sums all SUCCESSful trades in the last 24h for this account)
     if (s.dailyUsdLimit != null) {
       const usedToday = dailyUsdVolume(input.account, input.chain);
@@ -245,6 +229,36 @@ export function enforceSafety(input: SafetyCheckInput, config: Config, logger: L
   }
 
   logger.debug("Safety checks passed");
+}
+
+/**
+ * v125: the per-tx USD cap, extracted so BOTH the live path (enforceSafety) and
+ * the paper dry-run (executePaperTrade) enforce it from one definition — a
+ * paper trade sized past the per-tx limit must reject exactly where a real one
+ * would, or the dry-run overstates what the strategy could actually do live.
+ * Stateless: only this trade's USD value vs the cap. No-op when safety is
+ * disabled, the cap is unset, or the trade couldn't be priced.
+ */
+export function enforcePerTxUsdLimit(estimatedUsd: number | null, config: Config): void {
+  const s = config.safety;
+  if (!s.enabled || s.perTxUsdLimit == null || estimatedUsd == null) return;
+  if (estimatedUsd > s.perTxUsdLimit) {
+    throw new ToolError(
+      "AMOUNT_EXCEEDS_LIMIT",
+      `Trade size $${estimatedUsd.toFixed(2)} exceeds per-tx limit $${s.perTxUsdLimit.toFixed(2)}.`,
+      {
+        details: { estimatedUsd, perTxUsdLimit: s.perTxUsdLimit },
+        // Iter307: don't suggest raising the limit — that bypasses the safety the
+        // operator opted into. Suggest splitting/resizing instead.
+        nextActions: [
+          {
+            tool: "quote",
+            reason: `Reduce the trade amount to keep estimated value ≤ $${s.perTxUsdLimit.toFixed(2)}, or split into multiple smaller trades. Quote first to verify the resized amount.`,
+          },
+        ],
+      },
+    );
+  }
 }
 
 // ── rate-limit guard (iter633) ────────────────────────────────

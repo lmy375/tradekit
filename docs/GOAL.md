@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 125 — paper 护栏对齐：让 dry-run "在 live 会拒的地方同样拒"，否则 paper 失真、信任管道被它自己误导（paper-enforcement parity — the dry-run must reject exactly where a real trade would）** ✅
+- **背景/盲点**：信任管道（backtest→paper→promote→live）的核心承诺是 **paper 能预测 live**。但 executePaperTrade 此前只强制了**仓位上限（v38）**+ 虚拟余额——**没有**单笔/每日 USD 上限、token 白/黑名单、滑点上限、策略亏损断路器。于是一个 paper 策略能成交 live 会**直接拒绝**的交易：单笔超额、交易被拉黑的 token、滑点超限、或在亏损断路器早该停手后还在加仓。结果 paper **高估**了策略的成交频率/规模/回报，而 promote-check（前向）读到的是被夸大的 paper 指标，promote-outcome（后向）随后又把这种"paper/live 分歧"误判成策略本身的问题（cadence diverged / underperforming）——**失真是信任管道自己制造的**。代码注释（v38 仓位上限处）早写明意图"dry-run 必须在 real 会拒的地方同样拒"，但只对仓位上限兑现了
+- 为什么重要：这是"围绕最核心目标做对"——paper 的全部价值在于忠实预测 live，护栏不对齐就直接侵蚀信任管道这个产品最重要的决策机制（决定哪些策略上真钱）。是 v38 意图的自然补全，不是加新 feature
+- 实现（最大化复用 + 单一来源纪律）：把单笔 USD 上限抽成 safety.ts 的 `enforcePerTxUsdLimit`，live（enforceSafety）与 paper **共用同一份定义**。executePaperTrade 现在按 live 的同样时序/门控跑：定价后调 enforcePreflightSafety（滑点上限 + token 白/黑名单，纯 config-vs-input，逐字复用）；按金额算出 estimatedUsd（用 base 的 USD 价 × base 数量，**与 quote token 无关**地正确，而非裸 quote_amount）后调 enforcePerTxUsdLimit；保留 v38 仓位上限；再按 live 门控（maxStrategyLossUsd、买单、带 tag）调 enforceStrategyLossBreaker(mode:"paper") 读虚拟书的已实现盈亏
+- 明确**不**强制（并在代码里说明原因，避免引入已知错误的计算）：合约白名单（paper 没有 router 合约）；**每日 USD 上限 + 策略预算**（其滚动/终身窗口需要 paper_trades 增加 value_usd 列才能对非稳定币 quote 正确计价——刻意推迟，不引入 stablecoin-only 的近似，呼应 v104-v111 的 value_usd 正确性纪律）；回撤断路器（需 paper-equity 接线）；gas/限频（paper 无 gas、非真实 tx）
+- 测试覆盖：+8——滑点超限拒（且不落虚拟成交）、拉黑 token 拒、白名单外 token 拒、单笔超额拒（验证按 base-USD 计价而非裸 quote）、上限内放行、亏损断路器在虚拟书上触发买单拒、断路器仍放行卖单（出场/恢复）、safety 关闭时全不强制（与 live 总开关一致）；3636 测试全绿（+8）
+
 **Phase 124 — 把"保护"补进 agent 的行动清单：dashboard 风险判定不再对"裸奔仓位"视而不见（wire protection into the unified action inbox — the dashboard's risk verdict stops skipping the one dimension that matters most for spot）** ✅
 - **背景/盲点**：agent 的统一"我现在该做什么"清单是 health.deriveNextActions（带 severity 分级的 nextActions[]）。它覆盖 reconcile/approvals/snapshots/backfills/aggregator/safety-posture/concentration/MEV——但**它早于整条保护与信任管道投入（v84-v123）**。代码里有一行实锤盲点：风险判定显式带着 `notChecked: ["protection"]` 并传 `protection: null`，注释写着"protection 需要 positions，这里没 fetch"。于是 agent 把 health 当主仪表盘轮询时，**永远不会被告知"你持有没有止损的现货仓位"**——必须自己另外想起来调 risk_posture / open_positions
 - 为什么重要：这是"围绕最多的目标、把散落的 detect→respond 收拢进一个面"而非加新 feature。对自主现货 agent 来说，"裸奔仓位"是最该进行动清单的安全信号之一（一次崩盘没有任何自动出场）。把它补进主仪表盘的行动清单，等于让此前所有保护检测（v76/v110/v119/v123）在 agent 轮询的**那一个**面上可见、可执行

@@ -61,6 +61,7 @@ import {
   type Chain,
 } from "viem";
 import { ToolError } from "./errors.js";
+import { enforcePreflightSafety, enforcePerTxUsdLimit } from "./safety.js";
 import { getCurrentPrice } from "./price.js";
 import { getToken, isNativeSentinel, NATIVE_TOKEN } from "./tokens.js";
 import { parseSizingSentinel, applyFractionBig, describeSentinel } from "./sizing.js";
@@ -352,6 +353,24 @@ export async function executePaperTrade(
   // Slippage resolution.
   const slipBps =
     req.slippageBps ?? ctx.config.defaultSlippageBps ?? DEFAULT_PAPER_SLIPPAGE_BPS;
+
+  // v125: paper-enforcement parity — the dry-run must reject exactly where a
+  // real trade would, or paper overstates what the strategy could do live and
+  // promote-outcome later mistakes paper/live divergence (cadence, sizing) for
+  // a strategy fault. enforcePreflightSafety is PURE config-vs-input (slippage
+  // cap + token whitelist/blacklist), so paper shares it verbatim with the live
+  // path. (Per-tx USD cap + strategy loss breaker run below, once the trade is
+  // priced/sized.) The contract whitelist, daily-USD cap, strategy budget, and
+  // drawdown breaker are NOT applied here: a paper fill has no router contract;
+  // the cumulative-USD guards need a paper value_usd column to value
+  // non-stablecoin quotes correctly (deferred); drawdown needs paper-equity
+  // wiring. Position caps already enforce below (v38).
+  enforcePreflightSafety(
+    { chain: ctx.profile.name, tokenIn: baseAddr, tokenOut: quoteAddr, slippageBps: slipBps },
+    ctx.config,
+    ctx.logger,
+  );
+
   const effectivePrice = applyWorstCaseSlippage(spot, req.direction, slipBps);
 
   // v35: resolve the "max" sentinel against the VIRTUAL book before
@@ -402,6 +421,13 @@ export async function executePaperTrade(
     effectivePrice,
   });
 
+  // v125: per-tx USD cap — paper twin of enforceSafety's check (the dry-run
+  // must reject exactly where real would). estimatedUsd uses the base's USD
+  // price × the base amount, so it's correct regardless of the quote token
+  // (unlike a raw quote_amount). Applies to buys AND sells, like the live cap.
+  const paperEstimatedUsd = baseUsd != null && baseUsd > 0 ? baseUsd * parseFloat(amounts.baseAmount) : null;
+  enforcePerTxUsdLimit(paperEstimatedUsd, ctx.config);
+
   // v38: per-strategy position caps — paper twin of executeTrade's
   // enforcement (the dry-run must reject exactly where real would).
   if (
@@ -420,6 +446,26 @@ export async function executePaperTrade(
       addCostQuote: parseFloat(amounts.quoteAmount),
       caps: ctx.config.safety.positionCaps,
       paper: true,
+    });
+  }
+
+  // v125: per-strategy realized-loss breaker (v84) — paper twin. A paper
+  // strategy that keeps buying after big realized losses, when live would have
+  // halted at safety.maxStrategyLossUsd, overstates how long the strategy keeps
+  // deploying capital — exactly the kind of behavior promote-outcome later
+  // compares. mode:"paper" reads the virtual book's realized P&L. Buy-only +
+  // tagged-only + opt-in, mirroring the live gate.
+  if (
+    ctx.config.safety.maxStrategyLossUsd != null &&
+    req.direction === "buy" &&
+    req.strategy
+  ) {
+    const { enforceStrategyLossBreaker } = await import("./strategyCompare.js");
+    enforceStrategyLossBreaker({
+      strategyTag: req.strategy,
+      maxLossUsd: ctx.config.safety.maxStrategyLossUsd,
+      mode: "paper",
+      account: ctx.accountLabel,
     });
   }
 

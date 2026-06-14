@@ -567,6 +567,99 @@ describe("executePaperTrade", () => {
   });
 });
 
+// ── v125: paper-enforcement parity — the dry-run rejects where live would ──
+describe("executePaperTrade — guardrail parity (v125)", () => {
+  beforeEach(() => {
+    (getToken as ReturnType<typeof vi.fn>).mockImplementation(async (_pc, _profile, addr: Address) => {
+      if (addr.toLowerCase() === WETH.toLowerCase()) return mockToken(WETH, "WETH", 18);
+      if (addr.toLowerCase() === USDC.toLowerCase()) return mockToken(USDC, "USDC", 6);
+      throw new Error(`unknown token ${addr}`);
+    });
+    (getCurrentPrice as ReturnType<typeof vi.fn>).mockImplementation(async (addr: string) => {
+      if (addr.toLowerCase() === WETH.toLowerCase()) return 2_500;
+      if (addr.toLowerCase() === USDC.toLowerCase()) return 1;
+      return null;
+    });
+  });
+
+  const cfgSafe = (safety: Record<string, unknown>) =>
+    ({ ...(fakeConfig as object), safety: { enabled: true, maxSlippageBps: 50, ...safety } }) as never;
+  const ctxWith = (config: never) => ({
+    publicClient: fakePublicClient, profile: fakeProfile, config, logger: fakeLogger, accountLabel: "default",
+  });
+  const buy = (quoteAmount: string, extra: Record<string, unknown> = {}) =>
+    ({ direction: "buy" as const, base: WETH, quote: USDC, quoteAmount, source: { type: "manual" as const, id: null }, ...extra });
+
+  it("rejects slippage over the cap, exactly like live", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    await expect(
+      executePaperTrade(buy("5000", { slippageBps: 100 }), ctxWith(cfgSafe({ maxSlippageBps: 50 }))),
+    ).rejects.toMatchObject({ code: "SLIPPAGE_TOO_HIGH" });
+    expect(listPaperTrades({})).toHaveLength(0); // no virtual fill recorded
+  });
+
+  it("rejects a blacklisted token, exactly like live", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    await expect(
+      executePaperTrade(buy("100"), ctxWith(cfgSafe({ maxSlippageBps: 5000, tokenBlacklist: { base: [WETH] } }))),
+    ).rejects.toMatchObject({ code: "TOKEN_BLOCKED" });
+  });
+
+  it("rejects a token outside a configured whitelist, exactly like live", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    await expect(
+      // Whitelist only USDC → buying WETH (not whitelisted) rejects.
+      executePaperTrade(buy("100"), ctxWith(cfgSafe({ maxSlippageBps: 5000, tokenWhitelist: { base: [USDC] } }))),
+    ).rejects.toMatchObject({ code: "TOKEN_BLOCKED" });
+  });
+
+  it("rejects a trade over the per-tx USD cap (priced by base USD, not raw quote)", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    // ~$4950 of WETH (2500 × ~1.98) vs a $1000 per-tx cap → rejects.
+    await expect(
+      executePaperTrade(buy("5000"), ctxWith(cfgSafe({ maxSlippageBps: 5000, perTxUsdLimit: 1000 }))),
+    ).rejects.toMatchObject({ code: "AMOUNT_EXCEEDS_LIMIT" });
+  });
+
+  it("allows a trade within the per-tx cap", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    const r = await executePaperTrade(buy("5000"), ctxWith(cfgSafe({ maxSlippageBps: 5000, perTxUsdLimit: 10000 })));
+    expect(r.status).toBe("success");
+  });
+
+  it("trips the strategy loss breaker on the virtual book (paper mode)", async () => {
+    // Seed a losing round-trip for strategy "ls": buy 1 WETH @2500, sell @2000 → realized −$500.
+    recordPaperTrade(samplePaperRow({ direction: "buy", strategy: "ls", base_amount: "1", quote_amount: "2500", price: "2500", timestamp: "2026-06-01T00:00:00Z" }));
+    recordPaperTrade(samplePaperRow({ direction: "sell", strategy: "ls", base_amount: "1", quote_amount: "2000", price: "2000", timestamp: "2026-06-02T00:00:00Z" }));
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    // maxStrategyLossUsd=100; realized −500 ≤ −100 → new BUYS blocked.
+    await expect(
+      executePaperTrade(buy("100", { strategy: "ls" }), ctxWith(cfgSafe({ maxSlippageBps: 5000, maxStrategyLossUsd: 100 }))),
+    ).rejects.toMatchObject({ code: "STRATEGY_LOSS_BREAKER_TRIPPED" });
+  });
+
+  it("loss breaker still ALLOWS sells (exit/recover), like live", async () => {
+    recordPaperTrade(samplePaperRow({ direction: "buy", strategy: "ls", base_amount: "1", quote_amount: "2500", price: "2500", timestamp: "2026-06-01T00:00:00Z" }));
+    recordPaperTrade(samplePaperRow({ direction: "sell", strategy: "ls", base_amount: "1", quote_amount: "2000", price: "2000", timestamp: "2026-06-02T00:00:00Z" }));
+    setPaperBalance({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "1" });
+    const r = await executePaperTrade(
+      { direction: "sell", base: WETH, quote: USDC, baseAmount: "1", strategy: "ls", source: { type: "manual", id: null } },
+      ctxWith(cfgSafe({ maxSlippageBps: 5000, maxStrategyLossUsd: 100 })),
+    );
+    expect(r.status).toBe("success");
+  });
+
+  it("enforces nothing when safety is disabled (parity with live's master switch)", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    // Over-slippage + tiny per-tx cap, but safety.enabled=false → trade goes through.
+    const r = await executePaperTrade(
+      buy("5000", { slippageBps: 100 }),
+      ctxWith({ ...(fakeConfig as object), safety: { enabled: false, maxSlippageBps: 50, perTxUsdLimit: 1 } } as never),
+    );
+    expect(r.status).toBe("success");
+  });
+});
+
 // ── helpers ─────────────────────────────────────────────────
 
 function samplePaperRow(overrides: Partial<Parameters<typeof recordPaperTrade>[0]> = {}) {
