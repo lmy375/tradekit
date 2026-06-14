@@ -28,6 +28,7 @@
 
 import { ToolError } from "./errors.js";
 import { recentTrades, listPaperTrades } from "./db.js";
+import { applyBuy, applySell, type CostBasisState } from "./costBasis.js";
 
 export interface PositionCapRule {
   /** Tag pattern: exact ("dca-eth") or prefix wildcard ("playbook:*"). */
@@ -64,31 +65,24 @@ export interface FillRowLite {
 }
 
 /** Net position for (rows already scoped to one strategy) × token.
- *  Weighted-average cost model — identical semantics to the MTM
- *  walker so cap math can never disagree with the P&L surfaces. */
+ *  Reduces through the SHARED weighted-average cost-basis core
+ *  (costBasis.ts), the same arithmetic the MTM walker uses — so cap math
+ *  can never disagree with the P&L surfaces (structural, not by comment). */
 export function netPosition(
   rows: readonly FillRowLite[],
   rule: Pick<PositionCapRule, "token">,
 ): { baseAmount: number; costQuote: number } {
   const sorted = [...rows].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-  let amount = 0;
-  let cost = 0;
+  const state: CostBasisState = { amount: 0, cost: 0 };
   for (const r of sorted) {
     if (!tokenMatches(rule as PositionCapRule, r.base_token, r.base_symbol)) continue;
     const base = parseFloat(r.base_amount);
     const quote = parseFloat(r.quote_amount);
     if (!Number.isFinite(base) || !Number.isFinite(quote) || base <= 0) continue;
-    if (r.direction === "buy") {
-      amount += base;
-      cost += quote;
-    } else {
-      const avg = amount > 0 ? cost / amount : 0;
-      const sold = Math.min(base, Math.max(0, amount));
-      amount -= sold;
-      cost = Math.max(0, cost - avg * sold);
-    }
+    if (r.direction === "buy") applyBuy(state, base, quote);
+    else applySell(state, base);
   }
-  return { baseAmount: amount, costQuote: cost };
+  return { baseAmount: state.amount, costQuote: state.cost };
 }
 
 /** Production rows loader: success real trades OR paper fills for one tag. */

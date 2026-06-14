@@ -49,6 +49,7 @@ import type { Config } from "./config.js";
 import type { Logger } from "./logger.js";
 import { resolveProfile } from "./config.js";
 import { summarizePaperPnl, type PaperPnlSummary } from "./paperTrade.js";
+import { FLAT_EPSILON, applyBuy, applySell } from "./costBasis.js";
 
 /** Same conservative allow-list as pnl.ts / pairStats.ts / aggregatorStats.ts. */
 function isStablecoin(symbol: string | null | undefined): boolean {
@@ -208,10 +209,6 @@ interface PosAcc {
 export const LONG_TERM_DAYS = 365;
 export type GainTerm = "short" | "long" | "untracked";
 
-/** Dust guard: positions below this base amount are considered flat and
- *  skipped from pricing. Matches the 1e-9 epsilon style used elsewhere. */
-const FLAT_EPSILON = 1e-9;
-
 /**
  * Compute per-strategy MTM P&L over a set of paper fills.
  *
@@ -298,13 +295,13 @@ export async function computePaperPnlMtm(
             acc.acquiredAtMs = (acc.acquiredAtMs * acc.amount + buyMs * baseAmt) / (acc.amount + baseAmt);
           }
         }
-        acc.amount += baseAmt;
-        acc.cost += quoteAmt;
+        applyBuy(acc, baseAmt, quoteAmt);
       } else {
-        const avgCost = acc.amount > 0 ? acc.cost / acc.amount : 0;
+        // Reduce via the shared weighted-average reducer (same arithmetic the
+        // position-cap enforcer uses — they cannot drift). The returned
+        // avgCost/sold/untracked drive realized P&L + the holding period.
         const sellPricePerUnit = quoteAmt / baseAmt;
-        const sold = Math.min(baseAmt, Math.max(0, acc.amount));
-        const untracked = baseAmt - sold;
+        const { avgCost, sold, untracked } = applySell(acc, baseAmt);
         const realizedDelta = (sellPricePerUnit - avgCost) * sold;
         acc.realized += realizedDelta;
         // v60: holding period for the TRACKED portion, from the position's
@@ -342,8 +339,7 @@ export async function computePaperPnlMtm(
           bucketRealized += realizedDelta;
           realizedTimeline.push({ at: r.timestamp, cumulativeRealizedQuote: bucketRealized });
         }
-        acc.amount -= sold;
-        acc.cost = Math.max(0, acc.cost - avgCost * sold);
+        // (acc.amount / acc.cost already mutated by applySell above.)
         if (untracked > FLAT_EPSILON) {
           acc.untrackedSellBase += untracked;
           acc.untrackedSellQuote += sellPricePerUnit * untracked;

@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 71 — 成本基准引擎合一（one shared cost-basis reducer — the numbers can no longer disagree）** ✅
+- **不加 feature，消除最重要数字的结构性漂移风险**：产品最重要的东西是 agent 和运营商**信任的数字**。"strategy Y 持有多少 token X、成本基准多少"此前有**两套独立实现**的加权平均算法——MTM walker（`computePaperPnlMtm`，喂 pnl/gains/open_positions）和 `netPosition`（positionCaps，喂仓位上限 enforcer + v70 sizing）。两边各写一遍同样的算术，各自用注释承诺"与对方一致"
+- 为什么这是最重要的：注释承诺是**结构性技术债**。任一边修个边界（over-sell 截断、成本下限、epsilon）而另一边没改，position cap enforcer 就会按 open_positions **从未显示过**的数字行事——**最坏的信任 bug**，因为每个面单独看都自洽。连续 6 期都在加决策面（context/timing/sizing），是时候回头加固它们共同依赖的地基
+- 实现（提取而非重写）：新纯模块 `costBasis.ts` 是这套算术的**唯一定义**——`applyBuy`（amount/cost 双增）+ `applySell`（按加权平均实现 realize：sold 截断至持仓、溢出为 untracked、成本 floored 至 0，返回 avgCost/sold/untracked/costRemoved 供 caller 算已实现盈亏+持有期）+ 共享 `FLAT_EPSILON`。walker 的买/卖分支与 netPosition 全部改为 reduce through 这两个函数——**两边按构造不可能再分歧**，不再靠注释
+- walker 重构保持行为不变：买分支保留 acquiredAtMs 加权混合（读 pre-buy amount）后调 applyBuy；卖分支前置调 applySell 拿 avgCost/sold/untracked（卖分支后续不再读 acc.amount/cost——验证过），移除末尾手动 mutation。netPosition 保留 token 过滤+输入校验，算术全委托
+- 测试覆盖：新 `costBasis.test.ts` 12 case——(1) reducer 单测 5（买累加 / 卖按加权平均双减 / over-sell 截断+untracked+成本归零 / 平仓卖纯 no-op 全 untracked / FLAT_EPSILON 阈值）；(2) **跨引擎一致性守卫** 7 个场景（单买 / 两买加权 / 部分卖留存 / 往返归平 / 超卖 / 买光再买 / 分数额）——同一组 fills 喂 walker 和 netPosition，断言净额+成本基准一致。这是两个面一直只用注释承诺的不变量，现在**被测试**且重构后**按构造成立**
+- 向后兼容：纯提取重构——零行为变化（paperPnl/positionCaps/gains/openPositions/tradeSizing 既有 72 测试全部不变通过）；FLAT_EPSILON 原为 paperPnl 私有未导出，移入共享模块；3345 测试全绿（+12，无回归）
+- 影响面：所有成本基准/持仓数字现在源自一处定义——pnl、gains、open_positions、position cap enforcer、v70 sizing 在数学上保证同源同步
+
 **Phase 70 — 最大可交易额求解（max admissible trade size — "how much CAN I safely trade right now, and which limit binds?"）** ✅
 - **把安全态势变成可执行的单一数字，而非加新观测面**：超额下单是自主 agent **爆仓的头号方式**之一。v54 `projectTradeLimits` 回答正向问题"这个 size 行不行"，v53 `safety_headroom` 报告"每个限额还剩多少"——但 agent **每笔交易都要面对**的问题是反向的："给定我的护栏和当前消耗，单笔最多能花多少才不会被拒？"。此前 agent 得读 headroom、手动对所有 USD 限额取 min、再换算——易错。本期直接求解这个上限并指出**绑定约束**
 - 为什么是最重要的：这是把"安全"从被动观测变成**主动的、防爆仓的下单纪律**。agent 不再猜或二分试探自己的限额；一次调用得到"现在最多买 $X TOKEN，再多就撞上 <哪个限额>"
