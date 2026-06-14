@@ -992,6 +992,49 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── aggregator_tune (v58) ─────────────────────────────────
+  // Closes the execution-quality learning loop: turns aggregator_stats'
+  // descriptive per-aggregator quality into the PRESCRIPTIVE optimal
+  // config.aggregator.preferred order + a mode recommendation. Read-only —
+  // returns the recommendation; the agent applies via the `config` tool
+  // (set aggregator.preferred) if it chooses.
+  server.tool(
+    "aggregator_tune",
+    "v58: rank aggregators by REALIZED fill quality into the optimal config.aggregator.preferred order — closing the loop aggregator_stats opens (which only DESCRIBES quality). Reliability-first ranking (a failed fill wastes gas AND misses the trade — worse than a few bps of slippage), bucketed by success rate then median realized slippage as the tiebreak; only aggregators with ≥10 trades are ranked on merit. Returns { ok, recommendedPreferred (best-first — what to set), recommendedOrder (full resolved), currentOrder, changed, ranking[] (per-aggregator rank/successRate/medianSlippageBps/eligible/note), recommendedMode ('best' when the eligible slippage spread ≥15bps and you're on 'first' — racing beats a fixed order; null = keep current), modeReason, eligibleCount, insufficient (true when <2 eligible → keep current) }. Read-only: apply by calling `config` with action=set, path=aggregator.preferred, value=recommendedPreferred. Uses the STORED realized_slippage_bps (no per-trade RPC). Mainly benefits mode='first'; for 'best' the order matters less (it races all). Errors: UNKNOWN_CHAIN.",
+    {
+      since: z.string().optional().describe("ISO date/timestamp or shorthand (7d, 30d). Default 30d ago."),
+      chain: z.string().optional(),
+      account: z.string().optional().describe("HD account label override; defaults to active."),
+      strategy: z.string().optional().describe("Scope to one strategy tag's trades (exact match)."),
+    },
+    async ({ since, chain, account, strategy }) => {
+      try {
+        return ok(
+          await runTool("aggregator_tune", rt.opts, { since, chain, account, strategy }, chain, async () => {
+            const { recentTrades } = await import("../db.js");
+            const { computeAggregatorStats, deriveAggregatorTuning } = await import("../aggregatorStats.js");
+            const { parseDateFilter } = await import("../format.js");
+            const config = rt.getConfig();
+            const sinceIso = since
+              ? (parseDateFilter(since, "since") ?? new Date(Date.now() - 30 * 86_400_000).toISOString())
+              : new Date(Date.now() - 30 * 86_400_000).toISOString();
+            // Tuning rides on stored realized_slippage_bps — no RPC analysis.
+            const rows = recentTrades({ chain, account, since: sinceIso, limit: 10_000, strategy });
+            const report = computeAggregatorStats(rows, [], { since: sinceIso });
+            const tuning = deriveAggregatorTuning({
+              stats: report.byAggregator,
+              currentPreferred: config.aggregator?.preferred ?? [],
+              currentMode: config.aggregator?.mode ?? "first",
+            });
+            return { ok: true, totalTrades: report.totalTrades, since: sinceIso, ...tuning };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── pair_stats (iter634) ──────────────────────────────────
   // Per-pair slippage scorecard. Orthogonal to aggregator_stats — buckets
   // by canonical BASE/QUOTE pair instead of by aggregator. Use to identify

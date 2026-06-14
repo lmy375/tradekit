@@ -8,6 +8,7 @@ import {
   computeAggregatorStats,
   deriveRecommendation,
   deriveRecommendationStructured,
+  deriveAggregatorTuning,
   deriveWarnings,
   estimateRowUsdVolume,
   percentile,
@@ -589,5 +590,120 @@ describe("deriveWarnings", () => {
     const report = computeAggregatorStats(rows, []);
     expect(report.warnings).toBeDefined();
     expect(report.warnings.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ── deriveAggregatorTuning (v58) ───────────────────────────
+
+describe("deriveAggregatorTuning", () => {
+  function stat(overrides: Partial<AggregatorStat>): AggregatorStat {
+    return {
+      aggregator: "kyberswap",
+      tradeCount: 20,
+      successCount: 20,
+      failedCount: 0,
+      pendingCount: 0,
+      successRate: 1,
+      medianSlippageBps: 20,
+      p95SlippageBps: 50,
+      avgSlippageBps: 25,
+      totalUsdVolume: 1000,
+      volumeNotePartial: false,
+      analyzedCount: 20,
+      byVerdict: {},
+      failureReasons: [],
+      ...overrides,
+    };
+  }
+
+  it("ranks reliability-first: a higher success rate beats lower slippage", () => {
+    const t = deriveAggregatorTuning({
+      stats: [
+        // kyberswap: great slippage but flaky fills.
+        stat({ aggregator: "kyberswap", successRate: 0.85, successCount: 17, medianSlippageBps: 5 }),
+        // openocean: slightly worse slippage but reliable.
+        stat({ aggregator: "openocean", successRate: 1.0, medianSlippageBps: 12 }),
+      ],
+      currentPreferred: ["kyberswap", "openocean"],
+      currentMode: "first",
+    });
+    expect(t.recommendedPreferred[0]).toBe("openocean"); // reliability wins
+    expect(t.changed).toBe(true);
+    expect(t.ranking.find((r) => r.aggregator === "openocean")?.rank).toBe(1);
+  });
+
+  it("within the success band, lower median slippage wins the tiebreak", () => {
+    const t = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", successRate: 1.0, medianSlippageBps: 18 }),
+        stat({ aggregator: "openocean", successRate: 0.995, medianSlippageBps: 6 }), // same band, better slippage
+      ],
+      currentPreferred: ["kyberswap"],
+      currentMode: "first",
+    });
+    expect(t.recommendedPreferred[0]).toBe("openocean");
+  });
+
+  it("aggregators below the trade floor are not ranked on merit", () => {
+    const t = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", tradeCount: 20, successRate: 0.9, successCount: 18 }),
+        stat({ aggregator: "openocean", tradeCount: 3, successCount: 3, successRate: 1, medianSlippageBps: 1 }),
+      ],
+      currentPreferred: ["kyberswap", "openocean"],
+      currentMode: "first",
+    });
+    expect(t.insufficient).toBe(true); // only 1 eligible
+    const oo = t.ranking.find((r) => r.aggregator === "openocean")!;
+    expect(oo.eligible).toBe(false);
+    expect(oo.rank).toBeNull();
+    expect(oo.note).toMatch(/< 10/);
+  });
+
+  it("recommends mode 'best' when the eligible slippage spread is wide", () => {
+    const t = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", successRate: 1, medianSlippageBps: 8 }),
+        stat({ aggregator: "openocean", successRate: 1, medianSlippageBps: 30 }), // 22bps spread ≥ 15
+      ],
+      currentPreferred: ["kyberswap"],
+      currentMode: "first",
+    });
+    expect(t.recommendedMode).toBe("best");
+    expect(t.modeReason).toMatch(/races every quote/);
+  });
+
+  it("does NOT recommend a mode change when already on 'best' or spread is narrow", () => {
+    const narrow = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", successRate: 1, medianSlippageBps: 10 }),
+        stat({ aggregator: "openocean", successRate: 1, medianSlippageBps: 14 }), // 4bps < 15
+      ],
+      currentPreferred: ["kyberswap"],
+      currentMode: "first",
+    });
+    expect(narrow.recommendedMode).toBeNull();
+    const onBest = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", successRate: 1, medianSlippageBps: 8 }),
+        stat({ aggregator: "openocean", successRate: 1, medianSlippageBps: 30 }),
+      ],
+      currentPreferred: ["kyberswap"],
+      currentMode: "best",
+    });
+    expect(onBest.recommendedMode).toBeNull(); // already racing
+  });
+
+  it("changed=false when the data already matches the configured order", () => {
+    const t = deriveAggregatorTuning({
+      stats: [
+        stat({ aggregator: "kyberswap", successRate: 1, medianSlippageBps: 8 }),
+        stat({ aggregator: "openocean", successRate: 1, medianSlippageBps: 12 }),
+      ],
+      currentPreferred: ["kyberswap", "openocean"],
+      currentMode: "first",
+    });
+    expect(t.recommendedPreferred).toEqual(["kyberswap", "openocean"]);
+    expect(t.changed).toBe(false);
   });
 });

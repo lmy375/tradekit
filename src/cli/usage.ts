@@ -987,6 +987,13 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
   aggregator stats [--since DATE] [--chain X] [--account L] [--strategy TAG] [--json]
         Per-aggregator quality scorecard: trade count, success rate, median+p95 realized slippage, total volume.
         Recommends a winner when sample sizes support it (>=10 trades, >=10 bps margin)
+  aggregator tune [--since DATE] [--chain X] [--account L] [--strategy TAG] [--apply] [--json]
+        v58: rank aggregators by REALIZED fill quality (success rate, then median slippage)
+        into the optimal config.aggregator.preferred order — closing the loop 'aggregator
+        stats' opens. Reliability-first (a failed fill is worse than a few bps); only
+        aggregators with >=10 trades are ranked on merit. Also recommends mode "best" when
+        the slippage spread is wide enough that racing beats a fixed order. --apply writes
+        config.aggregator.preferred (CLI-only). MCP: aggregator_tune (read-only).
   pairs stats [--since DATE] [--chain X] [--account L] [--strategy TAG] [--limit N (default 30)] [--json]
         Per-token-pair slippage scorecard: which pairs give bad fills (orthogonal to aggregator stats — averaging over routes vs. averaging over pairs surfaces different signals)
   slippage suggest <base> <quote> [--chain X] [--account L] [--lookback-days N] [--json]

@@ -437,6 +437,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "health",
     // Iter623: aggregator quality stats.
     "aggregator_stats",
+    // v58: data-driven aggregator routing tuning.
+    "aggregator_tune",
     // Iter629: unified token report.
     "token_info",
     // Iter634: per-pair slippage stats.

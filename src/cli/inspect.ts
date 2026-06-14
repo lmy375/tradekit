@@ -865,6 +865,83 @@ export async function aggregatorStatsCommand(flags: Record<string, string>) {
   }
 }
 
+// ── aggregator tune (v58) ────────────────────────────────────
+//
+// Close the execution-quality learning loop: rank aggregators by realized
+// fill quality (success rate + median slippage from the STORED
+// realized_slippage_bps — no RPC) into the optimal config.aggregator.preferred
+// order, and recommend mode="best" when the slippage spread warrants racing.
+// --apply writes the order (CLI-only config mutation, like every config set).
+export async function aggregatorTuneCommand(flags: Record<string, string>) {
+  const config = loadConfig();
+  const logger = makeCliLogger(flags);
+  try {
+    const account = flags["account"] ?? activeWalletLabel();
+    const since = flags["since"]
+      ? (parseDateFilter(flags["since"], "since") ?? new Date(Date.now() - 30 * 86_400_000).toISOString())
+      : new Date(Date.now() - 30 * 86_400_000).toISOString();
+
+    const { recentTrades } = await import("../db.js");
+    const rows = recentTrades({ chain: flags["chain"], account, since, limit: 10_000, strategy: flags["strategy"] });
+
+    // Tuning rides on the STORED realized_slippage_bps (iter641) — no
+    // per-trade RPC analysis needed; pass [] for the legacy-analysis arg.
+    const { computeAggregatorStats, deriveAggregatorTuning } = await import("../aggregatorStats.js");
+    const report = computeAggregatorStats(rows, [], { since });
+    const currentPreferred = config.aggregator?.preferred ?? [];
+    const currentMode = config.aggregator?.mode ?? "first";
+    const tuning = deriveAggregatorTuning({ stats: report.byAggregator, currentPreferred, currentMode });
+
+    const applied = flags["apply"] === "true" && tuning.changed && !tuning.insufficient;
+    if (applied) {
+      const { setConfigPath, saveConfig } = await import("../config.js");
+      const next = setConfigPath(config, "aggregator.preferred", tuning.recommendedPreferred);
+      saveConfig(next, { source: "cli:aggregator tune --apply" });
+    }
+
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...tuning, applied });
+      return;
+    }
+
+    const sinceStr = new Date(since).toISOString().slice(0, 10);
+    console.log(`Aggregator tuning — ${report.totalTrades} trade${report.totalTrades === 1 ? "" : "s"} since ${sinceStr}`);
+    console.log("");
+    console.log(`  Current preferred: ${currentPreferred.length > 0 ? currentPreferred.join(", ") : "(none — default order)"}  ·  mode: ${currentMode}`);
+    console.log("");
+    if (tuning.ranking.length === 0) {
+      console.log("  No aggregator trade history in the window. Use --since to widen the lookback.");
+      return;
+    }
+    console.log("  Ranking (reliability-first, slippage tiebreak):");
+    for (const r of tuning.ranking) {
+      const prefix = r.rank != null ? `  ${r.rank}.` : "  · ";
+      console.log(`  ${prefix} ${r.aggregator.padEnd(11)} ${r.note}`);
+    }
+    console.log("");
+    if (tuning.insufficient) {
+      console.log(`  Recommendation: not enough evidence (need ≥2 aggregators with ≥${10} trades) — keep the current order.`);
+    } else {
+      console.log(`  Recommended preferred: ${tuning.recommendedPreferred.join(", ")}${tuning.changed ? "  [CHANGED]" : "  (unchanged — already optimal)"}`);
+    }
+    if (tuning.recommendedMode) {
+      console.log(`  Recommended mode: ${tuning.recommendedMode} — ${tuning.modeReason}`);
+    }
+    if (applied) {
+      console.log("");
+      console.log(`  ✓ Applied: config.aggregator.preferred = [${tuning.recommendedPreferred.join(", ")}]`);
+    } else if (tuning.changed && !tuning.insufficient) {
+      console.log("");
+      console.log(`  → Apply with: tradekit aggregator tune --apply   (writes config.aggregator.preferred)`);
+      if (tuning.recommendedMode) {
+        console.log(`     For mode: tradekit config set aggregator.mode ${tuning.recommendedMode}`);
+      }
+    }
+  } finally {
+    logger.close();
+  }
+}
+
 // ── pairs stats (iter634) ────────────────────────────────────
 //
 // Per-pair slippage scorecard. Orthogonal to iter623 aggregator stats —

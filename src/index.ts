@@ -282,10 +282,18 @@ async function main() {
       // slippage + success rate from the trade history. Helps operators
       // pick the right aggregator default.
       case "aggregator": {
-        if (positional[1] !== "stats") {
+        const sub = positional[1];
+        if (sub === "tune") {
+          // v58: rank aggregators by realized fill quality → optimal
+          // config.aggregator.preferred order; --apply writes it.
+          const { aggregatorTuneCommand } = await import("./cli/inspect.js");
+          await aggregatorTuneCommand(flags);
+          break;
+        }
+        if (sub !== "stats") {
           throw new (await import("./errors.js")).ToolError(
             "INVALID_PARAMS",
-            "Usage: tradekit aggregator stats [--since DATE] [--account L] [--chain X] [--json]",
+            "Usage: tradekit aggregator stats [--since DATE] [--account L] [--chain X] [--json]\n       tradekit aggregator tune [--since DATE] [--apply] [--json]",
           );
         }
         const { aggregatorStatsCommand } = await import("./cli/inspect.js");

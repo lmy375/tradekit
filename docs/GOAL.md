@@ -33,6 +33,22 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 58 — 聚合器路由调优（aggregator tuning — close the execution-quality learning loop）** ✅
+- **转向产品的字面核心**：交易执行质量（路由 → 成交质量 → 每笔交易省下的真实滑点钱），不是又一个观察面板。这是连续 8 个迭代后第一次碰执行本身
+- 开着的学习闭环：`aggregatorStats`（iter623）**描述**每个聚合器的成交质量，`deriveRecommendation` **点名**单个最佳，`health` 的 `aggregator_underperformer` **提醒**运营商重排 `config.aggregator.preferred`——但把这份"已实现成交"数据变成**实际路由配置**（完整排序 + 一键应用）的那块一直缺失。运营商得手动改
+- 新增 `deriveAggregatorTuning()`（纯函数，aggregatorStats.ts）：按已实现成交质量把聚合器排成最优 `preferred` 顺序
+  - **可靠性优先排序**：失败成交浪费 gas **且**错过交易——严格比几个 bps 滑点更糟。先按成功率分桶（TUNE_SUCCESS_BAND=2% 带，避免噪音重排路由），桶内按中位已实现滑点 tiebreak
+  - 只有 ≥ TUNE_MIN_TRADES（10）笔的聚合器才按实绩排名；其余按当前/默认顺序垫后（无证据→无意见）
+  - **mode 推荐**：eligible 聚合器的滑点跨度 ≥ TUNE_MODE_SPREAD_BPS（15bps）且当前在 "first" → 推荐 "best"（逐笔竞价取最便宜成交，胜过押注固定顺序）
+  - 复用既有导出的 `resolveAggregatorOrder`（preferred + 默认尾部 dedup）算 current/recommended 完整解析顺序
+- **零 RPC**：`computeAggregatorStats` 优先用 STORED `realized_slippage_bps`（iter641），所以 tune 传 `analyses=[]`，纯读 trades 表算中位滑点——快且离线
+- Surfaces：CLI `aggregator tune [--since] [--apply] [--json]`（排名 + 推荐顺序 + mode 建议；`--apply` 写 config.aggregator.preferred，CLI-only 配置变更，与所有 config set 一致）+ MCP `aggregator_tune`（只读返回推荐；agent 想应用就调 config 工具——保留配置写入的审慎边界）
+- 与既有的分工：`aggregator stats` 描述性（每聚合器质量），`aggregator tune` 规定性（最优顺序 + 动作）。主要惠及 mode="first"；"best" 模式顺序意义小（反正全竞价），故 tune 在跨度大时主动推 first→best
+- 测试覆盖：`aggregatorStats.test.ts` +6（可靠性优先：高成功率压低滑点 / 同桶内低滑点 tiebreak / 低于交易门槛不按实绩排 + insufficient / 跨度大推 best / 窄跨度或已 best 不推 / 数据已匹配则 changed=false）
+- MCP_TOOLS 不变量：`aggregator_tune` 加入 iter589/iter877 set
+- 向后兼容：纯加法——无 schema migration、无现有行为改动；tune 默认 dry-run（只 --apply 才写配置）
+- v1 限制：排名用历史已实现滑点（过去不保证未来，但 30d 窗口对稳定路由够用）；mode 应用仍需运营商手动 `config set aggregator.mode`（--apply 只写 preferred 顺序——改 mode 是更大决定，留给显式确认）；只覆盖有 stored realized_slippage_bps 的成交（legacy 行无 → 该行不计入中位，与 aggregator stats 同款）
+
 **Phase 57 — 安全态势进 cron digest（standing posture in the digest verdict）** ✅
 - 对称完成 v55 在交互式 `health` 做的事——把**标准安全态势**接进 `digest`，即 **cron 监控面**。这是无人值守自主 agent 最关键的监控路径（`--summary` 单行 + `--strict` 退出码 + `--watch` JSONL 流）：运营商不盯着看，靠 cron digest + alert
 - 缺口：digest 已有 `SafetyEventsSection`（统计窗口内**发生**了什么——drawdown 触发、budget block、honeypot block）+ verdict（healthy/attention/critical），但 verdict 对**当下站立的危险**完全盲——配置 EXPOSED（safety 关掉 / 根本没有 USD 上限）或运行时逼近某个会停掉交易的限额。一个 cron digest 可以报 "healthy" 而钱包大开

@@ -21,6 +21,7 @@
 import type { TradeRow } from "./db.js";
 import { failureReasonHistogram } from "./db.js";
 import type { AnalyzedTrade } from "./tradeAnalysis.js";
+import { resolveAggregatorOrder, type ProviderName } from "./aggregator.js";
 
 export interface AggregatorStat {
   /** Aggregator name as stored in trades.aggregator (e.g. "kyberswap"). */
@@ -412,6 +413,149 @@ export function deriveWarnings(stats: readonly AggregatorStat[]): string[] {
 
 export function deriveRecommendation(stats: readonly AggregatorStat[]): string | undefined {
   return deriveRecommendationStructured(stats)?.message;
+}
+
+// ── v58: aggregator tuning — close the execution-quality learning loop ──
+//
+// aggregatorStats DESCRIBES per-aggregator fill quality; deriveRecommendation
+// NAMES the single best one; health NUDGES the operator to reorder
+// config.aggregator.preferred. The missing piece was turning that realized-
+// fill data into the actual routing config — a full ranked `preferred` order
+// + a mode recommendation, applyable in one step. This is that piece.
+
+/** Min trades before an aggregator's quality is trusted for ranking;
+ *  below this it's appended in the fallback order, not ranked on merit. */
+export const TUNE_MIN_TRADES = 10;
+/** Median-slippage spread (bps) across eligible aggregators above which
+ *  racing every quote ("best" mode) beats betting on a fixed order. */
+export const TUNE_MODE_SPREAD_BPS = 15;
+/** Success-rate band width (fraction): aggregators within this band are
+ *  treated as tied on reliability, so median slippage breaks the tie.
+ *  Prevents a 0.5%-success-rate noise difference from dominating routing. */
+export const TUNE_SUCCESS_BAND = 0.02;
+
+const KNOWN_PROVIDERS: ProviderName[] = ["kyberswap", "openocean", "0x", "1inch"];
+
+export interface AggregatorRankEntry {
+  aggregator: string;
+  /** 1-based rank among ELIGIBLE aggregators; null when ineligible. */
+  rank: number | null;
+  successRate: number | null;
+  medianSlippageBps: number | null;
+  tradeCount: number;
+  analyzedCount: number;
+  eligible: boolean;
+  note: string;
+}
+
+export interface AggregatorTuning {
+  /** Aggregators we have evidence for, best-first — what `--apply` writes
+   *  to config.aggregator.preferred (routing appends the rest by default). */
+  recommendedPreferred: string[];
+  /** Full resolved order (recommendedPreferred + default tail), for display. */
+  recommendedOrder: string[];
+  /** The current resolved order (resolveAggregatorOrder of the config). */
+  currentOrder: string[];
+  /** recommendedOrder differs from currentOrder. */
+  changed: boolean;
+  ranking: AggregatorRankEntry[];
+  /** "best" when the eligible slippage spread warrants racing and the
+   *  operator is on "first"; null = keep the current mode. */
+  recommendedMode: "first" | "best" | null;
+  modeReason: string | null;
+  eligibleCount: number;
+  /** True when there isn't enough evidence (< 2 eligible) to recommend a
+   *  reorder — the recommendation then equals the current config. */
+  insufficient: boolean;
+}
+
+/**
+ * Pure: rank aggregators by realized fill quality into an optimal
+ * `preferred` order. Ranking is reliability-first (a failed fill wastes
+ * gas AND misses the trade — strictly worse than a few bps of slippage),
+ * then slippage as the tiebreak:
+ *   1. success rate, bucketed into TUNE_SUCCESS_BAND bands (so noise
+ *      doesn't reorder routing), higher first;
+ *   2. within a band, lower median realized slippage first.
+ * Only aggregators with ≥ TUNE_MIN_TRADES are ranked on merit; the rest
+ * keep the current/default order behind them (no evidence → no opinion).
+ */
+export function deriveAggregatorTuning(args: {
+  stats: readonly AggregatorStat[];
+  currentPreferred: readonly string[];
+  currentMode: "first" | "best";
+}): AggregatorTuning {
+  const currentPreferred = args.currentPreferred.filter((p): p is ProviderName =>
+    (KNOWN_PROVIDERS as string[]).includes(p),
+  ) as ProviderName[];
+  const currentOrder = resolveAggregatorOrder(currentPreferred, []);
+
+  const byName = new Map(args.stats.map((s) => [s.aggregator, s]));
+  const eligible = args.stats.filter(
+    (s) => (KNOWN_PROVIDERS as string[]).includes(s.aggregator) && s.tradeCount >= TUNE_MIN_TRADES && s.successRate != null,
+  );
+
+  // Reliability-first, slippage-tiebreak ordering.
+  const band = (rate: number) => Math.round(rate / TUNE_SUCCESS_BAND);
+  const ranked = [...eligible].sort((a, b) => {
+    const bandDiff = band(b.successRate ?? 0) - band(a.successRate ?? 0);
+    if (bandDiff !== 0) return bandDiff;
+    const aSlip = a.medianSlippageBps ?? Infinity;
+    const bSlip = b.medianSlippageBps ?? Infinity;
+    return aSlip - bSlip;
+  });
+
+  const recommendedPreferred = ranked.map((s) => s.aggregator);
+  const recommendedOrder =
+    recommendedPreferred.length > 0
+      ? resolveAggregatorOrder(recommendedPreferred as ProviderName[], [])
+      : currentOrder;
+  const changed = recommendedOrder.join(",") !== currentOrder.join(",");
+  const insufficient = ranked.length < 2;
+
+  // Ranking detail (eligible ranked first, then the rest noted).
+  const rankOf = new Map(ranked.map((s, i) => [s.aggregator, i + 1]));
+  const ranking: AggregatorRankEntry[] = KNOWN_PROVIDERS.filter((p) => byName.has(p)).map((p) => {
+    const s = byName.get(p)!;
+    const eligibleHere = ranked.includes(s);
+    return {
+      aggregator: p,
+      rank: rankOf.get(p) ?? null,
+      successRate: s.successRate,
+      medianSlippageBps: s.medianSlippageBps,
+      tradeCount: s.tradeCount,
+      analyzedCount: s.analyzedCount,
+      eligible: eligibleHere,
+      note: eligibleHere
+        ? `${((s.successRate ?? 0) * 100).toFixed(1)}% success · ${s.medianSlippageBps != null ? `${s.medianSlippageBps.toFixed(1)}bps median` : "slippage n/a"}`
+        : `only ${s.tradeCount} trade(s) (< ${TUNE_MIN_TRADES}) — not ranked on merit`,
+    };
+  });
+
+  // Mode: a wide slippage spread means a fixed order leaves money on the
+  // table — racing (best) captures the cheapest fill per trade.
+  let recommendedMode: AggregatorTuning["recommendedMode"] = null;
+  let modeReason: string | null = null;
+  const medians = ranked.map((s) => s.medianSlippageBps).filter((v): v is number => v != null);
+  if (medians.length >= 2) {
+    const spread = Math.max(...medians) - Math.min(...medians);
+    if (args.currentMode === "first" && spread >= TUNE_MODE_SPREAD_BPS) {
+      recommendedMode = "best";
+      modeReason = `eligible aggregators span ${spread.toFixed(1)}bps of median slippage (≥ ${TUNE_MODE_SPREAD_BPS}bps) — mode "best" races every quote and takes the cheapest fill per trade instead of betting on a fixed order.`;
+    }
+  }
+
+  return {
+    recommendedPreferred,
+    recommendedOrder,
+    currentOrder,
+    changed,
+    ranking,
+    recommendedMode,
+    modeReason,
+    eligibleCount: ranked.length,
+    insufficient,
+  };
 }
 
 /**
