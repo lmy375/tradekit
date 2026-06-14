@@ -2814,6 +2814,30 @@ export async function priceStatsCommand(flags: Record<string, string>) {
   console.log("Stats are in-memory only and reset on process restart. Use --reset to clear within this process.");
 }
 
+// v65: open-position review — cost basis, unrealized P&L, holding period
+// + projected tax term (exit-timing context). The mode defaults to real;
+// --paper reviews the virtual book.
+export async function openPositionsCommand(flags: Record<string, string>) {
+  const mode = (flags["paper"] === "true" ? "paper" : "real") as "real" | "paper";
+  const logger = makeCliLogger(flags);
+  try {
+    const { gatherOpenPositions, renderOpenPositions } = await import("../openPositions.js");
+    const report = await gatherOpenPositions({
+      mode,
+      account: flags["account"],
+      chain: flags["chain"],
+      strategy: flags["strategy"],
+    });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...report });
+    } else {
+      console.log(renderOpenPositions(report));
+    }
+  } finally {
+    logger.close();
+  }
+}
+
 // v64: recent price range / trend / position — entry-timing context the
 // spot lookup can't give. Reuses the backtester's CoinGecko series fetch.
 async function priceContextCommand(flags: Record<string, string>, positional: string[]) {

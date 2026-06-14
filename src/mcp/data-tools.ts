@@ -443,6 +443,34 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── open_positions (v65) ──────────────────────────────────
+  // Exit-decision context: per open position, cost basis + unrealized P&L
+  // + holding period + the tax term it WOULD be if sold now. The exit
+  // counterpart to price_context (entry timing); completes v60's realized-
+  // gains holding period for OPEN positions.
+  server.tool(
+    "open_positions",
+    "v65: open-position review for EXIT timing. For each currently-held position returns cost basis, current value, unrealized P&L (abs + %), the weighted-average acquisition date, holding days, and — the actionable tax signal — projectedTerm ('short' / 'long' / 'untracked' if sold NOW) + daysToLongTerm (how long until short-term flips to long-term). Plus a summary { totalCostBasisQuote, totalValueQuote, totalUnrealizedQuote, unpricedCount, approachingLongTerm (short-term positions within 30d of long-term) }. Use to decide WHEN to exit: 'WETH is 340d held, 25d to long-term rates — wait' is a concrete decision this surfaces and nothing else did. The exit counterpart to price_context (entry timing) and the open-position completion of the gains report's realized holding period. Runs the same cost-basis walker every P&L surface shares; the strategy tag is stripped so positions are PORTFOLIO-level (total per (chain,token)) unless `strategy` scopes it. Deterministic given live marks. mode='real' (success trades) default; 'paper' reviews the virtual book. Errors: none typical (empty → no positions).",
+    {
+      mode: z.enum(["real", "paper"]).optional().describe("Default real (success trades). paper reviews the virtual book."),
+      account: z.string().optional(),
+      chain: z.string().optional(),
+      strategy: z.string().optional().describe("Scope to one strategy tag's positions (else portfolio-level across all)."),
+    },
+    async ({ mode, account, chain, strategy }) => {
+      try {
+        return ok(
+          await runTool("open_positions", rt.opts, { mode, account, chain, strategy }, chain, async () => {
+            const { gatherOpenPositions } = await import("../openPositions.js");
+            return { ok: true, ...(await gatherOpenPositions({ mode: mode ?? "real", account, chain, strategy, config: rt.getConfig() })) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── portfolio_snapshot / portfolio_history / portfolio_diff (iter618) ──
   // Persist + compare portfolio states over time. PnL captures realized trades
   // only; these capture the FULL position view (priced + unpriced, all

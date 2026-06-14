@@ -33,6 +33,18 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 65 — 持仓复盘 / 退出时机（open-position review — cost basis, unrealized, holding period + projected tax term）** ✅
+- **退出决策的对位**：v64 price context 给**入场**时机，v60 给**已实现**收益的持有期+短/长期；本期补上 **OPEN 持仓** 的持有期+若现在卖的税务 term——退出时机。三者凑齐：入场（v64）、持有中（v65）、平仓后（v60）
+- 缺口：agent 持有仓位，要决定**何时退出**（止盈/止损/等长期税率），需要每个仓位的：成本基准、当前价值、未实现盈亏（绝对+%）、持有多久、**若现在卖是短期还是长期**、距离长期还差几天。此前无任何 surface 给这个——"WETH 已持 340 天，再 25 天转长期税率，等等" 这种具体退出决策无从下手
+- 复用既有：成本基准走 **同一个** cost-basis walker（`computePaperPnlMtm`，real 经 v50 的 `toMtmRows`）——数字与所有 P&L surface 一致。v60 已在 walker 的 `PosAcc.acquiredAtMs` 追踪加权平均取得日；本期把它暴露到 OPEN 持仓输出（`PaperPositionEntry.acquiredAt`，纯加法）
+- 新模块 `openPositions.ts`：`gatherOpenPositions(mode, ...)` → 每个 OPEN 持仓 { costBasis, value, unrealized(+%), acquiredAt, holdingDays, projectedTerm（short/long/untracked if sold now）, daysToLongTerm } + 汇总 { totalCostBasis/Value/Unrealized, unpricedCount, approachingLongTerm（短期且距长期 ≤30d 的计数）}。strategy tag 在 walk 前剥离 → 持仓是**组合级**（每 (chain,token) 合并你所有该 token 的买入），传 strategy 则按策略 scope
+- 确定性 + 可验证：mark fetcher 注入（测试用确定价；生产用 defaultPaperPriceFetcher live）；compute 对种子 paper 成交确定
+- Surfaces：CLI `positions [--paper] [--strategy]` + MCP `open_positions`。与既有区分：holdings=余额，pnl=已实现+整体未实现，portfolio=多账户聚合，`positions`=**逐仓退出上下文**（持有期+税务 term）
+- 测试覆盖：`openPositions.test.ts` 7 case（>365d→long 无 days-to-long + 未实现+%；<365d→short + days-to-long；approaching 窗口计数；多次买入加权平均取得日混合；全平仓排除；无 mark 价 unpriced 不崩、成本/持有期仍精确；组合汇总）
+- MCP_TOOLS 不变量：`open_positions` 加入 iter589/iter877 set
+- 向后兼容：纯加法——`PaperPositionEntry.acquiredAt` 新字段现有消费者忽略；新模块/CLI/MCP；3295 测试全绿、零回归
+- v1 限制：持有期/term 沿用 v60 的加权平均取得日近似（非 lot-based FIFO，已披露）；real 模式只看 success 成交的 tracked 仓位（deposit-seeded 的 untracked 部分不计入——与成本基准模型一致）；mark 价取当下 spot（未实现是快照，非历史）
+
 **Phase 64 — 价格上下文（price context — "where does the price sit, which way is it going?"）** ✅
 - **转向最少被服务的支柱：行情/发现（market data）**——agent 决策漏斗的前端"该不该/何时交易"。前面大量迭代在 safety/reliability/accounting；这次服务 agent 的核心市场决策
 - 缺口：agent 有**现价**（check_price）和**发现**（trending 按 volume/liquidity），但没有**价格上下文**——当前价在近期区间的哪个位置、趋势方向、波动多大。"在 7d 高点附近买" vs "在 7d 低点附近买"是天差地别的决策，而 agent 此前无从判断。仅有的历史序列 `fetchPriceSeries` 埋在 backtest 里、只给回测用

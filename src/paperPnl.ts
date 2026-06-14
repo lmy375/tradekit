@@ -97,6 +97,11 @@ export interface PaperPositionEntry {
   /** Quote received for the untracked portion of sells. Counted in the
    *  legacy quoteReceived cash flow but NOT in realizedQuote. */
   untrackedSellQuote: number;
+  /** v65: weighted-average acquisition time (ISO) of the CURRENTLY-held
+   *  base — the same v60 blend the realization records use. Null when the
+   *  position is flat. Lets consumers derive a holding period + projected
+   *  short/long-term tax term for OPEN positions (tax-aware exit timing). */
+  acquiredAt: string | null;
 }
 
 /** Per-strategy MTM roll-up. SUPERSET of PaperPnlSummary — every legacy
@@ -411,6 +416,7 @@ export async function computePaperPnlMtm(
         lastTradeAt: acc.lastTradeAt,
         untrackedSellBase: acc.untrackedSellBase,
         untrackedSellQuote: acc.untrackedSellQuote,
+        acquiredAt: acc.acquiredAtMs != null && acc.amount > FLAT_EPSILON ? new Date(acc.acquiredAtMs).toISOString() : null,
       });
     }
 
