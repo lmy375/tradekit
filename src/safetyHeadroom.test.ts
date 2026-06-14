@@ -31,6 +31,7 @@ const seams = {
   drawdownLookup: () => null as DrawdownStateRow | null,
   lastTradeAtFn: () => new Map<string, string>(),
   fillRowsLookup: () => [] as FillRowLite[],
+  strategyRealizedFn: () => [] as Array<{ strategy: string; realizedUsd: number }>,
 };
 
 const head = (safety: Partial<Config["safety"]>, over: Record<string, unknown> = {}) =>
@@ -110,6 +111,57 @@ describe("drawdown distance-to-trip", () => {
     const e = entry(head(ddCfg, { drawdownLookup: () => st }), "drawdown")!;
     expect(e.status).toBe("tripped");
     expect(e.detail).toMatch(/TRIPPED/);
+  });
+});
+
+// v99: the loss breaker gains the same early-warning headroom every other
+// limit already has — it was the only silent binary cliff.
+describe("strategy loss breaker distance-to-trip", () => {
+  const lossCfg = { maxStrategyLossUsd: 500 };
+
+  it("a strategy approaching the loss cap flags as approaching with room left", () => {
+    // realized −$420 of a −$500 cap → 84% > APPROACHING_PCT.
+    const r = head(lossCfg, { strategyRealizedFn: () => [{ strategy: "dca-eth", realizedUsd: -420 }] });
+    const e = entry(r, "strategyLoss:dca-eth")!;
+    expect(e.used).toBeCloseTo(420, 6);
+    expect(e.remaining).toBeCloseTo(80, 6);
+    expect(e.utilizationPct).toBeCloseTo(84, 6);
+    expect(e.status).toBe("approaching");
+    expect(e.detail).toMatch(/\$80\.00 of room/);
+  });
+
+  it("a strategy past the cap flags as tripped (buys blocked)", () => {
+    const r = head(lossCfg, { strategyRealizedFn: () => [{ strategy: "grid", realizedUsd: -650 }] });
+    const e = entry(r, "strategyLoss:grid")!;
+    expect(e.status).toBe("tripped");
+    expect(e.detail).toMatch(/TRIPPED.*new BUYS blocked/);
+  });
+
+  it("a profitable (or flat) strategy gets NO entry — full headroom, no noise", () => {
+    const r = head(lossCfg, {
+      strategyRealizedFn: () => [
+        { strategy: "winner", realizedUsd: 300 },
+        { strategy: "flat", realizedUsd: 0 },
+        { strategy: "loser", realizedUsd: -120 },
+      ],
+    });
+    expect(entry(r, "strategyLoss:winner")).toBeUndefined();
+    expect(entry(r, "strategyLoss:flat")).toBeUndefined();
+    expect(entry(r, "strategyLoss:loser")).toBeDefined(); // only the losing one
+  });
+
+  it("no entry at all when the breaker is unconfigured", () => {
+    const r = head({}, { strategyRealizedFn: () => [{ strategy: "x", realizedUsd: -900 }] });
+    expect(r.entries.some((e) => e.key.startsWith("strategyLoss:"))).toBe(false);
+  });
+
+  it("an approaching loss breaker can be the binding constraint", () => {
+    // loss breaker at 90% beats a daily cap at 50%.
+    const r = head(
+      { maxStrategyLossUsd: 500, dailyUsdLimit: 1000 },
+      { dailyVolumeFn: () => 500, strategyRealizedFn: () => [{ strategy: "dca", realizedUsd: -450 }] },
+    );
+    expect(r.binding?.key).toBe("strategyLoss:dca");
   });
 });
 

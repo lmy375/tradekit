@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 99 — 止损熔断也有提前预警：唯一的"静默悬崖"补上 headroom（strategy loss-breaker headroom — the last safety limit with no early warning gets one）** ✅
+- **补上唯一一个没有提前预警的安全限额**：safetyHeadroom（v53）的整个存在意义就是"让自主 agent 知道自己离每条红线还有多远，从而提前 size 动作"——它追踪每日 USD、单笔、策略预算、回撤熔断、限频、持仓上限，全都有 `approaching`（≥80%）预警。唯独 v84 的**策略已实现止损熔断**（maxStrategyLossUsd）不在其中：一个策略一路"正常"，直到某笔 buy 突然被 STRATEGY_LOSS_BREAKER_TRIPPED 拦下——**静默二元悬崖**，与产品"提前预警"的哲学相悖
+- 为什么是最重要的：止损熔断是真金白银的最后一道自动护栏。其他所有限额都能"看见它逼近"，唯独这一道不能，意味着 agent 无法在被拦之前主动停手——它会一直撞墙、被拒、重试，而不是"还剩 \$80 就触发，我这个策略先别买了"。把它接进 headroom，让最该提前看见的安全信号（正在亏损、逼近熔断）变得可预见，是 headroom 模块覆盖度的收尾，也直接服务"安全自主交易"
+- 实现（复用熔断同源 realized P&L，零分歧）：`gatherSafetyHeadroom` 在 `maxStrategyLossUsd` 配置时，对每个**正在亏损**的策略（realizedUsd<0；盈利的满 headroom、不出条目避免噪声）发一条 HeadroomEntry——used=已实现亏损、limit=cap、util=loss/cap、status=tripped（realized≤−cap）否则 classify（80% approaching）。realized 来源**直接复用熔断 enforce 的 `gatherStrategyComparison`**（注入式 seam 供测试），headroom 永远不会和真实闸门给出不同数字。real 模式（对齐 live gate）
+- 自动下游收益：headroom 的 `binding`（最紧约束）喂给 cron digest 的 posture 行（gatherPosture）+ `safety headroom` CLI + MCP `safety_headroom`——一处接入，三处提前预警。逼近熔断的策略现在会成为 digest 的 binding 约束浮到运营商眼前
+- 测试覆盖：safetyHeadroom.test.ts +5（approaching 带剩余额度 / 过 cap→tripped 且文案含 buys blocked / 盈利或持平策略无条目只有亏损的出 / 未配置无条目 / 逼近的止损熔断能成为 binding 约束）；3513 测试全绿（+5）；CLI 已烟测；MCP 描述同步
+- 向后兼容：纯加法——仅在 maxStrategyLossUsd 配置且策略亏损时新增条目；注入式 seam 保持测试纯净；复用既有 realized 源（零阈值漂移）；不改熔断 enforce 逻辑
+
 **Phase 98 — detect→respond：偏离的已晋升策略给出结构化的"该怎么办"（promote-outcome recommendedActions — close the trust pipeline's final gap from detection to the protective response）** ✅
 - **检测到了，然后呢？**：信任管道的检测端已经很完整——v50 promote-outcome 判定 diverged/underperforming，v95 让它进 cron digest 主动暴露。但检测到"这个已晋升策略在实盘亏钱/低于纸面承诺"之后，报告只给 `verdict` + `reasons[]`，**没有任何结构化的响应指引**。运营商凭直觉知道"该 demote 或砍掉"，但 **agent 经 MCP 拿到 `verdict: "diverged"` 却不知道下一步调什么工具**——这正是产品到处都有 `recommendedActions[]`（每个 MCP 工具都带 next_actions）的原因，唯独最危险结局的检测器没有
 - 为什么是最重要的：托管真钱的 agent，最危险的不是看不见问题，而是**看见了却不知道怎么安全响应**。"diverged = 实盘正在亏钱"的正确响应是立刻 demote 回 paper——停掉真钱交易、同时保留策略状态（HWM/计数器）以便观察或修复后重新晋升。把这个响应**结构化、内联进检测结果**，让 agent 不止知道"出事了"，而是知道"调 playbook_promote {to:'paper', yes:true} 止血"。这收尾了信任管道的最后一环：paper→promote-check→promote→live→outcome→**respond**

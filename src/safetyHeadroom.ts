@@ -35,6 +35,7 @@ import {
 } from "./db.js";
 import { computeBudgetConsumption } from "./strategyBudget.js";
 import { netPosition, capMatchesTag, defaultFillRows, type FillRowLite, type PositionCapRule } from "./positionCaps.js";
+import { gatherStrategyComparison } from "./strategyCompare.js";
 
 /** Utilization at/above this fraction (%) flags a limit as approaching. */
 export const APPROACHING_PCT = 80;
@@ -92,6 +93,10 @@ export function gatherSafetyHeadroom(args: {
   drawdownLookup?: (scope: string) => DrawdownStateRow | null;
   lastTradeAtFn?: () => Map<string, string>;
   fillRowsLookup?: (tag: string, paper: boolean) => FillRowLite[];
+  /** v99: realized P&L per strategy tag for the loss-breaker headroom.
+   *  Defaults to the SAME source the breaker enforces against
+   *  (gatherStrategyComparison), so headroom can't disagree with the gate. */
+  strategyRealizedFn?: () => Array<{ strategy: string; realizedUsd: number }>;
 } = {}): SafetyHeadroomReport {
   const config = args.config ?? loadConfig();
   const s = config.safety;
@@ -213,6 +218,43 @@ export function gatherSafetyHeadroom(args: {
           ? `current drawdown ${currentDd.toFixed(1)}% of the ${maxDd}% trip threshold · ${Math.max(0, maxDd - currentDd).toFixed(1)}pp of room`
           : `enabled (trips at −${maxDd}%); no portfolio peak observed yet`,
     });
+  }
+
+  // ── v99: per-strategy realized-LOSS breaker (v84): distance from each
+  // losing strategy's realized loss to the −maxStrategyLossUsd trip. The ONLY
+  // safety limit that was previously a silent binary cliff — every other limit
+  // here warns at 80%, but a strategy stayed "fine" until a buy was suddenly
+  // blocked. Now an agent can see the trip coming and stop buying first. Reuses
+  // the EXACT realized source the breaker enforces against (no divergence). One
+  // entry per strategy carrying a realized LOSS (profitable strategies have full
+  // headroom — not worth the noise). Real-mode only, mirroring the live gate.
+  if (s.maxStrategyLossUsd != null && s.maxStrategyLossUsd > 0) {
+    const cap = s.maxStrategyLossUsd;
+    const strategies =
+      args.strategyRealizedFn?.() ??
+      gatherStrategyComparison({ mode: "real", account }).strategies.map((x) => ({
+        strategy: x.strategy,
+        realizedUsd: x.realizedUsd,
+      }));
+    for (const { strategy: tag, realizedUsd } of strategies) {
+      if (realizedUsd >= 0) continue; // no realized loss → full headroom, skip
+      const lossUsd = -realizedUsd;
+      const util = (lossUsd / cap) * 100;
+      const tripped = realizedUsd <= -cap;
+      entries.push({
+        key: `strategyLoss:${tag}`,
+        label: "Strategy loss breaker",
+        scope: `strategy ${tag}`,
+        limit: cap,
+        used: lossUsd,
+        remaining: Math.max(0, cap - lossUsd),
+        utilizationPct: util,
+        status: tripped ? "tripped" : classify(util),
+        detail: tripped
+          ? `TRIPPED — realized −$${lossUsd.toFixed(2)} past the −$${cap} cap; new BUYS blocked (sells allowed to exit). Pause/cut the strategy, or raise safety.maxStrategyLossUsd if intentional.`
+          : `realized −$${lossUsd.toFixed(2)} of the −$${cap} loss cap · $${Math.max(0, cap - lossUsd).toFixed(2)} of room before new buys block`,
+      });
+    }
   }
 
   // ── rate limit: time since the account's last trade vs the minimum ──
