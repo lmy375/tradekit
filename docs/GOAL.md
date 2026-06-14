@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 105 — 按风险定仓：止损会亏多少决定买多少（risk-based position sizing — size by risk budget ÷ stop distance, clamped by the safety ceiling）** ✅
+- **补上"该买多少"这个交易核心原语（有效性支柱，非又一个安全护栏）**：v70 的 `trade_sizing` 回答"安全策略允许我最多买多少"（硬上限）。但缺了纪律交易每笔都要问的正交问题——"为了让止损命中时只亏掉我的风险预算，我应该买多少？"。`recommendedUsd = riskUsd ÷ (止损距离%)`（风险 \$50、止损 5% → \$1000：\$1000 跌 5% 正好亏 \$50）。这是把仓位大小和风险挂钩的纪律，是自主 agent **不爆仓**的基石——框架之前只给安全天花板，不给风险适配的尺寸
+- 为什么是最重要的：交易产品在安全之外，最重要的是帮 agent 有纪律地活下来。无纪律定仓（每笔风险无界）是爆仓的头号原因。这个原语和已有件无缝组合——agent 用 v80 入场即挂的追踪止损（trail %），风险定仓说"挂 5% 追踪止损、想冒 \$50 风险 → 买 \$1000"；再由 v70 天花板夹住（绝不超出策略允许）
+- 实现（纯函数 + 复用 v70 天花板，advisory 层）：新 `riskSizing.ts`——纯 `recommendedRiskSize({riskUsd, stopDistancePct})`；`gatherRiskSize` 解析风险预算（--risk-usd 绝对值，或 --risk-pct × --portfolio-usd）+ 止损距离（--stop-pct 止损 / --trail-pct 追踪），算 recommended，调 `gatherTradeSizing` 取安全天花板，`finalUsd = min(recommended, 天花板)`，报告 boundBy（风险预算 vs 哪条安全约束）+ effectiveRiskUsd（天花板夹住时实际风险 < 预算）。风险层是 advisory——只收窄推荐尺寸、绝不放宽 maxTradeUsd 的"政策允许"含义
+- 接入：CLI `safety size-by-risk`、MCP `risk_size`（含 price→baseAmount 转换，复用 trade_sizing 的解析/定价路径）；MCP_TOOLS 不变量已注册
+- 测试覆盖：+13——纯公式（风险÷止损、更紧止损更大仓、非正→null）/ 预算解析（绝对 vs %×组合）/ 止损源（stop-loss vs trail）/ price→baseAmount / **天花板夹紧**（per-tx 夹到 \$500、实际风险降到 \$25、给出 caveat；宽天花板不夹；daily-remaining 当 binding）/ 错误（无风险源 / risk-pct 缺 portfolio / 无止损）；3556 测试全绿（+13）；CLI 已烟测
+- 向后兼容：纯加法——新模块/CLI 子命令/MCP 工具；不改 v70 sizing 逻辑（天花板含义不变）；advisory 不影响任何强制路径
+
 **Phase 104 — USD 预算按"美元"计而非"报价代币单位"：修复每日上限/策略预算对非稳定币报价交易的静默错算（USD budgets sum DOLLARS, not raw quote-token units — fix the daily-cap/strategy-budget undercount for non-stablecoin quotes）** ✅
 - **审计发现的安全护栏正确性 bug（非加 feature，是修错）**：整个 USD 预算层（每日 USD 上限 `dailyUsdVolume` + 策略预算 `usdSpentUnderStrategy`）历史上把 `quote_amount`（报价**代币**数量）直接当美元累加——**仅当报价是稳定币时才对**。一笔 WETH 报价的交易（quote_amount=0.5 WETH，约 \$1500）只算 \$0.50 进每日上限——把第二基础的安全护栏**静默低估约 1000×**。而单笔上限（per-tx）用的是 `estimatedUsd`（quote_amount × 报价代币 USD 价，**正确**）——两者不一致，每日的那个是错的。一个用 WETH 报价交易的 agent 能把每日 USD 限额超出几个数量级
 - 为什么是最重要的：自主交易的护栏必须真的按美元约束住。这是 v85（稳定币集合分叉）/v100（护栏计数漏项）同一类静默错算 bug，但发生在**强制执行层**（不只是显示）——比任何新 feature 都重要，因为它让运营商以为有的 USD 上限保护实际是漏的

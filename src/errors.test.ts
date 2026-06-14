@@ -444,6 +444,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "protect_positions",
     // v70: solve for the max admissible trade size (inverse of safety_headroom).
     "trade_sizing",
+    // v105: risk-based position sizing — size by risk budget ÷ stop distance, clamped by the ceiling.
+    "risk_size",
     // v74: preflight decision journal (verdicts incl. refused trades).
     "preflight_history",
     // v75: preflight calibration — did the verdicts predict outcomes?

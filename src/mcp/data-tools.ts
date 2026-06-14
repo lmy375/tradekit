@@ -222,6 +222,59 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── v105: risk-based sizing ────────────────────────────────
+  server.tool(
+    "risk_size",
+    "v105: risk-based position sizing — 'how much SHOULD I trade so hitting my stop loses only my risk budget?'. Where `trade_sizing` gives the MAX policy allows (the ceiling), this gives the RISK-DISCIPLINED size: recommendedUsd = riskUsd ÷ (stopDistancePct/100) — e.g. risk $50 with a 5% stop → $1000. Pass the risk budget as `risk_usd` (absolute) OR `risk_pct` + `portfolio_usd` (% of book). Pass the stop distance as `stop_loss_pct` OR `trail_pct` (the trailing-stop trail you'll attach via protectTrailPct on the buy). The recommendation is then CLAMPED by the `trade_sizing` safety ceiling — the safe path never exceeds policy. Returns { ok, riskUsd, stopDistancePct, stopSource, recommendedUsd, ceilingUsd, ceilingBinding, finalUsd, boundBy ('risk_budget' or a safety constraint kind), priceUsd, baseAmount (finalUsd÷price), effectiveRiskUsd (finalUsd×stop% — ≤ budget when the ceiling clamped), caveats[] }. The cornerstone of not blowing up: size by risk, stay inside the envelope. Errors: INVALID_PARAMS (no risk source / risk_pct w/o portfolio_usd / no stop distance), UNKNOWN_TOKEN, UNKNOWN_CHAIN.",
+    {
+      direction: z.enum(["buy", "sell"]).describe("buy = spend quote to acquire base; sell = dispose base."),
+      risk_usd: z.number().positive().optional().describe("Absolute risk budget in USD (the most you'll lose if the stop hits)."),
+      risk_pct: z.number().positive().optional().describe("Risk budget as a % of the book (needs portfolio_usd). e.g. 1 = risk 1%."),
+      portfolio_usd: z.number().positive().optional().describe("Current portfolio USD value — required when using risk_pct."),
+      stop_loss_pct: z.number().positive().optional().describe("Stop-loss distance from entry, % (5 = -5%)."),
+      trail_pct: z.number().positive().optional().describe("Trailing-stop trail %, used as the stop distance (the protect-on-entry trail)."),
+      chain: z.string().optional(),
+      token: z.string().optional().describe("Base token symbol or address — scopes position caps + prices the base-amount conversion."),
+      strategy: z.string().optional().describe("Strategy tag — folds the matching budget into the safety ceiling."),
+    },
+    async ({ direction, risk_usd, risk_pct, portfolio_usd, stop_loss_pct, trail_pct, chain, token, strategy }) => {
+      try {
+        return ok(
+          await runTool("risk_size", rt.opts, { direction, risk_usd, risk_pct, stop_loss_pct, trail_pct, chain, token, strategy }, chain, async () => {
+            const config = rt.getConfig();
+            const profile = resolveProfile(chain ?? config.activeChain, config);
+            const resolved = token ? resolveToken(profile, token) : profile.weth;
+            if (!resolved) throw unknownTokenError("token", token ?? "(none)", profile);
+            const priceAddr = /^0x[0-9a-fA-F]{40}$/.test(resolved) ? resolved : profile.weth;
+            const priceUsd = await getCurrentPrice(priceAddr, rt.opts.logger).catch(() => null);
+            const { gatherRiskSize } = await import("../riskSizing.js");
+            try {
+              const report = gatherRiskSize({
+                direction,
+                riskUsd: risk_usd ?? null,
+                riskPct: risk_pct ?? null,
+                portfolioUsd: portfolio_usd ?? null,
+                stopLossPct: stop_loss_pct ?? null,
+                trailPct: trail_pct ?? null,
+                config,
+                chain: chain ?? config.activeChain ?? undefined,
+                strategy: strategy ?? null,
+                token: token ?? (resolved === profile.weth ? profile.nativeSymbol : resolved),
+                priceUsd,
+              });
+              return { ok: true, ...report };
+            } catch (e) {
+              // gatherRiskSize throws plain Errors on bad inputs — give the agent a clean code.
+              throw new ToolError("INVALID_PARAMS", (e as Error).message);
+            }
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── holdings ──────────────────────────────────────────────
   server.tool(
     "holdings",

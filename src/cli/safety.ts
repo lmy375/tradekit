@@ -188,6 +188,9 @@ export async function safetyCommand(
     case "sizing":
       await safetySizingCommand(flags);
       break;
+    case "size-by-risk":
+      await safetySizeByRiskCommand(flags);
+      break;
     case "harden":
       await safetyHardenCommand(flags);
       break;
@@ -198,7 +201,7 @@ export async function safetyCommand(
       await safetyResetDrawdownCommand(flags);
       break;
     default:
-      throw subcommandError("safety", action, ["review", "headroom", "sizing", "harden", "drawdown", "reset-drawdown"]);
+      throw subcommandError("safety", action, ["review", "headroom", "sizing", "size-by-risk", "harden", "drawdown", "reset-drawdown"]);
   }
 }
 
@@ -226,6 +229,44 @@ async function safetyHeadroomCommand(flags: Record<string, string>) {
     printJson({ ok: true, ...report });
   } else {
     console.log(renderSafetyHeadroom(report));
+  }
+}
+
+// v105: risk-based position sizing — "how much SHOULD I trade so hitting my
+// stop loses only my risk budget?" — clamped by the v70 safety ceiling.
+async function safetySizeByRiskCommand(flags: Record<string, string>) {
+  const { gatherRiskSize, renderRiskSize } = await import("../riskSizing.js");
+  const directionRaw = (flags["direction"] ?? "buy").toLowerCase();
+  if (directionRaw !== "buy" && directionRaw !== "sell") {
+    throw new ToolError("INVALID_PARAMS", `--direction must be 'buy' or 'sell' (got "${directionRaw}").`);
+  }
+  const num = (key: string, label: string, min = 0): number | null => {
+    const raw = flags[key];
+    if (raw == null || raw === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= min) throw new ToolError("INVALID_PARAMS", `${label} must be a number > ${min} (got "${raw}").`);
+    return n;
+  };
+  try {
+    const report = gatherRiskSize({
+      direction: directionRaw,
+      riskUsd: num("risk-usd", "--risk-usd"),
+      riskPct: num("risk-pct", "--risk-pct"),
+      portfolioUsd: num("portfolio-usd", "--portfolio-usd"),
+      stopLossPct: num("stop-pct", "--stop-pct"),
+      trailPct: num("trail-pct", "--trail-pct"),
+      account: flags["account"],
+      chain: flags["chain"],
+      strategy: flags["strategy"] ?? null,
+      token: flags["token"] ?? null,
+      priceUsd: num("price", "--price"),
+    });
+    if (flags["json"] === "true") printJson({ ok: true, ...report });
+    else console.log(renderRiskSize(report));
+  } catch (e) {
+    // gatherRiskSize throws plain Errors for bad inputs — map to a clean code.
+    if (e instanceof ToolError) throw e;
+    throw new ToolError("INVALID_PARAMS", (e as Error).message);
   }
 }
 
