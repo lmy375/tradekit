@@ -4,10 +4,12 @@
 // every combination an agent's branching code would see.
 
 import { describe, expect, it } from "vitest";
-import { combinePreflightVerdict } from "./preflight.js";
+import { combinePreflightVerdict, projectPortfolioGates } from "./preflight.js";
 import type { TradePreviewReport } from "./tradePreview.js";
 import type { TokenSafetyReport } from "./tokenSafety.js";
 import type { PriceCrossCheck } from "./priceCrossCheck.js";
+import { configSchema, type Config } from "./config.js";
+import type { DrawdownStateRow } from "./db.js";
 import type { Address } from "viem";
 
 // ── fixture builders ───────────────────────────────────────
@@ -332,5 +334,118 @@ describe("combinePreflightVerdict — skipped checks", () => {
     expect(r.verdict).toBe("go");
     expect(r.reasons.find((x) => x.code === "token_ok")).toBeDefined();
     expect(r.reasons.find((x) => x.code === "check_skipped")).toBeDefined();
+  });
+});
+
+describe("combinePreflightVerdict — portfolio gates (v73)", () => {
+  it("drawdown would-trip → no_go (critical)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview(),
+      portfolio: { drawdown: { blocks: true, approaching: false, drawdownPct: 18, thresholdPct: 15 }, concentration: null },
+    });
+    expect(r.verdict).toBe("no_go");
+    const reason = r.reasons.find((x) => x.code === "drawdown_would_trip")!;
+    expect(reason.severity).toBe("critical");
+    expect(reason.source).toBe("portfolio");
+  });
+
+  it("drawdown approaching → caution (warn)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview(),
+      portfolio: { drawdown: { blocks: false, approaching: true, drawdownPct: 13, thresholdPct: 15 }, concentration: null },
+    });
+    expect(r.verdict).toBe("caution");
+    expect(r.reasons.find((x) => x.code === "drawdown_approaching")).toBeDefined();
+  });
+
+  it("drawdown within band → go (info)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview(),
+      portfolio: { drawdown: { blocks: false, approaching: false, drawdownPct: 3, thresholdPct: 15 }, concentration: null },
+    });
+    expect(r.verdict).toBe("go");
+    expect(r.reasons.find((x) => x.code === "drawdown_ok")).toBeDefined();
+  });
+
+  it("concentration breach → caution (warn)", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview(),
+      portfolio: {
+        drawdown: null,
+        concentration: { thresholdPct: 50, verdict: "warn", largestPct: 80, largestSymbol: "WETH", breaches: [{ symbol: "WETH", percentOfPortfolio: 80, overByPct: 30 }], summary: "CONCENTRATED: WETH 80%" },
+      },
+    });
+    expect(r.verdict).toBe("caution");
+    expect(r.reasons.find((x) => x.code === "concentration_high")).toBeDefined();
+  });
+
+  it("a would-trip drawdown stays no_go alongside other OK signals", () => {
+    const r = combinePreflightVerdict({
+      preview: makePreview(),
+      tokenSafety: makeTokenSafety("ok"),
+      portfolio: { drawdown: { blocks: true, approaching: false, drawdownPct: 20, thresholdPct: 15 }, concentration: null },
+    });
+    expect(r.verdict).toBe("no_go");
+  });
+
+  it("portfolio fetch error → a check_skipped reason, no crash", () => {
+    const r = combinePreflightVerdict({ preview: makePreview(), portfolio: { error: "rpc down" } });
+    expect(r.reasons.find((x) => x.source === "portfolio" && x.code === "check_skipped")).toBeDefined();
+  });
+});
+
+describe("projectPortfolioGates (v73)", () => {
+  const base = configSchema.parse({});
+  const cfg = (over: Partial<Config["safety"]> = {}): Config =>
+    ({ ...base, safety: { ...base.safety, ...over } }) as Config;
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+  const holdings = [
+    { symbol: "WETH", token: WETH, usd: 4000 },
+    { symbol: "USDC", token: USDC, usd: 6000 },
+  ];
+  const ddState = (peak: number, last: number): DrawdownStateRow => ({
+    scope_key: "global", peak_usd: peak, peak_at: "2026-06-01T00:00:00Z", tripped_at: null, last_value_usd: last, updated_at: "2026-06-01T00:00:00Z",
+  });
+
+  it("projects a drawdown trip from peak vs current portfolio value", () => {
+    // total = 10000; peak 12500 → drawdown 20% > 15% trip.
+    const r = projectPortfolioGates({
+      holdings, drawdownState: ddState(12500, 10000),
+      config: cfg({ drawdownCircuitBreaker: { enabled: true, maxDrawdownPct: 15, autoResumeAtPct: null, scope: "global" } }),
+      direction: "buy", baseToken: WETH, baseSymbol: "WETH", quoteToken: USDC, buyUsd: 1000,
+    });
+    expect(r.drawdown!.blocks).toBe(true);
+    expect(r.drawdown!.drawdownPct).toBeCloseTo(20, 6);
+  });
+
+  it("a buy that pushes the base token over the concentration limit → warn", () => {
+    // WETH 4000 + buy 3000 = 7000 of 10000 = 70% > 50%. (USDC drops 6000→3000.)
+    const r = projectPortfolioGates({
+      holdings, drawdownState: null,
+      config: cfg({ maxConcentrationPct: 50 }),
+      direction: "buy", baseToken: WETH, baseSymbol: "WETH", quoteToken: USDC, buyUsd: 3000,
+    });
+    expect(r.concentration!.verdict).toBe("warn");
+    expect(r.concentration!.breaches[0].symbol).toBe("WETH");
+    expect(r.concentration!.breaches[0].percentOfPortfolio).toBeCloseTo(70, 6);
+  });
+
+  it("sells never project concentration (can't raise a token's share)", () => {
+    const r = projectPortfolioGates({
+      holdings, drawdownState: null,
+      config: cfg({ maxConcentrationPct: 50 }),
+      direction: "sell", baseToken: WETH, baseSymbol: "WETH", quoteToken: USDC, buyUsd: null,
+    });
+    expect(r.concentration).toBeNull();
+  });
+
+  it("no gates configured → both projections null", () => {
+    const r = projectPortfolioGates({
+      holdings, drawdownState: null, config: cfg({}),
+      direction: "buy", baseToken: WETH, baseSymbol: "WETH", quoteToken: USDC, buyUsd: 1000,
+    });
+    expect(r.drawdown).toBeNull();
+    expect(r.concentration).toBeNull();
   });
 });

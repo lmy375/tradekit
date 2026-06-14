@@ -916,6 +916,8 @@ export async function tradePreflightCommand(
         skipHoneypot: flags["skip-honeypot"] === "true",
         skipPriceCheck: flags["skip-price-check"] === "true",
         skipHistory: flags["skip-history"] === "true",
+        skipPortfolio: flags["skip-portfolio"] === "true",
+        strategy: flags["strategy"],
       },
       publicClient: wallet.publicClient,
       walletAddress: wallet.account.address as Address,

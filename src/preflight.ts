@@ -32,6 +32,30 @@ import type { TradePreviewReport } from "./tradePreview.js";
 import type { TokenSafetyReport } from "./tokenSafety.js";
 import type { PriceCrossCheck } from "./priceCrossCheck.js";
 import type { AnalyzedTrade } from "./tradeAnalysis.js";
+import type { ConcentrationRisk, TokenAggregate } from "./portfolio.js";
+import { assessConcentrationRisk } from "./portfolio.js";
+import type { DrawdownStateRow } from "./db.js";
+import { evaluateDrawdown } from "./drawdown.js";
+
+/** v73: projected portfolio-level gate state (read-only). The drawdown
+ *  circuit breaker + concentration limit fire at EXECUTION using a live
+ *  portfolio valuation that the config/DB-based limit projection (v54) can't
+ *  see — so a preflight without this can say "go" and the trade then trips.
+ *  This projects both so the verdict reflects every gate. */
+export interface PortfolioGateProjection {
+  /** Drawdown breaker projection (null when the breaker is disabled). */
+  drawdown: {
+    /** The breaker would REJECT a trade right now (tripped or trip-now). */
+    blocks: boolean;
+    /** Within band but ≥80% of the way to the trip threshold. */
+    approaching: boolean;
+    drawdownPct: number;
+    thresholdPct: number;
+  } | null;
+  /** Concentration verdict on the projected post-trade book (null when no
+   *  limit configured, or for sells, which can't increase a token's share). */
+  concentration: ConcentrationRisk | null;
+}
 
 /** Final go/no_go/caution verdict. */
 export type PreflightVerdict = "go" | "caution" | "no_go";
@@ -51,6 +75,11 @@ export interface PreflightReason {
     | "approval_needed"
     | "market_timing_caution"
     | "market_timing_ok"
+    | "drawdown_would_trip"
+    | "drawdown_approaching"
+    | "drawdown_ok"
+    | "concentration_high"
+    | "concentration_ok"
     | "preview_ok"
     | "token_ok"
     | "price_ok"
@@ -59,7 +88,7 @@ export interface PreflightReason {
   severity: "info" | "warn" | "critical";
   message: string;
   /** Source check this came from. */
-  source: "preview" | "token_safety" | "price_cross_check" | "history" | "market_timing" | "general";
+  source: "preview" | "token_safety" | "price_cross_check" | "history" | "market_timing" | "portfolio" | "general";
 }
 
 export interface PreflightReport {
@@ -82,6 +111,9 @@ export interface PreflightReport {
     medianSlippageBps: number | null;
     p95SlippageBps: number | null;
   };
+  /** v73: projected portfolio-level gate state (drawdown breaker +
+   *  concentration). Absent when skipped or when the fetch failed. */
+  portfolioGate?: PortfolioGateProjection;
 }
 
 /**
@@ -94,6 +126,8 @@ export interface PreflightReport {
  *    1. token honeypot detected
  *    2. price cross-check extreme divergence (likely manipulation)
  *    3. preview safety pre-flight rejected (slippage cap, USD limit, etc.)
+ *    3b. drawdown circuit breaker would block (v73 — projected from a live
+ *        portfolio valuation the config/DB limit projection can't see)
  *
  *  Warn (caution):
  *    4. token suspicious (high transfer tax / round-trip loss)
@@ -102,6 +136,8 @@ export interface PreflightReport {
  *    7. gas % of trade > 10%
  *    8. market-timing caution (buying near a high / into a falling knife;
  *       selling near a low) — advice, nudges to caution, never blocks
+ *    8b. drawdown approaching the trip threshold (v73)
+ *    8c. post-trade concentration over the configured limit (v73)
  *
  *  Info (still go, but operator should know):
  *    9. balance fraction > 50%
@@ -118,6 +154,7 @@ export function combinePreflightVerdict(args: {
   tokenSafety?: TokenSafetyReport | { error: string };
   priceCrossCheck?: PriceCrossCheck | { error: string };
   history?: { sampleSize: number; medianSlippageBps: number | null; p95SlippageBps: number | null } | { error: string };
+  portfolio?: PortfolioGateProjection | { error: string };
 }): { verdict: PreflightVerdict; reasons: PreflightReason[] } {
   const reasons: PreflightReason[] = [];
 
@@ -279,6 +316,63 @@ export function combinePreflightVerdict(args: {
     }
   }
 
+  // v73: portfolio-level gates the config/DB limit projection can't see —
+  // the drawdown circuit breaker + concentration limit, both of which fire at
+  // EXECUTION against a live portfolio valuation. Projecting them here closes
+  // the "preview said go, trade then TRIPPED" gap for the portfolio gates.
+  if (args.portfolio && !("error" in args.portfolio)) {
+    const dd = args.portfolio.drawdown;
+    if (dd) {
+      if (dd.blocks) {
+        reasons.push({
+          code: "drawdown_would_trip",
+          severity: "critical",
+          message: `Drawdown circuit breaker would BLOCK this trade: portfolio is ${dd.drawdownPct.toFixed(1)}% below peak (trips at −${dd.thresholdPct}%). Trading is halted until recovery or manual reset.`,
+          source: "portfolio",
+        });
+      } else if (dd.approaching) {
+        reasons.push({
+          code: "drawdown_approaching",
+          severity: "warn",
+          message: `Drawdown ${dd.drawdownPct.toFixed(1)}% is approaching the −${dd.thresholdPct}% circuit-breaker trip — a further drop halts all trading.`,
+          source: "portfolio",
+        });
+      } else {
+        reasons.push({
+          code: "drawdown_ok",
+          severity: "info",
+          message: `Drawdown ${dd.drawdownPct.toFixed(1)}% of the −${dd.thresholdPct}% breaker threshold.`,
+          source: "portfolio",
+        });
+      }
+    }
+    const cc = args.portfolio.concentration;
+    if (cc && cc.verdict === "warn") {
+      reasons.push({
+        code: "concentration_high",
+        severity: "warn",
+        message: `Post-trade concentration: ${cc.summary}`,
+        source: "portfolio",
+      });
+    } else if (cc && cc.verdict === "ok") {
+      reasons.push({
+        code: "concentration_ok",
+        severity: "info",
+        message: `Post-trade concentration within limit: ${cc.summary}`,
+        source: "portfolio",
+      });
+    }
+    // verdict 'unconfigured' → no reason (nothing to assert without a limit).
+  }
+  if (args.portfolio && "error" in args.portfolio) {
+    reasons.push({
+      code: "check_skipped",
+      severity: "info",
+      message: `portfolio gate check skipped: ${args.portfolio.error}`,
+      source: "portfolio",
+    });
+  }
+
   // Skipped checks → record info-level so the verdict is honest.
   if (args.preview && "error" in args.preview) {
     reasons.push({
@@ -326,6 +420,74 @@ export function combinePreflightVerdict(args: {
   return { verdict, reasons };
 }
 
+/** Within this fraction of the trip threshold, a drawdown is "approaching"
+ *  (mirrors safetyHeadroom's APPROACHING_PCT). */
+const DRAWDOWN_APPROACHING_FRAC = 0.8;
+
+/**
+ * v73: pure projection of the portfolio-level gates (drawdown breaker +
+ * concentration) for THIS trade. Read-only — uses evaluateDrawdown (no state
+ * mutation) and assessConcentrationRisk on the projected post-trade book.
+ * Conserves total on a buy (base +buyUsd, quote −buyUsd) so the projected
+ * percentages are accurate. Exported pure for unit testing without RPC/DB.
+ */
+export function projectPortfolioGates(args: {
+  holdings: Array<{ symbol: string; token: string; usd?: number }>;
+  drawdownState: DrawdownStateRow | null;
+  config: Config;
+  direction: "buy" | "sell";
+  baseToken: string; // address or "NATIVE"
+  baseSymbol: string;
+  quoteToken: string; // address or "NATIVE"
+  buyUsd: number | null;
+  now?: Date;
+}): PortfolioGateProjection {
+  const byToken = new Map<string, { symbol: string; usd: number }>();
+  let total = 0;
+  for (const b of args.holdings) {
+    if (b.usd == null || !Number.isFinite(b.usd)) continue;
+    const key = b.token === "NATIVE" ? "NATIVE" : b.token.toLowerCase();
+    const cur = byToken.get(key) ?? { symbol: b.symbol, usd: 0 };
+    cur.usd += b.usd;
+    byToken.set(key, cur);
+    total += b.usd;
+  }
+
+  // ── drawdown breaker (read-only evaluate) ──
+  let drawdown: PortfolioGateProjection["drawdown"] = null;
+  const ddCfg = args.config.safety.drawdownCircuitBreaker;
+  if (ddCfg?.enabled && total > 0) {
+    const outcome = evaluateDrawdown({ currentUsd: total, state: args.drawdownState, config: ddCfg, now: args.now });
+    const blocks = outcome.kind === "trip-now" || outcome.kind === "still-tripped";
+    const drawdownPct = "drawdownPct" in outcome ? outcome.drawdownPct : 0;
+    const thresholdPct = ddCfg.maxDrawdownPct;
+    const approaching = !blocks && drawdownPct >= thresholdPct * DRAWDOWN_APPROACHING_FRAC && drawdownPct < thresholdPct;
+    drawdown = { blocks, approaching, drawdownPct, thresholdPct };
+  }
+
+  // ── concentration (buy only — sells can't raise a token's share) ──
+  let concentration: ConcentrationRisk | null = null;
+  const concLimit = args.config.safety.maxConcentrationPct;
+  if (concLimit != null && args.direction === "buy" && args.buyUsd != null && args.buyUsd > 0 && total > 0) {
+    const baseKey = args.baseToken === "NATIVE" ? "NATIVE" : args.baseToken.toLowerCase();
+    const quoteKey = args.quoteToken === "NATIVE" ? "NATIVE" : args.quoteToken.toLowerCase();
+    const projected: Array<{ symbol: string; percentOfPortfolio: number }> = [];
+    for (const [key, v] of byToken) {
+      let usd = v.usd;
+      if (key === baseKey) usd += args.buyUsd;
+      if (key === quoteKey) usd = Math.max(0, usd - args.buyUsd);
+      projected.push({ symbol: v.symbol, percentOfPortfolio: (usd / total) * 100 });
+    }
+    if (!byToken.has(baseKey)) {
+      // First-time hold of this token — wasn't in the book yet.
+      projected.push({ symbol: args.baseSymbol, percentOfPortfolio: (args.buyUsd / total) * 100 });
+    }
+    concentration = assessConcentrationRisk(projected as unknown as TokenAggregate[], concLimit);
+  }
+
+  return { drawdown, concentration };
+}
+
 export interface PreflightRequest {
   direction: "buy" | "sell";
   /** Resolved address. CLI/MCP shim normalizes "ETH" → NATIVE_TOKEN before calling. */
@@ -341,6 +503,11 @@ export interface PreflightRequest {
   skipPriceCheck?: boolean;
   /** Skip the iter619 historical-quality lookup (DB-bound, cheap). */
   skipHistory?: boolean;
+  /** v73: skip the portfolio-gate projection (drawdown breaker + concentration).
+   *  It does a multi-chain holdings fetch, so skip it when speed matters and
+   *  the portfolio gates aren't a concern. Auto-skipped when neither the
+   *  drawdown breaker nor a concentration limit is configured. */
+  skipPortfolio?: boolean;
   /** v54: strategy tag — when set, the preview's limit projection also
    *  evaluates the per-strategy budget + position cap that would gate a
    *  tagged agent trade, so the verdict reflects them. */
@@ -411,6 +578,25 @@ export async function runPreflight(args: {
         logger: args.logger,
       }).catch((e) => ({ error: (e as Error).message }) as { error: string });
 
+  // v73: portfolio-gate fetch — drawdown breaker + concentration both fire at
+  // EXECUTION using a live valuation the config/DB limit projection can't see.
+  // Fetch holdings (best-effort) only when at least one gate is configured.
+  const wantPortfolio =
+    !args.req.skipPortfolio &&
+    (args.config.safety.drawdownCircuitBreaker?.enabled === true ||
+      args.config.safety.maxConcentrationPct != null);
+  const holdingsP: Promise<{ balances: Array<{ symbol: string; token: string; usd?: number }> } | { error: string }> =
+    wantPortfolio
+      ? import("./holdings.js")
+          .then(async (m) => {
+            const multi = await m.holdingsMultiChain(args.walletAddress, args.config, args.logger);
+            return { balances: multi.reports.flatMap((r) => r.balances) };
+          })
+          .catch((e) => ({ error: (e as Error).message }) as { error: string })
+      : Promise.resolve({
+          error: args.req.skipPortfolio ? "skipped via skipPortfolio" : "no portfolio gates configured",
+        } as { error: string });
+
   // History query is DB-only; do it inline.
   const history = args.req.skipHistory
     ? ({ error: "skipped via skipHistory" } as { error: string })
@@ -423,13 +609,42 @@ export async function runPreflight(args: {
         logger: args.logger,
       });
 
-  const [preview, tokenSafety, priceCrossCheck] = await Promise.all([previewP, tokenSafetyP, priceP]);
+  const [preview, tokenSafety, priceCrossCheck, holdingsRes] = await Promise.all([
+    previewP,
+    tokenSafetyP,
+    priceP,
+    holdingsP,
+  ]);
+
+  // Build the portfolio-gate projection from the fetched holdings.
+  let portfolio: PortfolioGateProjection | { error: string };
+  if ("error" in holdingsRes) {
+    portfolio = holdingsRes;
+  } else {
+    const { getDrawdownState } = await import("./db.js");
+    const ddEnabled = args.config.safety.drawdownCircuitBreaker?.enabled === true;
+    const ddScope = args.config.safety.drawdownCircuitBreaker?.scope ?? "global";
+    const buyUsd = !("error" in (preview as object))
+      ? ((preview as TradePreviewReport).metrics.inputUsd ?? null)
+      : null;
+    portfolio = projectPortfolioGates({
+      holdings: holdingsRes.balances,
+      drawdownState: ddEnabled ? getDrawdownState(ddScope) : null,
+      config: args.config,
+      direction: args.req.direction,
+      baseToken: args.req.base,
+      baseSymbol: !("error" in (preview as object)) ? (preview as TradePreviewReport).baseSymbol : "?",
+      quoteToken: args.req.quote,
+      buyUsd,
+    });
+  }
 
   const { verdict, reasons } = combinePreflightVerdict({
     preview,
     tokenSafety,
     priceCrossCheck,
     history,
+    portfolio,
   });
 
   // Resolve symbols for the report. Pull from preview when available; fall
@@ -453,6 +668,7 @@ export async function runPreflight(args: {
     tokenSafety: !("error" in (tokenSafety as object)) ? (tokenSafety as TokenSafetyReport) : undefined,
     priceCrossCheck: !("error" in (priceCrossCheck as object)) ? (priceCrossCheck as PriceCrossCheck) : undefined,
     history: !("error" in (history as object)) ? (history as PreflightReport["history"]) : undefined,
+    portfolioGate: !("error" in (portfolio as object)) ? (portfolio as PortfolioGateProjection) : undefined,
   };
 }
 

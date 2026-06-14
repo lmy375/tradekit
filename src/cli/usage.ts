@@ -112,8 +112,13 @@ TRADING
         Read-only pre-trade analysis: price impact, slippage cushion, gas %, balance fraction, safety pre-flight.
         --strict exits 1 when safety pre-flight fails (iter798 — pipeline gate before actual swap).
   trade preflight buy|sell --base X --quote Y --baseAmount A | --quoteAmount A [--slippage N] [--strict] [--json]
-                  [--skip-honeypot] [--skip-price-check] [--skip-history]
+                  [--skip-honeypot] [--skip-price-check] [--skip-history] [--skip-portfolio] [--strategy TAG]
         Composite pre-trade safety check: preview + token honeypot probe + cross-source price + historical slippage → go/caution/no_go verdict.
+        v73: also projects the PORTFOLIO-level gates — the drawdown circuit breaker
+        (would-trip → no_go) + concentration limit (over safety.maxConcentrationPct
+        → caution) — which fire at execution against a live valuation the limit
+        projection can't see, so the verdict no longer says go then trips. Fetches
+        holdings; --skip-portfolio to skip (auto-skipped when neither gate is set).
         --strict exits 1 when verdict=no_go (iter772 — pipeline gate before actual swap).
         [--base ETH|<addr>] [--quote USDC|<addr>] [--baseAmount|--quoteAmount <n|max>]
         [--slippage <bps>] [--simulate] [--note "..."] [--account <label>] [--chain X]

@@ -545,7 +545,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
   // catch issues in one call.
   server.tool(
     "preflight_trade",
-    "Composite pre-trade safety check. Returns { ok, chain, direction, baseSymbol, quoteSymbol, timestamp, verdict, reasons[], preview?, tokenSafety?, priceCrossCheck?, history? }. verdict ∈ 'go' / 'caution' / 'no_go'. Reasons each have a stable code ('token_honeypot', 'token_suspicious', 'price_extreme_divergence', 'price_suspicious_divergence', 'preview_safety_failed', 'limit_would_reject', 'high_realized_slippage_history', 'gas_pct_high', 'balance_fraction_high', 'approval_needed', 'market_timing_caution', 'market_timing_ok', 'preview_ok', 'token_ok', 'price_ok', 'history_ok', 'check_skipped') + severity (critical/warn/info) + source. no_go fires on critical findings (honeypot, extreme price divergence, preview-safety failure, or v54 'limit_would_reject' — a configured per-tx/daily/budget/cap/rate guardrail that would reject the trade at execution); caution fires on warns (incl. v69 'market_timing_caution' — buying near the recent high / into a falling knife, or selling near the recent low; timing is ADVICE that nudges to caution, never blocks); otherwise go. The embedded preview.marketContext carries the full timing read (rangePositionPct, changePctWindow, volatility, a direction-aware 'timing' flag + plain-language notes) so the agent can decide WHEN, not just whether the trade is safe. Source reports embedded for callers who want details. Skip-flags let agents bypass expensive checks: skipHoneypot avoids the ~4-RPC round-trip probe, skipPriceCheck avoids the CoinGecko+DexScreener fan-out, skipHistory avoids DB+RPC for analyzing past trades. Use before dispatching buy/sell — agents branching on report.verdict can refuse no_go automatically.",
+    "Composite pre-trade safety check. Returns { ok, chain, direction, baseSymbol, quoteSymbol, timestamp, verdict, reasons[], preview?, tokenSafety?, priceCrossCheck?, history?, portfolioGate? }. v73 `portfolioGate` carries the projected portfolio-level gates — { drawdown: {blocks, approaching, drawdownPct, thresholdPct} | null, concentration: ConcentrationRisk | null } — so the agent sees the drawdown breaker / concentration outcome BEFORE firing (these gate at execution against a live valuation the limit projection can't see). Skipped via skipPortfolio; auto-skipped when neither gate is configured. verdict ∈ 'go' / 'caution' / 'no_go'. Reasons each have a stable code ('token_honeypot', 'token_suspicious', 'price_extreme_divergence', 'price_suspicious_divergence', 'preview_safety_failed', 'limit_would_reject', 'high_realized_slippage_history', 'gas_pct_high', 'balance_fraction_high', 'approval_needed', 'market_timing_caution', 'market_timing_ok', 'preview_ok', 'token_ok', 'price_ok', 'history_ok', 'check_skipped') + severity (critical/warn/info) + source. no_go fires on critical findings (honeypot, extreme price divergence, preview-safety failure, v54 'limit_would_reject' — a configured per-tx/daily/budget/cap/rate guardrail that would reject the trade at execution, or v73 'drawdown_would_trip' — the portfolio drawdown circuit breaker would halt trading right now); caution fires on warns (incl. v69 'market_timing_caution' — buying near the recent high / into a falling knife, or selling near the recent low; v73 'drawdown_approaching' — drawdown ≥80% of the trip threshold; v73 'concentration_high' — this buy would push a token over safety.maxConcentrationPct; timing/portfolio signals nudge to caution but don't block); otherwise go. The embedded preview.marketContext carries the full timing read (rangePositionPct, changePctWindow, volatility, a direction-aware 'timing' flag + plain-language notes) so the agent can decide WHEN, not just whether the trade is safe. Source reports embedded for callers who want details. Skip-flags let agents bypass expensive checks: skipHoneypot avoids the ~4-RPC round-trip probe, skipPriceCheck avoids the CoinGecko+DexScreener fan-out, skipHistory avoids DB+RPC for analyzing past trades. Use before dispatching buy/sell — agents branching on report.verdict can refuse no_go automatically.",
     {
       direction: z.enum(["buy", "sell"]),
       chain: z.string().optional(),
@@ -558,6 +558,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       skipHoneypot: z.boolean().optional().describe("Skip iter609 token safety probe (saves ~4 RPC roundtrips when the token is well-known)."),
       skipPriceCheck: z.boolean().optional().describe("Skip iter613 cross-source price check (saves CoinGecko + DexScreener API calls)."),
       skipHistory: z.boolean().optional().describe("Skip iter619 historical slippage lookup (saves DB query + analysis-side RPC)."),
+      skipPortfolio: z.boolean().optional().describe("v73: skip the portfolio-gate projection (drawdown breaker + concentration). It fetches multi-chain holdings; skip when speed matters. Auto-skipped when neither gate is configured."),
       autoSlippage: z.boolean().optional().describe(
         "Iter645: derive slippage from realized history for the pair. Same data-driven recommendation as buy/sell autoSlippage. Response includes slippageSuggestion field.",
       ),
@@ -577,6 +578,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
       skipHoneypot,
       skipPriceCheck,
       skipHistory,
+      skipPortfolio,
       autoSlippage,
       strategy,
     }) => {
@@ -659,6 +661,7 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                   skipHoneypot,
                   skipPriceCheck,
                   skipHistory,
+                  skipPortfolio,
                   strategy,
                 },
                 publicClient: wallet.publicClient,

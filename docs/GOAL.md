@@ -33,6 +33,17 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 73 — preflight 感知组合级闸门（portfolio-aware preflight — close the "preview says GO, execution TRIPS" gap for the portfolio gates）** ✅
+- **补一个真实的"假 GO"风险，而非加新面**：v54 把 preflight 做成"下单前会不会被拒"的完整裁决，明确目标是"agent 不会拿到 GO 然后执行时吃 SAFEGUARD_TRIGGERED"。但 v54 的限额投影是 config/DB 级（便宜），**看不到需要组合估值的两个闸门**：drawdown 熔断器（硬 gate，执行时 throw DRAWDOWN_CIRCUIT_BREAKER_TRIPPED）和 v72 集中度。结果：agent preflight 得到 GO → 下单却被 drawdown 熔断器拦下。这正是 v54 要消灭的"假 GO"，偏偏漏在它唯一覆盖不到的闸门上
+- 为什么是最重要的：preflight 是 agent 的下单决策点。一个不反映**所有**可能拒绝的闸门的裁决会误导 agent。把组合级闸门投影进 preflight = 裁决变得诚实完整。这是 v54 使命的自然补全，不是新功能
+- 实现（投影而非执行，复用既有纯函数）：(1) 纯函数 `projectPortfolioGates(holdings, drawdownState, config, trade)` → { drawdown: {blocks, approaching, drawdownPct, thresholdPct}|null, concentration: ConcentrationRisk|null }——drawdown 走**只读** `evaluateDrawdown`（不 mutate，区别于执行时的 enforce），concentration 走 v72 `assessConcentrationRisk`，对**投影后**的 book 评估（买入：base +buyUsd、quote −buyUsd，总额守恒 → 百分比精确）；(2) `combinePreflightVerdict` 接 `portfolio` 输入：drawdown would-trip → critical(no_go)、approaching(≥80% 阈值) → warn(caution)、集中度超限 → warn(caution)；(3) `runPreflight` best-effort 拉一次 holdings（仅当 drawdown 或集中度任一已配）+ 读 drawdown 状态，投影后喂 combiner
+- 闸门语义一致：drawdown 是硬 gate（执行时真 throw）→ preflight 给 no_go（对位真实拒绝）；集中度是 v72 风险旗（非硬 gate）→ caution（建议）。preflight PROJECTS（只读），trade ENFORCES（mutate）——与 preview 投影 limits、trade 执行 limits 的既有分工同构
+- 诚实降级：holdings 拉取失败 → check_skipped reason（不崩、不阻断裁决）；未配任何闸门 → 自动跳过拉取（零成本）；`--skip-portfolio`/`skipPortfolio` 显式跳过（多链拉取较重）；卖出不投影集中度（不抬升占比）
+- Surfaces：CLI `trade preflight` reasons 自动渲染组合闸门 + `--skip-portfolio`/`--strategy` 旗 + MCP `preflight_trade` 加 `skipPortfolio` 参数、返回 `portfolioGate`、描述更新新 code（drawdown_would_trip/approaching/ok、concentration_high/ok）
+- 测试覆盖：`preflight.test.ts` +10——combiner 组合闸门 6（would-trip→no_go/approaching→caution/within-band→go/集中度超限→caution/would-trip 压过 OK 信号仍 no_go/拉取错误→check_skipped）+ `projectPortfolioGates` 纯函数 4（peak vs current 投影 drawdown trip / 买入推 base 过限→warn 点名 / 卖出不投影 / 未配→双 null）
+- 向后兼容：纯加法——新 reason code、新 source "portfolio"、新可选 req 旗、新报告字段；combiner 新增 portfolio 参数可选；3362 测试全绿（+10）
+- v1 限制：preflight 多一次多链 holdings 拉取（best-effort、可跳、仅闸门已配时）；drawdown 投影用当前估值（与执行时同源，但 preflight 与 execution 间组合若剧变需重跑——本就是 pre-trade 快照）；集中度投影按 swap 守恒总额近似（base+/quote−）
+
 **Phase 72 — 组合集中度护栏（portfolio concentration guardrail — the cross-strategy blind spot per-strategy caps miss）** ✅
 - **补一个真正缺失的安全护栏，而非又一个观测面**：集中度数学（top1/top3/top5）早已存在于 portfolio/health，但只是**观测指标**——没有任何护栏在组合危险地押注单一 token 时告警。仓位上限是 per-(strategy,token) 的**绝对额**，结构性地漏掉了**跨策略聚合**：多个策略可以各自守在自己的 cap 内，而整个 book 却漂移到 90% 压在一个高波动 token 上。这是自主 agent 的经典爆仓方式，此前无护栏
 - 为什么是最重要的：安全 = 不因可预防的错误亏钱。over-concentration 是和 over-sizing（v70）并列的爆仓源。v70 防单笔过大，本期防组合过于集中。两者都把"安全态势"从被动观测变成主动护栏
