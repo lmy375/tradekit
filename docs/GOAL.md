@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 103 — 引擎存活进 digest：引擎死了、保护性止损静默失效，心跳必须报警（engine liveness in the digest — a dead engine means trailing stops are silently inert）** ✅
+- **补上"心跳显示健康、引擎实际已死"的盲区**：引擎守护进程负责触发每一个定时单/DCA/再平衡，以及每一个保护性追踪止损。引擎一旦宕掉，这些全部静默失效——尤其**一个静默失效的追踪止损 = 一个无保护的持仓在一路下跌、却没人知道**。doctor 能查到（"有活动 primitive 但引擎状态过期"），但只在运营商手动跑时；cron digest（运营商真正盯的主心跳、带三档 verdict）**没有引擎存活信号**。digest 报"healthy"而引擎已死、止损全失效——正是 v55/v57 修过的那类危险盲区（"心跳说健康，钱包却敞着"）
+- 为什么是最重要的：自主交易里最吓人的静默失败之一——你以为有追踪止损保护持仓，但触发它的引擎是死的，持仓一路裸奔到底。运营商必须主动知道。这是可靠性支柱（相对安全支柱被反复打磨，可靠性被低估了），且 digest 报假"healthy"比没有 digest 更糟
+- 关键洞察——区分 PROTECTIVE vs 其他：引擎死 + 有保护性止损（追踪止损/price_below 卖单，下行退出）→ **CRITICAL**（持仓裸奔）；引擎死 + 仅普通 primitive（DCA/限价）→ attention（漏单，非裸奔）；无活动 primitive → 静默（引擎本就可选）。这个区分让信号直接回答"我的持仓现在真的有保护吗"，比 doctor 的扁平 warn 更精准
+- 实现（复用 doctor 同源，零分歧）：`gatherEngine()` 复用 `readEngineStatus()` + 活动 primitive 计数（与 doctor.checkEngineLiveness 同源，6h 过期阈值一致，杜绝第二套"引擎算不算死"的定义），但返回结构化数据并额外隔离 protectiveOrders（side=sell 且 trigger=trailing/price_below）。STANDING 信号（同 posture，在 gatherWindow 算、prior 对比里为 null）；best-effort→null。classifyVerdict 升级；text+slack 仅在引擎死且有 primitive 依赖时渲染
+- 测试覆盖：+7——classifyVerdict（保护性止损→critical / 仅普通→attention / 无 primitive→healthy / 引擎活→不升级）+ 端到端（无 primitive 不拖累 verdict / 活的追踪止损卖单→critical 计入 protective / price_above 买单→attention 非 protective）；3538 测试全绿（+7）；CLI JSON 已烟测、MCP 描述同步
+- 向后兼容：纯加法——`engine` 字段 optional；text/slack 仅故障时渲染；复用 readEngineStatus（无新状态源）；engine.js 静态引入无循环（engine→digestPush 是动态 import）；不改引擎/doctor 逻辑
+
 **Phase 102 — 审批队列上 Web：运营商在主监控界面就能审阅 agent 提案（trade-approval queue on the dashboard — review proposals where the operator already watches）** ✅
 - **把人在回路控制接到运营商真正盯着的界面**：v47 审批门（agent 提案/人决定）是自主交易最关键的人在回路控制。但 Web 上只有 Overview 的一个**计数横幅**（"N 笔交易待批"）——要真正看 agent 想干什么（交易内容、preview、v101 的 WHY-gated 理由），运营商必须切到 CLI。`/api/intents` 连 preview/request/approval_reasons 都不返回，光有计数。Web 是运营商的主监控面，"看都看不到要批什么"是真实摩擦
 - 为什么是最重要的：审批队列是阻塞 agent、等待人决策的地方——延迟决策=agent 卡住。把提案审阅放到运营商已经在盯的界面（而非强制切 CLF），缩短决策延迟，直接服务"人保持对自主交易的控制"。这是 v86/87 确立的"把关键信号搬上滞后的 Web 界面"模式，这次搬的是最关键的控制面

@@ -774,6 +774,41 @@ describe("classifyVerdict — strategy bleeding (v88)", () => {
     const r = classifyVerdict({ ...base, promote: { checked: 4, flagged: [], worst: null } });
     expect(r.verdict).toBe("healthy");
   });
+
+  // v103: engine-liveness escalation.
+  it("engine DOWN with a protective stop live → CRITICAL (position unprotected)", async () => {
+    const r = classifyVerdict({
+      ...base,
+      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 1, protectiveOrders: 1 },
+    });
+    expect(r.verdict).toBe("critical");
+    expect(r.verdictReasons.some((x) => /UNPROTECTED/.test(x))).toBe(true);
+  });
+
+  it("engine DOWN with only non-protective primitives → attention (not firing)", async () => {
+    const r = classifyVerdict({
+      ...base,
+      engine: { everRan: true, stale: true, lastTickAgoSec: 8 * 3600, livePrimitives: 3, protectiveOrders: 0 },
+    });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /not firing/.test(x))).toBe(true);
+  });
+
+  it("engine DOWN but NO live primitives → healthy (engine is optional)", async () => {
+    const r = classifyVerdict({
+      ...base,
+      engine: { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives: 0, protectiveOrders: 0 },
+    });
+    expect(r.verdict).toBe("healthy");
+  });
+
+  it("engine ALIVE → no escalation even with live primitives", async () => {
+    const r = classifyVerdict({
+      ...base,
+      engine: { everRan: true, stale: false, lastTickAgoSec: 12, livePrimitives: 5, protectiveOrders: 2 },
+    });
+    expect(r.verdict).toBe("healthy");
+  });
 });
 
 // ── v95: promote-outcome section (end-to-end through gatherDigest) ───
@@ -853,6 +888,46 @@ describe("gatherDigest — promote-outcome divergence section", () => {
     expect(r.promote!.flagged).toHaveLength(0);
     // promote alone doesn't escalate; the verdict is driven by other sections.
     expect(r.verdictReasons.some((x) => /promoted strateg/.test(x))).toBe(false);
+  });
+});
+
+// ── v103: engine-liveness section (end-to-end through gatherDigest) ──
+describe("gatherDigest — engine liveness", () => {
+  const win = { windowLabel: "24h", windowMs: 24 * 3_600_000, now: new Date("2026-05-30T12:00:00Z") };
+  const order = (over: Partial<Parameters<typeof insertOrder>[0]> = {}) =>
+    insertOrder({
+      side: "sell", trigger_type: "trailing", target_price_usd: null, trail_pct: 5,
+      chain: "base", account: "default", base_token: "0xw", base_symbol: "ETH",
+      quote_token: "0xu", quote_symbol: "USDC", base_amount: "1", quote_amount: null,
+      slippage_bps: null, auto_slippage: false, expires_at: null, strategy: null, note: null,
+      group_id: null, ...over,
+    });
+
+  it("no live primitives → engine optional, no escalation", async () => {
+    const r = await gatherDigest(win);
+    // In the test env the engine never ran (stale), but with 0 live primitives
+    // it's harmless — the verdict must not be dragged down by engine liveness.
+    expect(r.engine!.stale).toBe(true);
+    expect(r.engine!.livePrimitives).toBe(0);
+    expect(r.verdictReasons.some((x) => /engine/i.test(x))).toBe(false);
+  });
+
+  it("a live trailing-stop SELL + down engine → CRITICAL, counted as protective", async () => {
+    order({ side: "sell", trigger_type: "trailing", trail_pct: 5 });
+    const r = await gatherDigest(win);
+    expect(r.engine!.protectiveOrders).toBe(1);
+    expect(r.engine!.livePrimitives).toBe(1);
+    expect(r.verdict).toBe("critical");
+    expect(r.verdictReasons.some((x) => /UNPROTECTED/.test(x))).toBe(true);
+  });
+
+  it("a non-protective order (price_above BUY) + down engine → attention, not protective", async () => {
+    order({ side: "buy", trigger_type: "price_above", target_price_usd: 5000, trail_pct: null });
+    const r = await gatherDigest(win);
+    expect(r.engine!.protectiveOrders).toBe(0);
+    expect(r.engine!.livePrimitives).toBe(1);
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /not firing/.test(x))).toBe(true);
   });
 });
 

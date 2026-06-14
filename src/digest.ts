@@ -48,6 +48,7 @@ import { buildEquityCurve } from "./equity.js";
 import { reviewSafety } from "./safetyReview.js";
 import { gatherSafetyHeadroom } from "./safetyHeadroom.js";
 import { gatherStrategyComparison } from "./strategyCompare.js";
+import { readEngineStatus } from "./engine.js";
 
 // ── window parsing ───────────────────────────────────────────
 
@@ -292,6 +293,31 @@ export interface PromoteOutcomeSection {
   worst: { playbookId: number; name: string; verdict: "underperforming" | "diverged" } | null;
 }
 
+/**
+ * v103: engine liveness — a STANDING reliability signal. The engine daemon
+ * fires every scheduled order / DCA / rebalance AND every protective trailing
+ * stop. If it's down while standing primitives depend on it, those primitives
+ * are silently inert — and an inert trailing stop means a position is riding
+ * UNPROTECTED with nobody told. The digest must not read "healthy" while the
+ * engine is dead (same blind-spot class as v55/v57's wide-open-config gap).
+ * Distinguishes PROTECTIVE orders (downside-exit stops — inert = unprotected =
+ * critical) from other live primitives (a DCA not firing = attention).
+ */
+export interface EngineSection {
+  /** False when the engine has never written a status file on this install. */
+  everRan: boolean;
+  /** True when the engine is down: never ran, status age past the threshold,
+   *  or mid-shutdown. */
+  stale: boolean;
+  /** Seconds since the last engine tick (null when it never ran). */
+  lastTickAgoSec: number | null;
+  /** Active orders + schedules + rebalance plans — all depend on the engine. */
+  livePrimitives: number;
+  /** Active downside-exit SELL orders (trailing stop / stop-loss). Inert when
+   *  the engine is down → the position they guard is UNPROTECTED. */
+  protectiveOrders: number;
+}
+
 /** v47.5: agent trade-approval queue activity. pendingNow is the
  *  actionable number — an open intent means an agent is BLOCKED
  *  waiting on a human. */
@@ -337,6 +363,10 @@ export interface DigestReport {
    *  no deployed playbooks, or the scan failed best-effort). A STANDING
    *  signal (paper-vs-live, not window-scoped), so null in comparisons. */
   promote?: PromoteOutcomeSection | null;
+  /** v103: engine liveness — STANDING reliability signal (null when the check
+   *  failed best-effort). A down engine while protective stops are live is the
+   *  scariest silent failure: positions ride unprotected. Null in comparisons. */
+  engine?: EngineSection | null;
   /** When `--compare` was set, the same digest for the immediately-
    *  prior window with the same length. */
   comparison: {
@@ -387,6 +417,7 @@ export async function gatherDigest(args: GatherDigestArgs): Promise<DigestReport
       intents: report.intents,
       posture: report.posture,
       strategy: report.strategy,
+      engine: report.engine,
       promote,
     });
     report.verdict = re.verdict;
@@ -427,6 +458,34 @@ function gatherPosture(config: Config): PostureSection | null {
     };
   } catch {
     return null;
+  }
+}
+
+// v103: engine liveness — mirrors doctor.checkEngineLiveness's source
+// (readEngineStatus + active-primitive counts) so the two never disagree, but
+// returns STRUCTURED data and additionally isolates PROTECTIVE orders (the
+// scariest inert case). Staleness threshold matches the doctor's 6h to avoid a
+// second, divergent definition of "engine down". Best-effort → null on failure.
+const ENGINE_STALE_SECONDS = 6 * 3600;
+function gatherEngine(): EngineSection | null {
+  try {
+    const active = listOrders({ status: "active" });
+    const livePrimitives = active.length + listSchedules({ status: "active" }).length + listRebalancePlans({ status: "active" }).length;
+    // A protective order is a downside-exit SELL: a trailing stop or a hard
+    // stop-loss (price_below). Those exist to cap a position's loss — if the
+    // engine can't fire them, the position is unprotected.
+    const protectiveOrders = active.filter(
+      (o) => o.side === "sell" && (o.trigger_type === "trailing" || o.trigger_type === "price_below"),
+    ).length;
+    const status = readEngineStatus();
+    if (!status) {
+      return { everRan: false, stale: true, lastTickAgoSec: null, livePrimitives, protectiveOrders };
+    }
+    const ageSec = Math.floor((Date.now() - Date.parse(status.updatedAt)) / 1000);
+    const stale = status.stopping || ageSec > ENGINE_STALE_SECONDS;
+    return { everRan: true, stale, lastTickAgoSec: ageSec, livePrimitives, protectiveOrders };
+  } catch {
+    return null; // engine status unavailable — the digest never fails on it
   }
 }
 
@@ -545,8 +604,9 @@ function gatherWindow(args: {
   const intents = gatherIntents({ since: windowStart, now: new Date(args.nowMs) });
   const posture = gatherPosture(args.config);
   const strategy = gatherStrategyPerf({ since: windowStart });
+  const engine = gatherEngine();
 
-  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture, strategy });
+  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture, strategy, engine });
 
   let comparison: DigestReport["comparison"] = null;
   if (args.includeComparison) {
@@ -608,6 +668,7 @@ function gatherWindow(args: {
     intents,
     equity,
     strategy,
+    engine,
     comparison,
   };
 }
@@ -1019,6 +1080,9 @@ export function classifyVerdict(args: {
   /** v95: promote-outcome divergence — a promoted strategy not delivering its
    *  paper promise. The trust pipeline's most dangerous outcome. */
   promote?: PromoteOutcomeSection | null;
+  /** v103: engine liveness — a down engine while protective stops are live
+   *  means positions ride unprotected. */
+  engine?: EngineSection | null;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
@@ -1153,6 +1217,28 @@ export function classifyVerdict(args: {
     const b = args.posture.binding;
     if (b && b.label.toLowerCase().indexOf("drawdown") === -1 && (b.status === "approaching" || b.status === "exhausted")) {
       reasons.push(`${b.label} (${b.scope}) ${b.status}${b.utilizationPct != null ? ` at ${b.utilizationPct.toFixed(0)}%` : ""} — tradekit safety headroom`);
+      attention = true;
+    }
+  }
+
+  // v103: engine liveness. A down engine while standing primitives depend on it
+  // is a reliability danger no window signal catches — the digest could read
+  // "healthy" while every protective stop is silently inert. PROTECTIVE orders
+  // inert → CRITICAL (positions ride unprotected); other live primitives inert
+  // → attention (DCAs/limits not firing). No live primitives → harmless (engine
+  // is optional), so stay quiet.
+  if (args.engine && args.engine.stale) {
+    const e = args.engine;
+    const downLabel = !e.everRan ? "has never run" : "looks DOWN (status stale)";
+    if (e.protectiveOrders > 0) {
+      reasons.push(
+        `engine ${downLabel} — ${e.protectiveOrders} protective stop${e.protectiveOrders === 1 ? "" : "s"} NOT being monitored; position(s) riding UNPROTECTED — start it: tradekit engine run`,
+      );
+      critical = true;
+    } else if (e.livePrimitives > 0) {
+      reasons.push(
+        `engine ${downLabel} — ${e.livePrimitives} live primitive(s) not firing (orders/schedules/rebalances) — tradekit engine run`,
+      );
       attention = true;
     }
   }

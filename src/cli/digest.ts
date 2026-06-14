@@ -82,6 +82,16 @@ function renderText(r: DigestReport): string {
       lines.push(`  Binding limit:    ${b.label} (${b.scope}) ${b.status}${b.utilizationPct != null ? ` ${b.utilizationPct.toFixed(0)}%` : ""}`);
     }
   }
+  // v103: engine liveness — only surface when DOWN with primitives depending on it.
+  if (r.engine && r.engine.stale && (r.engine.livePrimitives > 0 || r.engine.protectiveOrders > 0)) {
+    const e = r.engine;
+    const down = !e.everRan ? "NEVER RAN" : `DOWN (last tick ${e.lastTickAgoSec != null ? `${Math.floor(e.lastTickAgoSec / 3600)}h ago` : "?"})`;
+    if (e.protectiveOrders > 0) {
+      lines.push(`  Engine:           🔴 ${down} — ${e.protectiveOrders} protective stop(s) INERT · position(s) UNPROTECTED — tradekit engine run`);
+    } else {
+      lines.push(`  Engine:           ⚠ ${down} — ${e.livePrimitives} live primitive(s) not firing — tradekit engine run`);
+    }
+  }
   lines.push(``);
   lines.push(renderAlertsText(r.alerts));
   lines.push(``);
@@ -363,6 +373,16 @@ function renderSlack(r: DigestReport): string {
   }
   if (safetyParts.length > 0) {
     lines.push(`*Safety:* ${safetyParts.join(" · ")}`);
+  }
+
+  // v103: engine liveness — only when down with primitives depending on it.
+  if (r.engine && r.engine.stale && (r.engine.livePrimitives > 0 || r.engine.protectiveOrders > 0)) {
+    const e = r.engine;
+    if (e.protectiveOrders > 0) {
+      lines.push(`*Engine:* 🔴 ${e.everRan ? "DOWN" : "never ran"} — *${e.protectiveOrders} protective stop(s) inert · position(s) unprotected*`);
+    } else {
+      lines.push(`*Engine:* ⚠ ${e.everRan ? "DOWN" : "never ran"} — ${e.livePrimitives} live primitive(s) not firing`);
+    }
   }
 
   // v95: promote-outcome divergence — promoted strategies missing their paper
