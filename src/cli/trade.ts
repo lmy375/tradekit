@@ -135,7 +135,12 @@ async function tradeOrQuote(direction: "buy" | "sell", flags: Record<string, str
     if (direction === "buy" && protectOn && !replayed && !isSimulateOnly && result.status === "success") {
       const trailPct = parseFloatFlag(flags["protect-trail"], "--protect-trail", { min: 0.1, max: 99 }) ?? 15;
       const { createEntryStop } = await import("../protect.js");
-      autoProtect = await createEntryStop({ result, trailPct, config, account: wallet.label, chain: chainName });
+      // v117: --take-profit-pct turns it into a bracket (stop + take-profit OCO).
+      const takeProfitPct = parseFloatFlag(flags["take-profit-pct"], "--take-profit-pct", { min: 0.1 }) ?? undefined;
+      const rr = result as { estimatedUsd?: number; baseAmount?: string; txHash?: string };
+      const baseAmtN = rr.baseAmount != null ? parseFloat(rr.baseAmount) : NaN;
+      const entryPriceUsd = rr.estimatedUsd != null && Number.isFinite(baseAmtN) && baseAmtN > 0 ? rr.estimatedUsd / baseAmtN : null;
+      autoProtect = await createEntryStop({ result, trailPct, config, account: wallet.label, chain: chainName, takeProfitPct, entryPriceUsd, txHash: rr.txHash });
     }
 
     if (flags["json"] === "true") {
@@ -221,6 +226,11 @@ async function tradeOrQuote(direction: "buy" | "sell", flags: Record<string, str
       if (autoProtect) {
         if (autoProtect.created) {
           console.log(`  🛡 Auto-protect: ${autoProtect.trailPct}% trailing stop on ${autoProtect.amount?.toPrecision(4)} ${autoProtect.symbol ?? "base"} (order #${autoProtect.orderId})`);
+          if (autoProtect.takeProfitOrderId != null) {
+            console.log(`  🎯 Take-profit: sell at $${autoProtect.takeProfitPriceUsd?.toFixed(6)} (order #${autoProtect.takeProfitOrderId}) — OCO bracket "${autoProtect.groupId}" (one fills, the other cancels)`);
+          } else if (autoProtect.takeProfitSkipped) {
+            console.log(`  Take-profit skipped: ${autoProtect.takeProfitSkipped}`);
+          }
         } else if (autoProtect.error) {
           console.log(`  ⚠ Auto-protect FAILED (trade is fine): ${autoProtect.error}`);
         } else if (autoProtect.skipped) {

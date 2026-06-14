@@ -182,6 +182,15 @@ export interface EntryStopResult {
   trailPct?: number;
   amount?: number;
   symbol?: string | null;
+  /** v117: when a take-profit target is requested, the stop + a price_above
+   *  sell are created as an OCO BRACKET (one fills → engine cancels the other).
+   *  These name the take-profit leg + the shared group. */
+  takeProfitOrderId?: number;
+  takeProfitPriceUsd?: number;
+  groupId?: string;
+  /** Take-profit leg couldn't be created (e.g. no entry USD price) — the stop
+   *  still protects. */
+  takeProfitSkipped?: string;
   /** Why no stop was created (not a buy / not filled / no amount). */
   skipped?: string;
   /** Order creation threw (e.g. token blacklisted) — the TRADE still happened. */
@@ -210,6 +219,15 @@ export async function createEntryStop(args: {
   account: string;
   chain: string;
   paper?: boolean;
+  /** v117: when set (> 0), ALSO create a take-profit (price_above sell) at
+   *  entryPriceUsd × (1 + takeProfitPct/100), OCO-grouped with the stop → a
+   *  complete bracket. Needs entryPriceUsd to place the target. */
+  takeProfitPct?: number;
+  /** USD price per base at entry (estimatedUsd ÷ baseAmount) — robust across
+   *  quote tokens. Required to compute the take-profit target. */
+  entryPriceUsd?: number | null;
+  /** Tx hash of the entry, for a stable OCO group id. */
+  txHash?: string;
 }): Promise<EntryStopResult> {
   const symbol = args.result.baseSymbol ?? null;
   if (args.result.direction !== "buy") {
@@ -231,6 +249,14 @@ export async function createEntryStop(args: {
     const profile = resolveProfile(args.chain, args.config);
     // Sell back to the quote the buy used (fallback to the chain's USDC).
     const quote = (args.result.quoteToken ?? profile.usdc) as `0x${string}`;
+    // v117: when a take-profit is requested AND we can place it, the stop + TP
+    // share an OCO group so the engine cancels the survivor when one fills.
+    const wantBracket = args.takeProfitPct != null && args.takeProfitPct > 0;
+    const tpTargetUsd =
+      wantBracket && args.entryPriceUsd != null && args.entryPriceUsd > 0
+        ? args.entryPriceUsd * (1 + args.takeProfitPct! / 100)
+        : null;
+    const group = tpTargetUsd != null ? `bracket-${(args.txHash ?? "").replace(/^0x/, "").slice(0, 16) || "entry"}` : undefined;
     const row = createOrderRow(
       {
         side: "sell",
@@ -242,11 +268,43 @@ export async function createEntryStop(args: {
         quote,
         baseAmount: String(amount),
         paper: args.paper ?? false,
+        group,
         note: `auto-protect on entry (v79): ${args.trailPct}% trailing stop on the ${symbol ?? "position"} just bought`,
       },
       args.config,
     );
-    return { created: true, orderId: row.id, trailPct: args.trailPct, amount, symbol };
+    const out: EntryStopResult = { created: true, orderId: row.id, trailPct: args.trailPct, amount, symbol };
+    if (wantBracket) {
+      if (tpTargetUsd == null) {
+        out.takeProfitSkipped = "no entry USD price — can't place the take-profit target (stop still active)";
+      } else {
+        out.groupId = group;
+        try {
+          const tp = createOrderRow(
+            {
+              side: "sell",
+              trigger: "price_above",
+              targetPriceUsd: tpTargetUsd,
+              chain: args.chain,
+              account: args.account,
+              base,
+              quote,
+              baseAmount: String(amount),
+              paper: args.paper ?? false,
+              group,
+              note: `auto take-profit on entry (v117): sell at $${tpTargetUsd.toFixed(6)} (+${args.takeProfitPct}% from entry), OCO with stop #${row.id}`,
+            },
+            args.config,
+          );
+          out.takeProfitOrderId = tp.id;
+          out.takeProfitPriceUsd = tpTargetUsd;
+        } catch (e) {
+          // The stop is already in place; report the TP failure without throwing.
+          out.takeProfitSkipped = (e as Error).message;
+        }
+      }
+    }
+    return out;
   } catch (e) {
     return { created: false, symbol, error: (e as Error).message };
   }

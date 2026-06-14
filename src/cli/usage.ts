@@ -112,6 +112,9 @@ TRADING
         sell for the received amount after the buy fills — source-level protection so the
         new position is never unguarded (the proactive twin of 'positions --protection' /
         'protect'). Best-effort; a stop-creation failure leaves the successful trade intact.
+        v117: add --take-profit-pct N to enter a BRACKET — the stop + a take-profit
+        (sell at entry × (1 + N/100)) as an OCO group, so when EITHER fills the engine
+        cancels the other. Pairs with risk sizing: stop caps the loss, TP books the gain.
   trade preview buy|sell --base X --quote Y --baseAmount A | --quoteAmount A [--slippage N] [--strict] [--json]
         Read-only pre-trade analysis: price impact, slippage cushion, gas %, balance fraction, safety pre-flight.
         --strict exits 1 when safety pre-flight fails (iter798 — pipeline gate before actual swap).

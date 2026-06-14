@@ -154,6 +154,13 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 .describe(
                   "v79: SOURCE-LEVEL protection — after this buy fills, auto-create a trailing-stop sell for the received amount at this % retracement, so the new position is never unprotected. The proactive twin of position_protection (detect) / protect_positions (fix after the fact). Response carries `autoProtect` { created, orderId, trailPct, amount }. Ignored on simulate. Reuses the validated order_create path (whitelist/amount/audit); a stop-creation failure leaves the successful trade intact (reported, never thrown).",
                 ),
+              takeProfitPct: z
+                .number()
+                .min(0.1)
+                .optional()
+                .describe(
+                  "v117: pair with protectTrailPct to enter a complete BRACKET — also auto-create a take-profit (price_above sell) at entry × (1 + takeProfitPct/100), OCO-grouped with the stop so when EITHER fills the engine cancels the other (no double-sell). The risk-disciplined exit twin of protectTrailPct: stop caps the loss, take-profit books the planned gain (e.g. with risk_size, set takeProfitPct to N× the stop distance for an N-R target). autoProtect then also carries { takeProfitOrderId, takeProfitPriceUsd, groupId }. Requires protectTrailPct; ignored on simulate.",
+                ),
             }
           : {}),
       },
@@ -281,12 +288,20 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                 (result as { status?: string }).status === "success"
               ) {
                 const { createEntryStop } = await import("../protect.js");
+                // v117: USD price per base at entry (robust across quote tokens)
+                // → the take-profit target. estimatedUsd is the trade's USD value.
+                const r = result as { estimatedUsd?: number; baseAmount?: string; txHash?: string };
+                const baseAmt = r.baseAmount != null ? parseFloat(r.baseAmount) : NaN;
+                const entryPriceUsd = r.estimatedUsd != null && Number.isFinite(baseAmt) && baseAmt > 0 ? r.estimatedUsd / baseAmt : null;
                 const autoProtect = await createEntryStop({
                   result: result as unknown as Parameters<typeof createEntryStop>[0]["result"],
                   trailPct: protectTrailPct,
                   config,
                   account: wallet.label,
                   chain: wallet.chain,
+                  takeProfitPct: (input as { takeProfitPct?: number }).takeProfitPct,
+                  entryPriceUsd,
+                  txHash: r.txHash,
                 });
                 return { ...result, autoProtect };
               }

@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 117 — 入场即括号单：止损 + 止盈作为 OCO 一步挂上，完成风险纪律入场闭环（protect-on-entry bracket — stop-loss + take-profit as one OCO, completing the risk-disciplined entry lifecycle）** ✅
+- **补全"入场即被完整管理的持仓"生命周期**：v105 按风险定仓、v80 入场即挂追踪止损——但只挂了**下行止损**，没有**计划的止盈出口**。完整的风险纪律交易是一个 bracket：止损（封顶 1R 风险）+ 止盈（兑现计划收益），二者 OCO（一个成交→另一个撤销）。之前 agent 得手动再挂止盈单
+- 为什么重要：这是 agent 持仓生命周期的闭环，与 v105 完美组合——按风险 R 定仓、止损在 stop 距离、止盈设在 N×R → 一步进入一个 R-multiple 目标的全托管仓。让"纪律入场"成为一次原子操作（同 v93/v105.1 的"让正确的事变容易"）。OCO 基础设施（group_id + 成交级联撤销 OCO_PEER_FIRED）早已存在且专为 bracket 设计
+- 实现（复用 OCO + createOrderRow，零执行路径改动）：createEntryStop 加 takeProfitPct + entryPriceUsd（= estimatedUsd÷baseAmount，跨报价代币稳健）+ txHash。给定止盈%时，止损与一个 price_above 卖单（target = entry×(1+pct/100)）共享 OCO group → 一个成交引擎撤另一个（无双卖）。无 entry 价→只挂止损 + takeProfitSkipped 说明。MCP buy 加 takeProfitPct 参数（配合 protectTrailPct）；CLI buy 加 --take-profit-pct；render 显示止盈腿 + bracket group
+- 测试覆盖：+4——止盈%+entry 价→止损+止盈同 OCO group、target 精确、同额（OCO 防双卖）/ 无 entry 价→只止损+skip 说明 / 无止盈%→纯止损无 group（行为不变）；3600 测试全绿（+4）
+- 向后兼容：纯加法——takeProfitPct optional（不传则纯止损，与 v80 完全一致）；复用 OCO 成交级联；executeTrade 执行路径零改动（best-effort caller 级，失败不影响成交）
+
 **Phase 116 — edge 指标上 Web 策略页：运营商在资金分配界面看到 profit factor，而非只看胜率（trading-edge metrics on the web Strategy table — capital allocation sees edge, not just win rate）** ✅
 - **把 v114 的 edge 信号搬到运营商做资金分配的界面**：v114 给策略对比加了 profit factor/payoff/expectancy，但 web Strategy 页（v87 的排名表，运营商在这里决定"加仓谁、砍谁"）只显示 realized $ / 胜率 / closes / trades / volume——**没有 profit factor**。胜率会骗人（70% 胜率仍可能流血），运营商在 web 上看不到真正判断 edge 的信号
 - 为什么重要：资金分配是 v83 的初衷。web 是运营商主盯的界面（v86/87/102 的"关键信号上滞后 web 界面"模式）。让 profit factor 在排名表里一眼可见——绿(≥1.2)/黄(1-1.2)/红(<1) 配色——把"看着不亏、实则脆弱"的策略当场标红，正是分配决策需要的

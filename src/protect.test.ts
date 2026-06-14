@@ -155,4 +155,46 @@ describe("createEntryStop (v79 source-level protection)", () => {
     expect(r.created).toBe(false);
     expect(r.skipped).toMatch(/fill/i);
   });
+
+  // v117: a take-profit target turns the entry into an OCO bracket.
+  it("with takeProfitPct + entryPriceUsd → stop + take-profit as one OCO group", async () => {
+    // entry $2000/unit, +50% take-profit → target $3000.
+    const r = await createEntryStop({
+      result: buyResult, trailPct: 10, config, account: "default", chain: "base", paper: true,
+      takeProfitPct: 50, entryPriceUsd: 2000, txHash: "0xabc123def456789a",
+    });
+    expect(r.created).toBe(true);
+    expect(r.orderId).toBeDefined();
+    expect(r.takeProfitOrderId).toBeDefined();
+    expect(r.takeProfitPriceUsd).toBeCloseTo(3000, 6);
+    expect(r.groupId).toBeTruthy();
+    const orders = listOrders({ status: "active" });
+    expect(orders).toHaveLength(2);
+    const stop = orders.find((o) => o.trigger_type === "trailing")!;
+    const tp = orders.find((o) => o.trigger_type === "price_above")!;
+    // Both legs in the SAME OCO group → one fills, the engine cancels the other.
+    expect(stop.group_id).toBe(r.groupId);
+    expect(tp.group_id).toBe(r.groupId);
+    expect(tp.target_price_usd).toBeCloseTo(3000, 6);
+    // Same amount on both legs (no double-sell — OCO guarantees only one fires).
+    expect(parseFloat(tp.base_amount!)).toBeCloseTo(1.5, 6);
+  });
+
+  it("take-profit requested but no entry price → stop only, take-profit skipped", async () => {
+    const r = await createEntryStop({
+      result: buyResult, trailPct: 10, config, account: "default", chain: "base", paper: true,
+      takeProfitPct: 50, entryPriceUsd: null,
+    });
+    expect(r.created).toBe(true);
+    expect(r.takeProfitOrderId).toBeUndefined();
+    expect(r.takeProfitSkipped).toMatch(/entry USD price/);
+    expect(listOrders({ status: "active" })).toHaveLength(1); // stop only, no group
+    expect(listOrders({ status: "active" })[0].group_id).toBeNull();
+  });
+
+  it("no takeProfitPct → plain trailing stop, no OCO group (unchanged)", async () => {
+    const r = await createEntryStop({ result: buyResult, trailPct: 10, config, account: "default", chain: "base", paper: true });
+    expect(r.takeProfitOrderId).toBeUndefined();
+    expect(listOrders({ status: "active" })[0].group_id).toBeNull();
+  });
 });
