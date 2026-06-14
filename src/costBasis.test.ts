@@ -15,7 +15,8 @@ import { describe, it, expect } from "vitest";
 import { applyBuy, applySell, FLAT_EPSILON, type CostBasisState } from "./costBasis.js";
 import { computePaperPnlMtm, type PaperPriceFetcher } from "./paperPnl.js";
 import { netPosition, type FillRowLite } from "./positionCaps.js";
-import type { PaperTradeRow } from "./db.js";
+import { enrichTradesForExport, quoteUsdAtTradeForExport } from "./tradeExport.js";
+import type { PaperTradeRow, TradeRow } from "./db.js";
 
 // ── unit: the shared reducer ───────────────────────────────
 
@@ -157,6 +158,76 @@ describe("coherence: MTM walker ≡ netPosition (shared cost-basis core)", () =>
       const cap = netPosition(capRows(fills), { token: WETH });
       expect(cap.baseAmount).toBeCloseTo(walker.amount, 9);
       expect(cap.costQuote).toBeCloseTo(walker.cost, 6);
+    });
+  }
+});
+
+// v82: extend the guard to the REAL-money realized PnL surfaces consolidated
+// this iteration — the tax export (tradeExport) must book the SAME realized
+// gain the MTM walker does for the same fills. (pnl.ts now shares the reducer
+// too; its realized math is pinned by pnl.test.ts behavior-preservation.)
+function exportRows(fills: Fill[]): TradeRow[] {
+  return fills.map((f, i) => ({
+    id: i + 1,
+    timestamp: f.ts,
+    chain: "base",
+    account: "default",
+    direction: f.dir,
+    base_token: WETH,
+    base_symbol: "WETH",
+    base_amount: f.base,
+    quote_token: USDC,
+    quote_symbol: "USDC",
+    quote_amount: f.quote,
+    price: "0",
+    tx_hash: `0x${(i + 1).toString(16).padStart(64, "0")}`,
+    status: "success",
+    gas_used: null,
+    gas_price_wei: null,
+    gas_cost_native: null,
+    aggregator: null,
+    fee_tier: null,
+    notes: null,
+  }));
+}
+
+async function walkerRealized(fills: Fill[]): Promise<number> {
+  const { summaries } = await computePaperPnlMtm(walkerRows(fills), noPrice);
+  return summaries.reduce((s, x) => s + x.realizedQuote, 0);
+}
+
+describe("coherence: tax export ≡ MTM walker realized PnL (shared cost-basis core, v82)", () => {
+  const SCENARIOS: Record<string, Fill[]> = {
+    "single sell at a gain": [
+      { dir: "buy", base: "2", quote: "4000", ts: "2026-06-01T00:00:00Z" },
+      { dir: "sell", base: "1", quote: "2500", ts: "2026-06-03T00:00:00Z" }, // avg 2000, +500
+    ],
+    "two buys then sell (weighted avg)": [
+      { dir: "buy", base: "1", quote: "2000", ts: "2026-06-01T00:00:00Z" },
+      { dir: "buy", base: "1", quote: "3000", ts: "2026-06-02T00:00:00Z" }, // avg 2500
+      { dir: "sell", base: "1", quote: "2800", ts: "2026-06-03T00:00:00Z" }, // +300
+    ],
+    "sell at a loss": [
+      { dir: "buy", base: "1", quote: "3000", ts: "2026-06-01T00:00:00Z" },
+      { dir: "sell", base: "1", quote: "2400", ts: "2026-06-02T00:00:00Z" }, // -600
+    ],
+    "over-sell beyond holdings": [
+      { dir: "buy", base: "1", quote: "2000", ts: "2026-06-01T00:00:00Z" },
+      { dir: "sell", base: "3", quote: "7500", ts: "2026-06-02T00:00:00Z" }, // only 1 tracked
+    ],
+    "fractional round trip": [
+      { dir: "buy", base: "0.37", quote: "1110", ts: "2026-06-01T00:00:00Z" },
+      { dir: "buy", base: "0.13", quote: "455", ts: "2026-06-02T00:00:00Z" },
+      { dir: "sell", base: "0.2", quote: "640", ts: "2026-06-03T00:00:00Z" },
+    ],
+  };
+
+  for (const [name, fills] of Object.entries(SCENARIOS)) {
+    it(name, async () => {
+      const enriched = enrichTradesForExport(exportRows(fills), quoteUsdAtTradeForExport);
+      const exportRealized = enriched.reduce((s, r) => s + (r.realized_pnl_usd ?? 0), 0);
+      const walker = await walkerRealized(fills);
+      expect(exportRealized).toBeCloseTo(walker, 6);
     });
   }
 });

@@ -24,6 +24,7 @@
 // that historical prices aren't backfilled).
 
 import type { TradeRow } from "./db.js";
+import { applyBuy, applySell } from "./costBasis.js";
 
 export interface EnrichedTradeRow extends TradeRow {
   /**
@@ -123,30 +124,23 @@ export function enrichTradesForExport(
         if (row.direction === "buy") {
           // Buy: ADD to position. cost_basis_usd represents the buy's USD value
           // (what's being added to basis). proceeds is null (you're paying, not receiving).
-          pos.amount += baseAmt;
-          pos.cost += tradeUsd;
+          applyBuy(pos, baseAmt, tradeUsd);
           costBasisUsd = tradeUsd;
           proceedsUsd = null;
           realizedPnlUsd = null;
         } else {
-          // Sell: REMOVE from position. cost_basis_usd is the avg cost × sold amount.
-          // proceeds is the USD received; realized = proceeds - cost basis released.
-          const avgCost = pos.amount > 0 ? pos.cost / pos.amount : 0;
-          const sold = Math.min(baseAmt, Math.max(0, pos.amount));
-          const releasedCost = avgCost * sold;
-          // The sell may attempt to close MORE than the open position (e.g. data
-          // gap / imported sell without a prior buy). We cap proceeds at the
-          // sold-from-position amount × sell-price-per-unit — the over-sold
-          // amount has cost_basis=0 (effectively pure gain since we have no
-          // prior buy to attribute against). For consistency with pnl.ts which
-          // also caps, do the same here.
+          // Sell: REMOVE from position via the shared reducer (v82 — the same
+          // cost-basis core pnl.ts / the MTM walker / position caps use, so the
+          // tax-export numbers can't drift from the PnL surfaces). cost_basis is
+          // the avg cost × sold; proceeds is USD received; realized = the diff.
+          // The over-sold amount (sell beyond the open position) gets cost_basis
+          // 0 — pure gain, no prior buy to attribute against — same cap pnl.ts uses.
+          const { sold, costRemoved } = applySell(pos, baseAmt);
           const sellPricePerUnit = tradeUsd / baseAmt;
           const proceedsForSold = sold * sellPricePerUnit;
-          costBasisUsd = releasedCost;
+          costBasisUsd = costRemoved;
           proceedsUsd = proceedsForSold;
-          realizedPnlUsd = proceedsForSold - releasedCost;
-          pos.amount -= sold;
-          pos.cost = Math.max(0, pos.cost - releasedCost);
+          realizedPnlUsd = proceedsForSold - costRemoved;
         }
       }
     }

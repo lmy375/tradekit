@@ -1,5 +1,6 @@
 import type { TradeRow } from "./db.js";
 import { allTrades } from "./db.js";
+import { applyBuy, applySell } from "./costBasis.js";
 import { getCurrentPrice } from "./price.js";
 import { getBuiltinProfile } from "./chains.js";
 import type { Logger } from "./logger.js";
@@ -651,14 +652,16 @@ export function aggregateTrades(
     }
 
     if (row.direction === "buy") {
-      // Acquire baseAmt at avg cost tradeUsd/baseAmt
-      acc.amount += baseAmt;
-      acc.cost += tradeUsd;
+      // Acquire baseAmt at avg cost tradeUsd/baseAmt — via the shared reducer
+      // (v82: the same cost-basis core the MTM walker / position caps / tax
+      // export use, so the headline real-money PnL can't drift from them).
+      applyBuy(acc, baseAmt, tradeUsd);
     } else {
       // Sell baseAmt at price (tradeUsd/baseAmt). Realize PnL against avg cost.
-      const avgCost = acc.amount > 0 ? acc.cost / acc.amount : 0;
+      // applySell caps the sale at the open position + mutates acc.amount/cost;
+      // the returned avgCost/sold drive the realized attribution below.
       const sellPricePerUnit = tradeUsd / baseAmt;
-      const sold = Math.min(baseAmt, Math.max(0, acc.amount)); // cap sale at current position
+      const { avgCost, sold } = applySell(acc, baseAmt);
       const realizedForThisSale = (sellPricePerUnit - avgCost) * sold;
       acc.realized += realizedForThisSale;
       // Iter636: also attribute realized to the executing aggregator.
@@ -679,10 +682,7 @@ export function aggregateTrades(
           }
         }
       }
-      // Decrease both amount and cost proportionally
-      const reduceCost = avgCost * sold;
-      acc.amount -= sold;
-      acc.cost = Math.max(0, acc.cost - reduceCost);
+      // (acc.amount / acc.cost already reduced by applySell above.)
     }
   }
 

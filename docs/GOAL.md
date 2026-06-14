@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 82 — 成本基准合一收尾：真实 PnL + 税务导出（finish the cost-basis unification — the real-money & tax numbers join the shared reducer）** ✅
+- **补 v71 的遗漏，硬化最重要的数字（真钱 PnL + 报税），而非加 feature**：v71 把成本基准合一到 `costBasis.ts`，宣称"数字不可能再分歧"——但只覆盖了 paper walker + netPosition。本期发现它**漏掉了两个最要命的真钱面**：`pnl.ts`（运营商看的**头条 PnL**）和 `tradeExport.ts`（运营商**用来报税**的已实现盈亏）各有一份**独立内联**的加权平均成本基准实现。同一算法第三、第四份拷贝——正是 v71 要消灭的漂移风险，却漏在影响最大的地方
+- 为什么是最重要的：安全做到极致后，"信任的数字"是产品根基。头条 PnL 和**税务**数字来自与 paper/cap 不同的成本基准实现，可能彼此漂移——这是最坏的信任 bug（每个面单独看都自洽，报税数字却可能与 PnL 面不一致）。v71 的"不可能再分歧"承诺**实质不完整**
+- 实现（提取，零行为变化）：`pnl.ts` 的内联 walk（买：amount/cost 累加；卖：avgCost/sold 归约）+ `tradeExport.ts` 的税务 walk，全部改为 reduce through v71 的 `applyBuy`/`applySell`。pnl 卖出用返回的 {avgCost, sold} 算 realizedForThisSale；tradeExport 用返回的 {sold, costRemoved} 算 cost_basis/proceeds/realized。两处 mutation 由 applySell 内部完成，移除手写归约
+- 现状：成本基准实现从**四份独立拷贝**收敛到**一处定义**——`costBasis.ts` 被 paper walker（v71）、netPosition（v71）、**pnl.ts 真实 PnL（本期）**、**tradeExport.ts 税务导出（本期）** 全部共享。按构造不可能再分歧
+- 测试覆盖：既有 pnl.test + tradeExport.test 137 case **全部不变通过**（证明零行为变化）；`costBasis.test.ts` +5 **跨实现一致性守卫**——同一组 fills 喂税务导出（enrichTradesForExport 汇总 realized_pnl_usd）和 MTM walker（汇总 realizedQuote），断言已实现盈亏一致（单笔盈利/两买加权/亏损/超卖/分数往返）。v71 的守卫只比净额+成本，本期加比 realized PnL
+- 向后兼容：纯提取重构——零行为变化、零新 surface、零新 MCP 工具（is a hardening pass, not a feature pile-on）；3425 测试全绿（+5，无回归）
+- 影响面：所有成本基准/已实现盈亏数字现在源自一处——pnl、gains、open_positions、position cap、sizing、**头条 PnL、税务 CSV** 数学上保证同源
+
 **Phase 81 — 风险态势进主仪表盘（risk posture in the health dashboard — make the v78 verdict visible where the operator looks）** ✅
 - **让最重要的信号到达运营商，而非加新检测器**：v78 把运行时风险合成为单一裁决，但只在 `risk` 命令里——运营商跑自主 agent 时**永不会被告知** book 转危，得记得去 poll。本期把统一风险裁决折进 `health`（运营商日常看的主仪表盘），可见性即价值
 - 为什么是最重要的：安全检测做透了，但**检测到没人看见 = 没检测**。health 是 agent/运营商的"晨报"，是评估信任的地方。把"Risk: ELEVATED — WETH 占 80%"放进去，运营商一眼看到，不必记得跑 `risk`
