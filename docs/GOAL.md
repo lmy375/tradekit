@@ -33,6 +33,19 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 55 — 安全态势进主仪表盘（safety posture + headroom in `health`）** ✅
+- 不是新工具，是**让既有投资落到运营商真正看的地方**：v51 safety_review（配置态势）和 v53 safety_headroom（运行时余量）是独立命令——运营商得**记得去跑**。但运营商的主交互是 `tradekit health`（一键仪表盘）和 cron `digest`。`health` 的 SECURITY 段**只讲 allowances**，对两个最危险状态——配置 EXPOSED（safety 关掉 / 没有任何 USD 上限 → agent 交易无界）和运行时逼近限额（日限额快花完 / 预算/仓位 cap 逼近 / drawdown 熔断已触发）——**完全盲**。本迭代把它们接进主仪表盘
+- 这是"针对最重要的东西优化"而非"加量"：没有新增 MCP 工具，只丰富既有 `health` 表面
+- `health.ts` 新增 `HealthSafetySection`：v51 态势 verdict（hardened/moderate/exposed）+ critical/warn gap 数 + 最严重 gap 一行 + v53 binding（最紧的运行时限额：label/scope/utilization/status）
+- `composeHealthReport` 保持纯 compose 契约：`reviewSafety`（纯读 config）在 compose 内跑；`gatherSafetyHeadroom`（读 DB）由 CLI/MCP 层算好传入——与 portfolio/pnl 同款编排模式。新增 `safety_failed` 错误码，headroom 失败降级为只剩 config-posture 半边，不破仪表盘
+- `deriveNextActions` 两条新规则（接进运营商真正会扫的 recommendedActions 流）：
+  - **safety_exposed**（critical）：态势 verdict===exposed → "Wallet safety posture is EXPOSED: <最严重 gap>"，command `tradekit safety review`
+  - **limit_near_exhaustion**：binding 非 ok → 严重度随状态（tripped→critical[交易已停]、exhausted→high、approaching→medium），command `tradekit safety headroom`
+- CLI `health` 文本新增 SAFETY 段（posture 徽章 + binding limit），新 actions 自动进 NEXT ACTIONS（已按严重度排序）；MCP `health` 报告加 `safety` 字段（纯加法）
+- 测试覆盖：`health.test.ts` +7（buildSafetySection：exposed 态势 + 折入 binding + hardened 无 binding；deriveNextActions：safety_exposed critical / hardened 不触发 / binding 严重度映射 tripped→critical exhausted→high approaching→medium / ok binding 不触发）。现有 87 个 health 测试零改动通过——纯加法的根本证明
+- 向后兼容：纯加法——无 schema migration、无新 MCP 工具、`safety` 字段仅在传入 config 时出现；不传则 `health` 行为与升级前逐字节一致
+- v1 限制：headroom 用 active account/chain（`health` 可多账户 scope，但 daily-USD/rate-limit 是 per account+chain——仪表盘取默认 scope，深查用 `safety headroom --account`）；digest cron 一行**未**接入本迭代（health 是主仪表盘，先做它；digest 集成留作对称跟进）；态势是配置静态审计，不查"刚才那笔会不会过"（那是 v54 admissibility 的职责）
+
 **Phase 54 — 交易前限额投影（pre-trade limit projection — "will this trade actually be ADMITTED, or bounce off a limit?"）** ✅
 - 修复**最重要的交易决策工具**的"沉默不完整"：`trade preview` / `preview_trade` 只跑**廉价子集**（`enforcePreflightSafety` = slippage 上限 + token 白/黑名单，iter405 拆分）。**状态相关**的执行护栏——per-tx / daily USD 上限、contract whitelist、per-strategy 预算、净敞口 position cap、交易限频、gas 预算——只在**执行时**才触发。结果：agent 读到 `safety.passes=true`，调 buy，却吃一个它**无法预见**的 `SAFEGUARD_TRIGGERED` / `STRATEGY_BUDGET_EXCEEDED` / `POSITION_CAP_EXCEEDED` 拒绝
 - 新模块 `tradeAdmissibility.ts`（~200 行）：`projectTradeLimits()` 为一笔**预期交易**投影完整的执行护栏。**关键设计——零偏差**：它在 try/catch 里跑**真正的抛错 enforcer**（`enforceSafety` / `enforceRateLimit` / `enforceStrategyBudget` / `enforcePositionCap` / `enforceGasBudget`），而**不是**重新推导阈值——所以投影**永远不可能**与执行实际行为不一致。一个"会撒谎的 preview"比没有 preview 更糟；复用执行代码让撒谎不可能

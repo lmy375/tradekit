@@ -32,11 +32,13 @@ import type { AnalyzedTrade } from "./tradeAnalysis.js";
 import type { TradeRow } from "./db.js";
 import { failureReasonHistogram } from "./db.js";
 import { computeAggregatorStats } from "./aggregatorStats.js";
+import { reviewSafety } from "./safetyReview.js";
+import type { SafetyHeadroomReport } from "./safetyHeadroom.js";
 import { computePairStats } from "./pairStats.js";
 
 export interface HealthSectionError {
   /** Stable code an agent can branch on. */
-  code: "portfolio_failed" | "pnl_failed" | "approvals_failed" | "trades_failed" | "snapshots_failed";
+  code: "portfolio_failed" | "pnl_failed" | "approvals_failed" | "trades_failed" | "snapshots_failed" | "safety_failed";
   /** Human-readable error message. */
   message: string;
 }
@@ -136,6 +138,28 @@ export interface SecuritySection {
   }>;
 }
 
+/** v55: the safety dimension of the dashboard — composes the v51 config
+ *  posture (what protects me) with the v53 runtime binding constraint
+ *  (how much room is left), so `health` answers "is my agent bounded AND
+ *  not about to hit a wall?" without the operator running two more tools. */
+export interface HealthSafetySection {
+  /** v51 config posture: hardened | moderate | exposed. */
+  postureVerdict: "hardened" | "moderate" | "exposed";
+  criticalGaps: number;
+  warnGaps: number;
+  /** Worst-severity gap finding, for the one-line summary. */
+  topGap?: string;
+  /** v53 binding (tightest active) runtime limit. Absent when no
+   *  quantitative limit is configured. */
+  binding?: {
+    label: string;
+    scope: string;
+    utilizationPct: number | null;
+    status: "ok" | "approaching" | "exhausted" | "tripped";
+    detail: string;
+  };
+}
+
 export interface NextAction {
   code:
     | "reconcile_pending"
@@ -165,7 +189,15 @@ export interface NextAction {
     // Iter743: sync bookmark hasn't advanced past the freshness threshold
     // (48h default — same as PnLReport.dataFreshness). Cron likely broken;
     // PnL silently incomplete.
-    | "stale_sync";
+    | "stale_sync"
+    // v55: the wallet's safety CONFIG posture has a CRITICAL gap (safety
+    // disabled, or no per-tx AND no daily USD ceiling) — agent trading is
+    // effectively unbounded. Surfaced from the v51 safety_review.
+    | "safety_exposed"
+    // v55: an active runtime guardrail is near (or past) its limit — daily
+    // USD nearly spent, a strategy budget/position cap approaching, or the
+    // drawdown breaker tripped. Surfaced from the v53 safety_headroom.
+    | "limit_near_exhaustion";
   /** Imperative description an operator can act on. */
   message: string;
   /** Suggested CLI invocation. */
@@ -198,6 +230,8 @@ export interface HealthReport {
   pnl?: PnLSection;
   trades?: TradesSection;
   security?: SecuritySection;
+  /** v55: config posture (v51) + binding runtime limit (v53). */
+  safety?: HealthSafetySection;
   errors: HealthSectionError[];
   /** Composed list of next-action suggestions derived from the section data
    *  (e.g. "you have 2 pending trades — run reconcile"). Empty array when
@@ -258,6 +292,10 @@ export function deriveNextActions(args: {
    *  When non-empty, fires the stale_sync rule (high severity) so cron-watch
    *  operators see the cron-broken signal in their nextActions stream. */
   staleBookmarks?: Array<{ chain: string; account: string; ageHours: number }>;
+  /** v55: the safety dimension — drives safety_exposed (config posture
+   *  has a critical gap) + limit_near_exhaustion (a runtime guardrail is
+   *  near/past its limit). */
+  safety?: HealthSafetySection;
 }): NextAction[] {
   const actions: NextAction[] = [];
 
@@ -444,6 +482,34 @@ export function deriveNextActions(args: {
       message,
       command: `tradekit pairs stats   # then use --auto-slippage when trading the flagged pair`,
       severity: "high",
+    });
+  }
+
+  // v55 rule (critical): the config posture is EXPOSED — a critical
+  // guardrail gap (safety disabled, or no USD ceiling at all) means agent
+  // trading is unbounded. This belongs in the operator's primary dashboard,
+  // not only in a `safety review` they have to remember to run.
+  if (args.safety && args.safety.postureVerdict === "exposed") {
+    actions.push({
+      code: "safety_exposed",
+      message: `Wallet safety posture is EXPOSED (${args.safety.criticalGaps} critical gap${args.safety.criticalGaps === 1 ? "" : "s"})${args.safety.topGap ? `: ${args.safety.topGap}` : ""}.`,
+      command: "tradekit safety review",
+      severity: "critical",
+    });
+  }
+
+  // v55 rule: a runtime guardrail is near or past its limit. Severity
+  // tracks how close: a tripped drawdown breaker (trading halted) is
+  // critical, an exhausted cap high, an approaching one medium.
+  if (args.safety?.binding && args.safety.binding.status !== "ok") {
+    const b = args.safety.binding;
+    const severity: NextAction["severity"] =
+      b.status === "tripped" ? "critical" : b.status === "exhausted" ? "high" : "medium";
+    actions.push({
+      code: "limit_near_exhaustion",
+      message: `${b.label} (${b.scope}) is ${b.status}${b.utilizationPct != null ? ` at ${b.utilizationPct.toFixed(0)}%` : ""} — ${b.detail}`,
+      command: "tradekit safety headroom",
+      severity,
     });
   }
 
@@ -701,6 +767,39 @@ export function buildPnLSection(report: PnLReport, windowLabel = "7d"): PnLSecti
  * via the existing primitives so that each surface controls its own error/
  * retry strategy. This keeps health.ts pure-compose and easily testable.
  */
+/**
+ * v55: compose the safety dimension from the v51 config posture +
+ * (optional) v53 runtime headroom. Pure — reviewSafety reads config only;
+ * the headroom (which reads the DB) is computed by the caller and passed in.
+ */
+export function buildSafetySection(
+  config: Config,
+  headroom?: SafetyHeadroomReport,
+): HealthSafetySection {
+  const posture = reviewSafety(config);
+  // Worst-severity gap finding for the one-liner (critical before warn).
+  const worst =
+    posture.gaps.find((g) => g.severity === "critical") ??
+    posture.gaps.find((g) => g.severity === "warn");
+  const section: HealthSafetySection = {
+    postureVerdict: posture.verdict,
+    criticalGaps: posture.counts.critical,
+    warnGaps: posture.counts.warn,
+    ...(worst ? { topGap: worst.finding } : {}),
+  };
+  if (headroom?.binding) {
+    const b = headroom.binding;
+    section.binding = {
+      label: b.label,
+      scope: b.scope,
+      utilizationPct: b.utilizationPct,
+      status: b.status,
+      detail: b.detail,
+    };
+  }
+  return section;
+}
+
 export function composeHealthReport(args: {
   scope: { accounts: AccountResolution[]; chains: string[] };
   portfolio?: PortfolioReport | { error: string };
@@ -725,6 +824,13 @@ export function composeHealthReport(args: {
    *  the full fan-out (portfolio + pnl + analyses + approvals) + compose.
    *  Optional so existing callers that don't measure don't need updates. */
   elapsedMs?: number;
+  /** v55: config for the safety-posture review (pure, config-only). When
+   *  supplied, the report gains a `safety` section + safety_exposed rule. */
+  config?: Config;
+  /** v55: pre-computed runtime headroom (reads the DB, so the CLI/MCP layer
+   *  computes it — same orchestrator contract as portfolio/pnl). Drives the
+   *  binding-constraint summary + limit_near_exhaustion rule. */
+  headroom?: SafetyHeadroomReport | { error: string };
 }): HealthReport {
   const errors: HealthSectionError[] = [];
 
@@ -784,6 +890,16 @@ export function composeHealthReport(args: {
       }))
     : undefined;
 
+  // v55: safety posture (pure config review) + binding runtime headroom.
+  let safety: HealthSafetySection | undefined;
+  if (args.headroom && "error" in args.headroom) {
+    errors.push({ code: "safety_failed", message: args.headroom.error });
+  }
+  if (args.config) {
+    const headroom = args.headroom && !("error" in args.headroom) ? args.headroom : undefined;
+    safety = buildSafetySection(args.config, headroom);
+  }
+
   const nextActions = deriveNextActions({
     portfolio,
     trades,
@@ -791,6 +907,7 @@ export function composeHealthReport(args: {
     daysSinceLastSnapshot: args.daysSinceLastSnapshot,
     legacyBackfillCounts: args.legacyBackfillCounts,
     ...(staleBookmarks && staleBookmarks.length > 0 ? { staleBookmarks } : {}),
+    ...(safety ? { safety } : {}),
   });
 
   // Iter764: pre-compute severity counts so dashboard consumers don't have to.
@@ -829,6 +946,7 @@ export function composeHealthReport(args: {
     pnl,
     trades,
     security,
+    ...(safety ? { safety } : {}),
     errors,
     nextActions,
     nextActionsSummary,

@@ -847,6 +847,15 @@ export const registerDataTools: RegisterFn = (server, rt) => {
               rt.opts.logger.debug(`legacy backfill count failed: ${(e as Error).message}`);
             }
 
+            // v55: runtime headroom for the safety section (best-effort).
+            let healthHeadroom: import("../safetyHeadroom.js").SafetyHeadroomReport | { error: string } | undefined;
+            try {
+              const { gatherSafetyHeadroom } = await import("../safetyHeadroom.js");
+              healthHeadroom = gatherSafetyHeadroom({ config });
+            } catch (e) {
+              healthHeadroom = { error: (e as Error).message };
+            }
+
             return {
               ok: true,
               ...composeHealthReport({
@@ -862,6 +871,8 @@ export const registerDataTools: RegisterFn = (server, rt) => {
                 portfolioDelta7d: snapshotInputs.delta7d,
                 lastSnapshotAt: snapshotInputs.lastSnapshotAt,
                 legacyBackfillCounts,
+                config,
+                headroom: healthHeadroom,
                 // Iter729: orchestration wall-clock for the MCP path.
                 elapsedMs: Date.now() - t0,
               }),

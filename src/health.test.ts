@@ -10,10 +10,13 @@ import {
   buildPnLSection,
   buildSecuritySection,
   buildTradesSection,
+  buildSafetySection,
   deriveNextActions,
   formatUsdDelta,
   medianAndAvg,
 } from "./health.js";
+import { configSchema, type Config } from "./config.js";
+import type { SafetyHeadroomReport } from "./safetyHeadroom.js";
 import type { Address } from "viem";
 import type { PortfolioReport } from "./portfolio.js";
 import type { PnLReport } from "./pnl.js";
@@ -1182,5 +1185,70 @@ describe("buildTradesSection failureReasons (iter671)", () => {
     const rows = [row({ id: 1, status: "success" })];
     const section = buildTradesSection({ rows, analyses: [], since7d: since });
     expect(section.failureReasons).toEqual([]);
+  });
+});
+
+// ── v55: safety section + next-action rules ──────────────────
+
+describe("buildSafetySection (v55)", () => {
+  const cfg = (over: Partial<Config["safety"]> = {}): Config =>
+    ({ ...configSchema.parse({}), safety: { ...configSchema.parse({}).safety, ...over } } as Config);
+
+  it("exposes the v51 posture verdict + gap counts + worst gap", () => {
+    // Default config has no USD ceiling → exposed (critical gap).
+    const s = buildSafetySection(cfg());
+    expect(s.postureVerdict).toBe("exposed");
+    expect(s.criticalGaps).toBeGreaterThan(0);
+    expect(s.topGap).toMatch(/USD ceiling|disabled/);
+  });
+
+  it("a hardened config reports hardened with no binding when no headroom passed", () => {
+    const s = buildSafetySection(cfg({ perTxUsdLimit: 100, tokenBlacklist: { base: ["0x1"] } }));
+    expect(["hardened", "moderate"]).toContain(s.postureVerdict);
+    expect(s.binding).toBeUndefined();
+  });
+
+  it("folds in the v53 binding constraint when headroom is supplied", () => {
+    const headroom = {
+      generatedAt: "x", account: "default", chain: "base", entries: [], counts: { ok: 0, approaching: 1, exhausted: 0, tripped: 0 },
+      binding: { key: "dailyUsd", label: "Daily USD cap", scope: "account:default × base", limit: 1000, used: 850, remaining: 150, utilizationPct: 85, status: "approaching" as const, detail: "$850 of $1000" },
+    } as unknown as SafetyHeadroomReport;
+    const s = buildSafetySection(cfg({ perTxUsdLimit: 100, tokenBlacklist: { base: ["0x1"] } }), headroom);
+    expect(s.binding?.label).toBe("Daily USD cap");
+    expect(s.binding?.status).toBe("approaching");
+    expect(s.binding?.utilizationPct).toBe(85);
+  });
+});
+
+describe("deriveNextActions — v55 safety rules", () => {
+  it("exposed posture → safety_exposed (critical)", () => {
+    const actions = deriveNextActions({
+      safety: { postureVerdict: "exposed", criticalGaps: 1, warnGaps: 0, topGap: "no USD ceiling" },
+    });
+    const a = actions.find((x) => x.code === "safety_exposed");
+    expect(a?.severity).toBe("critical");
+    expect(a?.command).toMatch(/safety review/);
+  });
+
+  it("hardened posture → no safety_exposed", () => {
+    const actions = deriveNextActions({ safety: { postureVerdict: "hardened", criticalGaps: 0, warnGaps: 0 } });
+    expect(actions.some((x) => x.code === "safety_exposed")).toBe(false);
+  });
+
+  it("binding severity maps tripped→critical, exhausted→high, approaching→medium", () => {
+    const mk = (status: "tripped" | "exhausted" | "approaching") =>
+      deriveNextActions({
+        safety: { postureVerdict: "hardened", criticalGaps: 0, warnGaps: 0, binding: { label: "Daily USD cap", scope: "x", utilizationPct: 99, status, detail: "d" } },
+      }).find((x) => x.code === "limit_near_exhaustion");
+    expect(mk("tripped")?.severity).toBe("critical");
+    expect(mk("exhausted")?.severity).toBe("high");
+    expect(mk("approaching")?.severity).toBe("medium");
+  });
+
+  it("an ok binding fires no limit_near_exhaustion", () => {
+    const actions = deriveNextActions({
+      safety: { postureVerdict: "hardened", criticalGaps: 0, warnGaps: 0, binding: { label: "x", scope: "x", utilizationPct: 10, status: "ok", detail: "d" } },
+    });
+    expect(actions.some((x) => x.code === "limit_near_exhaustion")).toBe(false);
   });
 });

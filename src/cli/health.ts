@@ -344,6 +344,17 @@ async function buildHealthReport(
     logger.debug(`legacy backfill count failed: ${(e as Error).message}`);
   }
 
+  // v55: runtime headroom (config + trades/drawdown reads). Best-effort —
+  // a failure becomes a {error} placeholder so the safety section degrades
+  // to the config-posture half rather than breaking the dashboard.
+  let headroom: import("../safetyHeadroom.js").SafetyHeadroomReport | { error: string } | undefined;
+  try {
+    const { gatherSafetyHeadroom } = await import("../safetyHeadroom.js");
+    headroom = gatherSafetyHeadroom({ config });
+  } catch (e) {
+    headroom = { error: (e as Error).message };
+  }
+
   return composeHealthReport({
     scope: { accounts, chains },
     portfolio,
@@ -357,6 +368,8 @@ async function buildHealthReport(
     portfolioDelta7d: snapshotInputs.delta7d,
     lastSnapshotAt: snapshotInputs.lastSnapshotAt,
     legacyBackfillCounts,
+    config,
+    headroom,
     // Iter729: pass measured orchestration time so the report carries it.
     elapsedMs: Date.now() - t0,
   });
@@ -564,6 +577,20 @@ function renderHealthText(r: HealthReport) {
         const sp = c.spenderLabel ?? c.spender;
         console.log(`    ${badge}  ${c.symbol.padEnd(12)} → ${sp} (${c.chain})`);
       }
+    }
+    console.log("");
+  }
+
+  // SAFETY (v55) — config posture + binding runtime limit.
+  if (r.safety) {
+    console.log("SAFETY");
+    const v = { hardened: "🛡 hardened", moderate: "⚠ moderate", exposed: "⛔ EXPOSED" }[r.safety.postureVerdict];
+    console.log(`  Posture:      ${v} (${r.safety.criticalGaps} critical, ${r.safety.warnGaps} warn gap${r.safety.warnGaps === 1 ? "" : "s"})`);
+    if (r.safety.topGap) console.log(`                ${r.safety.topGap}`);
+    if (r.safety.binding) {
+      const b = r.safety.binding;
+      const badge = b.status === "tripped" || b.status === "exhausted" ? "🔴" : b.status === "approaching" ? "🟡" : "✓";
+      console.log(`  Binding limit: ${badge} ${b.label} (${b.scope})${b.utilizationPct != null ? ` — ${b.utilizationPct.toFixed(0)}% used` : ""}`);
     }
     console.log("");
   }
