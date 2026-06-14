@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 84 — 策略止损熔断（per-strategy realized-loss circuit breaker — stop a strategy that bleeds while mechanically "succeeding"）** ✅
+- **检测→行动：v83 找出流血策略，本期自动止血**：v83 按 realized P&L 排名、标出 bleeders，但**没有任何东西阻止**流血策略继续交易。既有熔断只管**操作性失败**（tx revert）和**组合回撤**（mark-to-market）——但一个策略可以**每笔都成功成交、却在已平仓交易上持续亏钱**，无人拦截。这是最阴险的资本流失：机械上"工作正常"，账上却在失血
+- 为什么是最重要的：安全=不亏钱。一个"成功"但亏钱的策略是真实且无声的资本流失，此前**无任何护栏**。这是安全×有效性的交集——自主 agent 最该有的"别再挖坑"保护，也是 v83 的自然闭环（检测 bleeder → 自动止血）
+- 实现（镜像 strategyBudget 全链路）：config `safety.maxStrategyLossUsd`（可选）；纯 enforcer `enforceStrategyLossBreaker({ strategyTag, maxLossUsd, realizedLookup })`——策略 realized P&L ≤ −限额时抛 `STRATEGY_LOSS_BREAKER_TRIPPED`。**买入挡、卖出放**（让策略平仓/恢复），tagged-only + opt-in（默认零成本）。realized 用 v83 确定性比较（stablecoin-$1，无 marks/RPC）
+- 全链路一致（与 strategyBudget 同构）：(1) trade.ts step 5a-quater 实盘强制；(2) `projectTradeLimits` 加 `strategy_loss` check（复用同一 enforcer via runCheck）→ **preflight 提前显示**，无"preview GO 却执行 TRIPPED"惊吓（v54 原则）；(3) `safety review` 加 exposure 类护栏 + gap；(4) `STRATEGY_LOSS_BREAKER_TRIPPED` 入 ErrorCode（403）+ httpStatus
+- 语义：买入挡（止血）、卖出永远放行（降敞口/恢复）——与 position cap 同款方向语义。区别于 strategyBudget（管毛花费，赢亏都算）和 drawdown breaker（组合 mark-to-market）：本期管**单策略已实现亏损**
+- 测试覆盖：`strategyCompare.test.ts` +5（超限抛 STRATEGY_LOSS_BREAKER_TRIPPED 带金额 / 恰好 ≤−max 触发 / 限内放行 / 盈利放行 / 未配+无 tag+0 限额均 no-op 且不调 lookup）+ `safetyReview.test.ts` +2（未配→off+gap / 配了→active 带 $ 明细）；CLI 离线烟雾（safety review 两态 + 真实亏损策略 −$700 被 $500 限额 BLOCKED）
+- 向后兼容：纯加法——新 config（可选）、新 enforcer、新 limit check、新护栏、新 error code；buy-only+tagged+opt-in（默认零成本/零行为变化）；3440 测试全绿（+7）
+- v1 限制：realized-only（用 v83 确定性比较——非稳定币计价交易不计入亏损，与比较口径一致）；全局限额（每个策略各自适用同一阈值，非 per-tag 规则——v1 简化）；每笔 tagged buy 走一次该策略 realized walk（仅 opt-in 用户付此成本，与 drawdown breaker 的 per-trade RPC 同量级）
+
 **Phase 83 — 策略业绩对比（strategy comparison — rank strategies for capital allocation, the core effectiveness decision）** ✅
 - **转向被冷落的「有效性」支柱（连续 ~11 期在「安全」）**：安全做到极致后，agent 的本职是**赚钱**。多策略 agent 的核心有效性决策是**资本配置**：哪些策略赚钱（加码）、哪些流血（砍掉）。产品有 strategy_report（单策略深挖）+ pnl 里埋着的 byStrategy（仅 realized+count）——但**没有排名的横向对比**，缺了配置决策最需要的指标：realized P&L、**胜率**（一致性——2 笔运气 +$100 和 50 笔稳定 +$100 是完全不同的赌注）、交易数、成交量
 - 为什么时机正好：v82 刚把成本基准合一，**这些数字现在可信**。本期直接复用 canonical reducer（applyBuy/applySell）——按构造与所有 P&L 面同源、不可能漂移

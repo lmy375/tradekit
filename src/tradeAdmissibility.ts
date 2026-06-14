@@ -34,6 +34,7 @@ import {
   type GasBudgetInput,
 } from "./safety.js";
 import { enforceStrategyBudget } from "./strategyBudget.js";
+import { enforceStrategyLossBreaker } from "./strategyCompare.js";
 import { enforcePositionCap } from "./positionCaps.js";
 import { lastTradeAtByAccount } from "./db.js";
 
@@ -41,6 +42,7 @@ export type LimitCheckName =
   | "core_safety"
   | "rate_limit"
   | "strategy_budget"
+  | "strategy_loss"
   | "position_cap"
   | "gas_budget";
 
@@ -161,6 +163,19 @@ export function projectTradeLimits(args: {
           strategyTag: args.strategy,
           predictedUsd: args.estimatedUsd ?? 0,
           budgets: s.strategyBudgets,
+        }),
+      ),
+    );
+  }
+
+  // ── per-strategy realized-loss breaker (v84, buys only) ──
+  if (args.strategy && args.direction === "buy" && s.maxStrategyLossUsd != null) {
+    checks.push(
+      runCheck("strategy_loss", "Strategy loss breaker", () =>
+        enforceStrategyLossBreaker({
+          strategyTag: args.strategy,
+          maxLossUsd: s.maxStrategyLossUsd,
+          account: args.account,
         }),
       ),
     );

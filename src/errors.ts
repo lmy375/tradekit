@@ -62,6 +62,14 @@ export type ErrorCode =
   // (resize, wait for the window to roll, or raise the cap).
   | "STRATEGY_BUDGET_EXCEEDED"
   | "POSITION_CAP_EXCEEDED"
+  // v84: per-strategy realized-LOSS circuit breaker (safety.maxStrategyLossUsd).
+  // The strategy's realized P&L on CLOSED trades has fallen below
+  // -maxStrategyLossUsd — it's mechanically executing but bleeding capital, so
+  // new BUYS are blocked (sells still allowed to exit). Distinct from
+  // STRATEGY_BUDGET_EXCEEDED (gates gross SPEND, win or lose) and the drawdown
+  // breaker (portfolio mark-to-market) — this gates a single strategy's
+  // realized LOSSES. "Stop digging."
+  | "STRATEGY_LOSS_BREAKER_TRIPPED"
   // Iter20: portfolio drawdown circuit breaker tripped (safety.drawdownCircuitBreaker).
   // The portfolio's current USD value has fallen below peak × (1 - maxDrawdownPct/100),
   // OR the breaker was already tripped from a previous trade and hasn't been reset.
@@ -410,6 +418,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "POSITION_LIMIT_EXCEEDED":
     case "STRATEGY_BUDGET_EXCEEDED":
     case "POSITION_CAP_EXCEEDED":
+    case "STRATEGY_LOSS_BREAKER_TRIPPED":
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
     case "ENGINE_LOCKED":
       return 403;

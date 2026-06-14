@@ -314,6 +314,24 @@ export function reviewSafety(config: Config, opts: { now?: Date } = {}): SafetyP
     state: stratBudgets > 0 ? "active" : "off",
     detail: stratBudgets > 0 ? `${stratBudgets} rule(s)` : "off",
   });
+  // v84: per-strategy realized-loss breaker — gross-spend caps (above) don't
+  // stop a strategy that's spending within budget but losing money.
+  const lossBreaker = s.maxStrategyLossUsd;
+  g({
+    key: "strategyLossBreaker",
+    label: "Strategy loss breaker",
+    category: "exposure",
+    state: lossBreaker != null ? "active" : "off",
+    detail: lossBreaker != null ? `block buys past $${lossBreaker} realized loss/strategy` : "off",
+  });
+  if (lossBreaker == null) {
+    gap(
+      "info",
+      "strategyLossBreaker",
+      "no per-strategy loss breaker — a strategy that executes cleanly but bleeds money on closed trades keeps trading unchecked (spend caps gate gross volume, not P&L)",
+      "set safety.maxStrategyLossUsd (e.g. 500) to auto-block new buys once a strategy's realized loss exceeds it",
+    );
+  }
   // v72: portfolio concentration — the cross-strategy aggregate the per-
   // strategy caps above structurally miss.
   const concLimit = s.maxConcentrationPct;

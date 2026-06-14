@@ -151,6 +151,24 @@ describe("concentration limit (v72)", () => {
   });
 });
 
+describe("strategy loss breaker guardrail (v84)", () => {
+  it("is a gap (info) + reads off when unset", () => {
+    const r = review({ perTxUsdLimit: 10 });
+    expect(rail(r, "strategyLossBreaker").state).toBe("off");
+    const g = gap(r, "strategyLossBreaker");
+    expect(g).not.toBeNull();
+    expect(g!.severity).toBe("info");
+    expect(g!.finding).toMatch(/bleeds money|closed trades/i);
+  });
+
+  it("is active + no gap once configured", () => {
+    const r = review({ perTxUsdLimit: 10, maxStrategyLossUsd: 500 });
+    expect(rail(r, "strategyLossBreaker").state).toBe("active");
+    expect(rail(r, "strategyLossBreaker").detail).toMatch(/\$500/);
+    expect(gap(r, "strategyLossBreaker")).toBeNull();
+  });
+});
+
 describe("MEV protection guardrail (v77)", () => {
   it("is a gap (info) + reads off when no private relay is configured", () => {
     const r = review({ perTxUsdLimit: 10 });

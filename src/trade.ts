@@ -979,6 +979,30 @@ async function executeTradeInner(req: TradeRequest, ctx: TradeContext): Promise<
     });
   }
 
+  // ── 5a-quater. Per-strategy realized-loss breaker (v84) ──
+  //
+  // A strategy can execute "successfully" (every swap fills) yet bleed
+  // capital on closed trades — the budget cap (gross spend) and drawdown
+  // breaker (portfolio mark-to-market) don't catch it. When realized losses
+  // for the tagged strategy exceed safety.maxStrategyLossUsd, block new BUYS
+  // ("stop digging"); sells are always allowed (they let the strategy exit /
+  // recover). Buy-only + tagged-only + opt-in, so unconfigured installs and
+  // untagged/sell trades pay nothing.
+  if (
+    !req.simulate &&
+    ctx.config.safety.maxStrategyLossUsd != null &&
+    req.direction === "buy" &&
+    req.strategy
+  ) {
+    const { enforceStrategyLossBreaker } = await import("./strategyCompare.js");
+    enforceStrategyLossBreaker({
+      strategyTag: req.strategy,
+      maxLossUsd: ctx.config.safety.maxStrategyLossUsd,
+      mode: "real",
+      account: ctx.accountLabel,
+    });
+  }
+
   // ── 5a-ter. Per-strategy position caps (v38) ──
   //
   // Net-exposure axis: a BUY that would push the strategy's net

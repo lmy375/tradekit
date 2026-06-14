@@ -9,7 +9,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeStrategyComparison, type StrategyTradeLite } from "./strategyCompare.js";
+import { computeStrategyComparison, enforceStrategyLossBreaker, type StrategyTradeLite } from "./strategyCompare.js";
+import { ToolError } from "./errors.js";
 
 const WETH = "0x4200000000000000000000000000000000000006";
 let ts = 0;
@@ -98,6 +99,49 @@ describe("computeStrategyComparison", () => {
       fill({ strategy: "a", direction: "sell", base_token: WETH, base_symbol: "WETH", base_amount: "1", quote_amount: "2500" }), // +500 vs WETH basis
     ]);
     expect(r.strategies[0].realizedUsd).toBeCloseTo(500, 6); // not contaminated by WBTC's 60000
+  });
+});
+
+describe("enforceStrategyLossBreaker (v84)", () => {
+  const lookup = (realized: number) => () => realized;
+
+  it("throws STRATEGY_LOSS_BREAKER_TRIPPED when realized loss exceeds the limit", () => {
+    expect(() =>
+      enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 500, realizedLookup: lookup(-600) }),
+    ).toThrowError(ToolError);
+    try {
+      enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 500, realizedLookup: lookup(-600) });
+    } catch (e) {
+      expect((e as ToolError).code).toBe("STRATEGY_LOSS_BREAKER_TRIPPED");
+      expect((e as ToolError).message).toMatch(/600/);
+    }
+  });
+
+  it("trips exactly AT the limit (≤ -max)", () => {
+    expect(() =>
+      enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 500, realizedLookup: lookup(-500) }),
+    ).toThrowError(/loss breaker/);
+  });
+
+  it("allows when the loss is within the limit", () => {
+    expect(() =>
+      enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 500, realizedLookup: lookup(-400) }),
+    ).not.toThrow();
+  });
+
+  it("allows a profitable strategy", () => {
+    expect(() =>
+      enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 500, realizedLookup: lookup(1200) }),
+    ).not.toThrow();
+  });
+
+  it("is a no-op when unconfigured (no maxLossUsd) or untagged — and never calls the lookup", () => {
+    let called = false;
+    const spy = () => { called = true; return -9999; };
+    enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: undefined, realizedLookup: spy });
+    enforceStrategyLossBreaker({ strategyTag: null, maxLossUsd: 500, realizedLookup: spy });
+    enforceStrategyLossBreaker({ strategyTag: "a", maxLossUsd: 0, realizedLookup: spy });
+    expect(called).toBe(false);
   });
 });
 

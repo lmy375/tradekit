@@ -192,6 +192,14 @@ const safetySchema = z
      *  (not a hard pre-trade gate — concentration needs portfolio valuation).
      *  e.g. 50 = flag when one token is >50% of the book. */
     maxConcentrationPct: z.number().min(1).max(100).optional(),
+    /** v84: per-strategy realized-loss circuit breaker. When a strategy's
+     *  realized P&L on CLOSED trades falls below −this (USD), new BUYS under
+     *  that tag are blocked (sells still allowed, to exit) — "stop digging" on
+     *  a strategy that's mechanically executing but bleeding capital. Distinct
+     *  from strategyBudgets (gross spend, win or lose) and the drawdown breaker
+     *  (portfolio mark-to-market). Realized-only + deterministic (stablecoin-$1
+     *  model). Off when unset. */
+    maxStrategyLossUsd: z.number().positive().optional(),
     maxSlippageBps: z.number().int().min(1).max(5000).default(500),
     tokenWhitelist: z.record(z.string(), z.array(addressSchema)).optional(),
     tokenBlacklist: z.record(z.string(), z.array(addressSchema)).optional(),

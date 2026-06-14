@@ -20,6 +20,7 @@
 
 import { applyBuy, applySell, type CostBasisState } from "./costBasis.js";
 import { recentTrades, listPaperTrades } from "./db.js";
+import { ToolError } from "./errors.js";
 
 /** Same stablecoin set the rest of the codebase uses — a quote priced at $1. */
 const STABLES = new Set(["USDC", "USDT", "DAI", "USDC.E", "USDBC", "FRAX", "LUSD", "TUSD", "USDP", "GUSD"]);
@@ -192,19 +193,62 @@ export function gatherStrategyComparison(args: {
   mode?: "real" | "paper";
   account?: string;
   chain?: string;
+  /** Scope to a single strategy tag (the breaker uses this for one-strategy cost). */
+  strategy?: string;
   sinceIso?: string;
   now?: Date;
 }): StrategyComparisonReport {
   const mode = args.mode ?? "real";
   let rows: StrategyTradeLite[];
   if (mode === "paper") {
-    rows = listPaperTrades({ account: args.account, chain: args.chain, sinceIso: args.sinceIso }).map(toLite);
+    rows = listPaperTrades({ account: args.account, chain: args.chain, strategy: args.strategy, sinceIso: args.sinceIso }).map(toLite);
   } else {
-    rows = recentTrades({ account: args.account, chain: args.chain, since: args.sinceIso, limit: 1_000_000 })
+    rows = recentTrades({ account: args.account, chain: args.chain, strategy: args.strategy, since: args.sinceIso, limit: 1_000_000 })
       .filter((t) => t.status === "success")
       .map(toLite);
   }
   return computeStrategyComparison(rows, { now: args.now });
+}
+
+/**
+ * v84: per-strategy realized-loss circuit breaker. Throws
+ * STRATEGY_LOSS_BREAKER_TRIPPED when the strategy's realized P&L on closed
+ * trades has fallen below −maxLossUsd. No-op when unconfigured, untagged, or
+ * within limit. `realizedLookup` is injectable for tests; the default reads the
+ * deterministic per-strategy comparison. Mirrors enforceStrategyBudget's shape
+ * so projectTradeLimits runs it as a preflight check (no "go then tripped"
+ * surprise) and trade.ts as the live gate.
+ */
+export function enforceStrategyLossBreaker(args: {
+  strategyTag: string | null | undefined;
+  maxLossUsd: number | undefined;
+  mode?: "real" | "paper";
+  account?: string;
+  realizedLookup?: (tag: string) => number;
+}): void {
+  const { strategyTag, maxLossUsd } = args;
+  if (maxLossUsd == null || !(maxLossUsd > 0)) return;
+  if (!strategyTag) return;
+  const lookup =
+    args.realizedLookup ??
+    ((tag: string) => {
+      const r = gatherStrategyComparison({ mode: args.mode ?? "real", account: args.account, strategy: tag });
+      return r.strategies.find((s) => s.strategy === tag)?.realizedUsd ?? 0;
+    });
+  const realized = lookup(strategyTag);
+  if (realized <= -maxLossUsd) {
+    throw new ToolError(
+      "STRATEGY_LOSS_BREAKER_TRIPPED",
+      `Strategy "${strategyTag}" has realized a loss of $${Math.abs(realized).toFixed(2)}, past the $${maxLossUsd} loss breaker — new buys are blocked (sells still allowed, to exit/recover). Review with \`tradekit strategies compare\`; pause/cut the strategy, or raise safety.maxStrategyLossUsd if this drawdown is intentional.`,
+      {
+        details: { tag: strategyTag, realizedUsd: realized, maxLossUsd },
+        nextActions: [
+          { tool: "strategy_compare", reason: "Review per-strategy performance to decide whether to pause, cut, or accept the drawdown." },
+          { tool: "strategy_pause", reason: `Pause the bleeding strategy: \`tradekit strategy pause ${strategyTag}\`.` },
+        ],
+      },
+    );
+  }
 }
 
 function toLite(t: {
