@@ -473,6 +473,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "safety_drawdown", "safety_reset_drawdown",
     // v51: consolidated guardrail posture audit.
     "safety_review",
+    // v53: runtime headroom across every active limit.
+    "safety_headroom",
     // Iter26: strategy lifecycle (playbooks + backtests) exposed for agent control.
     // v2: playbook_diff + playbook_replace — strategy iteration over MCP.
     "playbook_validate", "playbook_deploy", "playbook_list", "playbook_show", "playbook_destroy",

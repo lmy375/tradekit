@@ -182,6 +182,9 @@ export async function safetyCommand(
     case "review":
       await safetyReviewCommand(flags);
       break;
+    case "headroom":
+      await safetyHeadroomCommand(flags);
+      break;
     case "drawdown":
       await safetyDrawdownCommand(flags);
       break;
@@ -189,7 +192,7 @@ export async function safetyCommand(
       await safetyResetDrawdownCommand(flags);
       break;
     default:
-      throw subcommandError("safety", action, ["review", "drawdown", "reset-drawdown"]);
+      throw subcommandError("safety", action, ["review", "headroom", "drawdown", "reset-drawdown"]);
   }
 }
 
@@ -202,5 +205,20 @@ async function safetyReviewCommand(flags: Record<string, string>) {
     printJson({ ok: true, ...report });
   } else {
     console.log(renderSafetyReview(report));
+  }
+}
+
+// v53: runtime headroom — "how much room is left across every active
+// limit, and what's the binding constraint right now?"
+async function safetyHeadroomCommand(flags: Record<string, string>) {
+  const { gatherSafetyHeadroom, renderSafetyHeadroom } = await import("../safetyHeadroom.js");
+  const report = gatherSafetyHeadroom({
+    account: flags["account"],
+    chain: flags["chain"],
+  });
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...report });
+  } else {
+    console.log(renderSafetyHeadroom(report));
   }
 }

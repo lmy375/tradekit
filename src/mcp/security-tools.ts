@@ -617,6 +617,33 @@ export const registerSecurityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── safety_headroom (v53) ──────────────────────────────────
+  //
+  // Runtime situational awareness — "how much room is left, and
+  // what's my binding constraint right now?". Read-only; the agent
+  // calls this BEFORE sizing a trade so it stays inside its envelope
+  // instead of bouncing off a SAFEGUARD_TRIGGERED rejection.
+  server.tool(
+    "safety_headroom",
+    "v53: runtime safety headroom — 'how much room do I have left across every active limit, and what's the binding constraint right now?'. Call this BEFORE sizing a trade so you stay inside the envelope instead of bouncing off a rejection. Returns entries[] (one per active limit: daily USD cap utilization, per-strategy budgets lifetime+24h, drawdown distance-to-trip, trade rate-limit readiness, net-exposure position caps, per-tx ceiling) each with used / remaining / utilizationPct + status (ok | approaching ≥80% | exhausted ≥100% | tripped), plus `binding` (the tightest active constraint) and counts. Where v51 safety_review shows what's CONFIGURED, this shows how much is LEFT. Scope: account + chain default to the active ones; pass account/chain to scope the daily-USD + rate-limit reads. Deterministic + offline (config + trades/drawdown tables; no oracle, no RPC).",
+    {
+      account: z.string().optional().describe("Account label for the daily-USD + rate-limit scope. Defaults to the active account."),
+      chain: z.string().optional().describe("Chain for the daily-USD scope. Defaults to the active chain."),
+    },
+    async ({ account, chain }) => {
+      try {
+        return ok(
+          await runTool("safety_headroom", rt.opts, { account, chain }, chain, async () => {
+            const { gatherSafetyHeadroom } = await import("../safetyHeadroom.js");
+            return { ok: true, ...gatherSafetyHeadroom({ config: rt.getConfig(), account, chain }) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── safety_reset_drawdown (iter26) ─────────────────────────
   //
   // Clear the tripped flag (manual reset). Optional `new_peak_usd`

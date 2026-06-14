@@ -689,6 +689,16 @@ STATEFUL SAFETY
         close it. Verdict hardened | moderate | exposed. CRITICAL = safety off,
         or no USD ceiling at all. Pure + deterministic. Run it before promoting
         a strategy to real money. MCP: safety_review.
+  safety headroom [--account L] [--chain X] [--json]
+        v53: runtime headroom — "how much room is left across every active
+        limit, and what's the binding constraint right now?". One entry per
+        active limit (daily USD cap, per-strategy budgets lifetime+24h, drawdown
+        distance-to-trip, rate-limit readiness, net-exposure position caps,
+        per-tx ceiling) with used/remaining/utilization% + status (ok |
+        approaching ≥80% | exhausted | tripped), plus the binding constraint.
+        Where 'safety review' shows what's CONFIGURED, this shows how much is
+        LEFT — call it before sizing a trade. Deterministic + offline. MCP:
+        safety_headroom.
   safety drawdown [--scope global] [--json]
         Show portfolio drawdown circuit-breaker state. Peak USD, last observed value, drawdown %,
         and tripped status per scope. Reveals whether the breaker would block trading right now.

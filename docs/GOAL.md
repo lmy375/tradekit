@@ -33,6 +33,26 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 53 — 运行时安全余量（safety headroom — "how much room is left, and what's my binding constraint right now?"）** ✅
+- 安全投资的**第三种用法**，而非第四道护栏：v51 safety_review 让**静态配置态势**对运营商可读；v52 promote safety-preflight 让它在 go-live 时**起闸**；v53 让**运行时余量**在决策时对 **agent** 可读
+- 痛点：一个自主 agent 在动手交易前，应该知道自己**还剩多少空间**——今天日限额还剩 $50、离某个 position cap 还有 80%、离 drawdown trip 还差 5%——这样它能**聪明地 size 下一笔交易**，而不是盲发然后撞上 SAFEGUARD_TRIGGERED 被拒。运营商也获得一句话的"我的 agent 离限额多近？"
+- 新模块 `safetyHeadroom.ts`（~330 行）：纯函数 `gatherSafetyHeadroom(config)`，每个**活跃的量化限制**变成一个 `HeadroomEntry`，带 used / remaining / utilizationPct + status（`ok | approaching ≥80% | exhausted ≥100% | tripped`）
+- 覆盖的限制（spend / loss / rate / exposure 全维度）：
+  - **daily USD cap**：24h 滚动量 vs 上限，按 account × chain 作用域（`dailyUsdVolume`）
+  - **strategy budgets**：复用 `computeBudgetConsumption`（lifetime + 24h 滚动 remaining；perFire 是 per-trade 上限，作静态报告）
+  - **drawdown 熔断**：当前 DD% 占 trip 阈值的比例 + 距离触发的 pp（`getDrawdownState`）；tripped 直接置顶
+  - **trade rate limit**：账户上次交易至今的间隔 vs 最小间隔（`lastTradeAtByAccount`）→ ready 或 wait Nms
+  - **position caps**：每个匹配 tag 的当前**净敞口** vs 上限（`netPosition` + `defaultFillRows`；wildcard pattern 展开到每个匹配 tag，与 enforcePositionCap 的 per-tag 语义一致）
+  - **per-tx USD**：静态 ceiling，信息性报告（无累积状态）
+- `binding`：最紧的活跃约束（tripped > exhausted > approaching > ok，同级比 utilization）——agent 一眼看到"现在卡我的是哪条"
+- 确定性 + 离线：读 config + trades/drawdown 表，无 oracle、无 RPC。注入 seam（dailyVolumeFn / spentLookup / distinctStrategiesFn / drawdownLookup / lastTradeAtFn / fillRowsLookup）让测试纯净无 DB
+- Surfaces：CLI `safety headroom [--account L] [--chain X] [--json]` + MCP `safety_headroom`（只读，agent 在 size 交易**之前**调用以待在 envelope 内）
+- 与 v51 的分工：`safety review` 答"配置了什么护栏"，`safety headroom` 答"还剩多少"——同一安全栈的静态面 vs 运行时面
+- 测试覆盖：`safetyHeadroom.test.ts` 18 case（daily USD used/remaining/util + ok/approaching/exhausted + account×chain 作用域 / per-tx 信息性 / strategy budgets lifetime+daily+perFire / drawdown 距离 + tripped 置顶 / rate limit ready vs wait / position caps 净敞口 + wildcard 展开 / binding 选择 tripped 优先 + 同级比 util / 空配置 null binding / 渲染 / APPROACHING_PCT 80% 边界）
+- MCP_TOOLS 不变量：`safety_headroom` 加入 iter589/iter877 set（security-tools）
+- 向后兼容：纯加法——无 schema migration、无现有行为改动、无引擎触动；纯读现有 config + 表
+- v1 限制：headroom 是**当下快照**，不预测——它不告诉你"再发 N 笔会怎样"（agent 拿 remaining 自己除）；position-cap 的净敞口用 real 成交（paper=false），paper 策略的 cap 余量留待 v2；daily USD + rate limit 含 pending 交易（与各自 enforcement 一致——pending 可能确认，排除会让人 double-spend）；per-fire / per-tx 是 per-trade ceiling 无"已用"概念，作静态项不参与 binding
+
 **Phase 52 — 晋升安全预检（promote safety preflight — "before this fires real trades, is the wallet GUARDED?"）** ✅
 - 让 v51 的安全态势在**真正动钱的那一刻**起作用，而不是一个运营商得记得去跑的工具：`promote --to real` 是钱真正上场的时刻，它已有一套 v36 **funding preflight**（advisory 默认、`--require-funded` 强制、`--skip-preflight` 绕过），但只问"钱包**付得起**吗？"——完全不问"钱包在交易时**有没有被护栏看住**？"。一个策略可以拿到 funding ✓ 同时 agent 的钱包根本没有 USD 上限、infinite approvals 还开着
 - 对称补全：在 funding preflight 旁边加一个 **safety preflight**——同样的形态（advisory 默认、打印态势、`--require-safe` 在 CRITICAL 护栏缺口上中止、`--skip-preflight` 同时关掉两个预检）
