@@ -718,8 +718,42 @@ export async function playbookCommand(
     case "promote":
       await playbookPromoteCommand(flags, positional);
       break;
+    // v49: "is this paper strategy ready for real money?" — the
+    // strategy-quality half of the promote decision (promote itself
+    // runs the funding-preflight half).
+    case "promote-check": {
+      const idArg = positional[2];
+      const id = parseInt(idArg ?? "", 10);
+      if (!Number.isInteger(id) || id <= 0) {
+        throw new ToolError("INVALID_PARAMS", `Usage: tradekit playbook promote-check <id> [--json]`);
+      }
+      const { gatherPromoteCheck, renderPromoteCheck } = await import("../promoteCheck.js");
+      // Best-effort native price so real gas can be expressed in USD;
+      // failure degrades to native-only reporting.
+      let nativeUsd: number | null = null;
+      try {
+        const { loadConfig, resolveProfile } = await import("../config.js");
+        const cfg = loadConfig();
+        const profile = resolveProfile(cfg.activeChain, cfg);
+        if (profile.weth) {
+          const { getCurrentPrice } = await import("../price.js");
+          const { makeCliLogger } = await import("./helpers.js");
+          nativeUsd = await getCurrentPrice(profile.weth, makeCliLogger(flags)).catch(() => null);
+        }
+      } catch {
+        // offline / unconfigured chain — report gas in native units
+      }
+      const report = await gatherPromoteCheck({ playbookId: id, nativeUsd });
+      if (flags["json"] === "true") {
+        const { printJson } = await import("./helpers.js");
+        printJson({ ok: true, ...report });
+      } else {
+        console.log(renderPromoteCheck(report));
+      }
+      break;
+    }
     default:
-      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace", "promote"]);
+      throw subcommandError("playbook", action, ["validate", "deploy", "list", "show", "destroy", "diff", "replace", "promote", "promote-check"]);
   }
 }
 

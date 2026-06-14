@@ -100,7 +100,7 @@ function parseResult(result: { content: { type: "text"; text: string }[] }): unk
 // ── registration ─────────────────────────────────────────────
 
 describe("registerStrategyTools — tool registration", () => {
-  it("registers all 15 expected tools", () => {
+  it("registers all 16 expected tools", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
     const names = Array.from(registered.keys());
@@ -113,6 +113,8 @@ describe("registerStrategyTools — tool registration", () => {
     expect(names).toContain("playbook_diff");
     expect(names).toContain("playbook_replace");
     expect(names).toContain("playbook_promote");
+    // v49: promote-readiness check (strategy-quality half of promote).
+    expect(names).toContain("playbook_promote_check");
     expect(names).toContain("backtest_order");
     expect(names).toContain("backtest_playbook");
     expect(names).toContain("backtest_rebalance");
@@ -122,7 +124,7 @@ describe("registerStrategyTools — tool registration", () => {
     // Strategy-level bulk control (manual circuit breaker).
     expect(names).toContain("strategy_pause");
     expect(names).toContain("strategy_resume");
-    expect(names.length).toBe(15);
+    expect(names.length).toBe(16);
   });
 
   it("every tool has a non-empty description", () => {

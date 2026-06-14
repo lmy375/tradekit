@@ -288,6 +288,28 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── v49: playbook_promote_check ────────────────────────────
+  server.tool(
+    "playbook_promote_check",
+    "v49: 'is this paper strategy ready for real money?' — the strategy-quality half of the promote decision (playbook_promote runs the funding half). Composes: paper runtime evidence (days/fills — floors at 7d/5 fills → not_ready), realized+MTM paper PnL, the v48 paper-book equity risk block (drawdown/vol/sharpe; book-level, disclosed), and the FRICTION REALITY cross-check — paper fills' ASSUMED slippage vs your REAL fills' realized slippage + gas, projected onto the paper cadence as monthly USD friction and its share of paper PnL (>50% → caution; 'the edge may not survive real execution'). Deterministic thresholds, reasons[] names every flag. Verdict: ready | caution | not_ready.",
+    {
+      id: z.number().int().positive().describe("Playbook id (paper deployment)."),
+      native_usd: z.number().positive().optional().describe("Current native-token USD price (for expressing real gas in USD). Omit to degrade to native-unit gas reporting."),
+    },
+    async ({ id, native_usd }) => {
+      try {
+        return ok(
+          await runTool("playbook_promote_check", rt.opts, { id, native_usd }, undefined, async () => {
+            const { gatherPromoteCheck } = await import("../promoteCheck.js");
+            return await gatherPromoteCheck({ playbookId: id, nativeUsd: native_usd ?? null, config: rt.getConfig() });
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── playbook_promote ───────────────────────────────────────
   server.tool(
     "playbook_promote",

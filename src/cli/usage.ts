@@ -736,6 +736,17 @@ PLAYBOOKS (declarative strategy bundles)
         live strategy back to the sandbox. Promotion to real asks for the
         'promote' confirmation phrase unless --yes; real balances are NOT
         pre-checked — sanity-check with 'tradekit holdings' + trade preflight.
+  playbook promote-check <id> [--json]
+        v49: "is this paper strategy ready for real money?" — the strategy-
+        quality half of the promote decision (promote runs the funding half).
+        Composes: runtime evidence (floors: 7d + 5 fills → NOT READY below),
+        realized+MTM paper PnL, the v48 paper-book risk block (drawdown/vol/
+        sharpe — book-level, disclosed), and the FRICTION REALITY cross-check:
+        paper fills' ASSUMED slippage vs your REAL fills' realized slippage +
+        gas, projected onto the paper cadence as $/month and % of paper PnL
+        (>50% → caution: "the edge may not survive real execution"). Verdict
+        ready | caution | not_ready with every flag named. MCP:
+        playbook_promote_check.
   playbook replace <id> <new-spec-file> [--var NAME=VAL ...] [--vars-file PATH]
                    [--fresh-state] [--yes] [--json]
         Atomically apply a new playbook spec. Modified primitives whose changes are all

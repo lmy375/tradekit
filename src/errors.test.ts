@@ -496,6 +496,7 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "incident_report",
     "execution_report",
     "intents_list",
+    "playbook_promote_check",
     // Iter36: forensic timeline (cross-strategy chronological events).
     "timeline_query",
     // Iter38: per-provider price-fetch observability.
