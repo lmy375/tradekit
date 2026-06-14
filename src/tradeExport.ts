@@ -108,8 +108,13 @@ export function enrichTradesForExport(
       const baseAmt = parseFloat(row.base_amount) || 0;
       const quoteAmt = parseFloat(row.quote_amount) || 0;
       const qUsd = quoteUsd(row);
-      if (baseAmt > 0 && quoteAmt > 0 && qUsd != null) {
-        const tradeUsd = quoteAmt * qUsd;
+      // v107: prefer the persisted trade-time USD value (v104 value_usd) — the
+      // exact dollars at execution, so the tax cost basis matches pnl.ts and
+      // isn't distorted by today's quote price on a non-stablecoin quote. Fall
+      // back to quoteAmt × qUsd for legacy rows.
+      const valueUsd = row.value_usd != null && Number.isFinite(row.value_usd) && row.value_usd > 0 ? row.value_usd : null;
+      const tradeUsd = valueUsd ?? (qUsd != null ? quoteAmt * qUsd : null);
+      if (baseAmt > 0 && quoteAmt > 0 && tradeUsd != null && tradeUsd > 0) {
         const key = `${row.chain}:${(row.base_symbol ?? row.base_token).toUpperCase()}`;
         let pos = positions.get(key);
         if (!pos) {

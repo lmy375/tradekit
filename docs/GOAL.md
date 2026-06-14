@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 107 — 已实现 P&L / 税务成本基础用"交易时刻美元"：消除非稳定币报价的现价失真（realized P&L + tax cost basis use trade-time USD via v104 value_usd — kill the current-price distortion on non-stablecoin quotes）** ✅
+- **用 v104 的 value_usd 闭合一个被注释承认的 P&L 近似**：pnl.ts 一直把每笔的 USD 算成 `quote_amount × 报价代币的「当前」USD 价`（注释明说"没有历史报价价时这是最好的近似"）。对稳定币报价近似精确；但对 WETH 报价交易——成本基础被**按今天的 ETH 价重估**：WETH \$2000 时买入、现在 \$3000，成本基础凭空涨 50%，已实现/未实现 P&L 全失真。v104 刚加的 `value_usd`（交易时刻精确美元）正好提供历史价，能把近似变精确
+- 为什么重要：P&L 和税务成本基础是 agent/运营商做决策、报税依赖的最核心数字。对非稳定币报价交易（WETH 计价）系统性失真，是 v104 同类（按报价代币单位错算 USD）的延伸——只是这次是"现价 vs 历史价"而非"代币单位 vs 美元"。把最重要的数字对所有报价类型做对
+- 实现（外科手术式，复用 v104 数据 + v82 共享 reducer）：aggregateTrades（pnl.ts）+ enrichTradesForExport（tradeExport.ts，税务）的 `tradeUsd` 改为 `value_usd ?? (qUsd != null ? quoteAmt × qUsd : null)`——有交易时刻值就用（精确），legacy 行回退旧近似。附带修复：有 value_usd 但无实时报价价的行**不再被跳过**（之前 qUsd==null 直接 continue，丢失该笔 P&L）。两处同源修复，税务与 P&L 不会分叉
+- 测试覆盖：+4——pnl（value_usd 驱动 realized=400 而非近似的 0 / 有 value_usd 无实时价仍计入 / 无 value_usd 回退 quoteAmt×qUsd）+ tradeExport（WETH 计价 lot 用 value_usd 算 cost_basis+proceeds+realized）；3572 测试全绿（+4）
+- 向后兼容：纯改进——稳定币报价 value_usd≈quote_amount 行为不变；legacy 行（无 value_usd）回退旧近似；paper MTM walker 不动（paper_trades 无 value_usd 列、且本就用假定价）
+
 **Phase 106 — 通知投递健康：静默失效的告警通道不再让运营商"盲飞"（notification-delivery health — a silently-dead alert channel is caught proactively, not discovered during an incident）** ✅
 - **补上"告警通道死了也没人知道"的信任盲区**：运营商靠 notifications.channels（webhook/Slack/Discord/Telegram）接收 digest、安全告警、agent 审批待办。`notify()` 每次投递都知道每个通道成功/失败，但**从不持久化**——一个 setup 时能用、之后 URL 轮换/吊销而失效的通道，会**永远静默失败**。运营商停止收到任何告警却毫不知情，恰恰在出事、最需要告警时盲飞。只有手动跑 `notify test` 才会发现
 - 为什么重要：自主交易的整个安全网（断路器、引擎存活、偏离检测…）最终都靠"告警真的送达运营商"。通道静默失效=安全网的最后一跳断了。这是 v103（引擎存活）同类的可靠性盲区——运营商依赖、静默损坏、必须主动暴露。被动追踪（无需手动 test）在运营商下次 check-in 时就报"你的告警两天没送出去了"

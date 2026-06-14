@@ -32,6 +32,49 @@ function row(overrides: Partial<TradeRow> & Pick<TradeRow, "direction" | "base_a
 // All test rows quote in USDC (stable) so quoteUsd = 1 for every trade.
 const stableQuote = () => 1;
 
+// v107: USD per trade prefers the persisted trade-time value_usd over
+// quote_amount × CURRENT quote price — exact for non-stablecoin quotes.
+describe("aggregateTrades — value_usd preference (v107)", () => {
+  // Current WETH price $3000 — the approximation would re-value WETH-quoted
+  // trades at this, distorting a cost basis set when WETH was cheaper.
+  const wethCurrent = () => 3000;
+
+  it("uses value_usd for cost + proceeds, not quoteAmt × current quote price", () => {
+    const { positions } = aggregateTrades(
+      [
+        // bought 1 base for 0.5 WETH when that was worth $1000 (WETH ~$2000 then)
+        row({ direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1000 }),
+        // sold 1 base for 0.5 WETH worth $1400 at sell time
+        row({ direction: "sell", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1400 }),
+      ],
+      wethCurrent,
+    );
+    const p = [...positions.values()][0];
+    // value_usd path: realized = 1400 − 1000 = 400.
+    // (the old approximation would give 0.5×3000 − 0.5×3000 = 0.)
+    expect(p.realized).toBeCloseTo(400, 6);
+  });
+
+  it("a row with value_usd but NO live quote price still contributes (was skipped before)", () => {
+    const { positions } = aggregateTrades(
+      [row({ direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1000 })],
+      () => null, // no live price
+    );
+    const p = [...positions.values()][0];
+    expect(p.amount).toBeCloseTo(1, 6);
+    expect(p.cost).toBeCloseTo(1000, 6); // from value_usd, not skipped
+  });
+
+  it("falls back to quoteAmt × qUsd when value_usd is absent (legacy rows unchanged)", () => {
+    const { positions } = aggregateTrades(
+      [row({ direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH" })], // no value_usd
+      wethCurrent,
+    );
+    const p = [...positions.values()][0];
+    expect(p.cost).toBeCloseTo(1500, 6); // 0.5 × 3000 fallback
+  });
+});
+
 describe("aggregateTrades", () => {
   it("returns empty maps for no rows", () => {
     const { positions, gasSpend } = aggregateTrades([], stableQuote);

@@ -50,6 +50,20 @@ describe("enrichTradesForExport (iter616)", () => {
     expect(enriched[0].realized_pnl_usd).toBeNull();
   });
 
+  // v107: tax basis prefers trade-time value_usd over quoteAmt × current price,
+  // so non-stablecoin-quoted lots match pnl.ts (no drift).
+  it("uses value_usd for cost_basis + proceeds when present (WETH-quoted lot)", () => {
+    const wethCurrent = () => 3000; // current WETH price — the approximation
+    const rows = [
+      row({ direction: "buy", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1000, timestamp: "2026-01-01T00:00:00Z" }),
+      row({ direction: "sell", base_amount: "1", quote_amount: "0.5", quote_symbol: "WETH", value_usd: 1400, timestamp: "2026-02-01T00:00:00Z" }),
+    ];
+    const enriched = enrichTradesForExport(rows, wethCurrent, noGas);
+    expect(enriched[0].cost_basis_usd).toBe(1000); // value_usd, not 0.5×3000
+    expect(enriched[1].proceeds_usd).toBe(1400); // value_usd, not 0.5×3000
+    expect(enriched[1].realized_pnl_usd).toBe(400); // 1400 − 1000
+  });
+
   it("buy-then-sell roundtrip: sell row carries realized + cost_basis + proceeds", () => {
     // Buy 10 @ $100 = $1000 → Sell 5 @ $150 = $750 → released cost = $500 (5 × avg cost $100),
     // realized = $750 - $500 = $250.

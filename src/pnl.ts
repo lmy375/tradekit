@@ -16,9 +16,11 @@ import { formatUsd } from "./holdings.js";
  *   - When a "sell" closes (base → quote), the realized PnL is
  *     base_amount_sold * (sell_price_usd - avg_cost_usd).
  *
- * USD is computed using the trade-record price (which is quote_per_base) plus the current
- * USD price of the QUOTE token; this is the best we can do without historical quote-USD prices.
- * For USD-pegged quote tokens (USDC, USDT, DAI) this gives near-exact results.
+ * USD per trade prefers the persisted trade-time value (v104 `value_usd`, the exact dollars
+ * moved at execution). Only when that's absent (legacy rows) does it fall back to the
+ * approximation: trade-record price (quote_per_base) × the QUOTE token's CURRENT USD price —
+ * near-exact for USD-pegged quotes (USDC/USDT/DAI), but for a non-stablecoin quote (WETH) the
+ * fallback re-values the cost basis at today's quote price. value_usd removes that distortion.
  *
  * Gas spend is summed in native token units per chain (separate report).
  */
@@ -578,9 +580,16 @@ export function aggregateTrades(
     const baseAmt = parseFloat(row.base_amount) || 0;
     const quoteAmt = parseFloat(row.quote_amount) || 0;
     const qUsd = quoteUsd(row);
-    if (baseAmt <= 0 || quoteAmt <= 0 || qUsd == null) continue;
-
-    const tradeUsd = quoteAmt * qUsd;
+    // v107: prefer the persisted trade-time USD value (v104 value_usd) — the
+    // EXACT dollars moved at execution. For a non-stablecoin quote (e.g. WETH)
+    // qUsd is only the CURRENT price, so quoteAmt × qUsd mis-states the cost
+    // basis by however much the quote token has moved since (WETH-quoted buys
+    // get re-valued at today's ETH). value_usd closes that documented gap. Fall
+    // back to quoteAmt × qUsd for legacy/unpriced-at-trade rows; a row with
+    // value_usd but no live quote price now contributes instead of being skipped.
+    const valueUsd = row.value_usd != null && Number.isFinite(row.value_usd) && row.value_usd > 0 ? row.value_usd : null;
+    const tradeUsd = valueUsd ?? (qUsd != null ? quoteAmt * qUsd : null);
+    if (baseAmt <= 0 || quoteAmt <= 0 || tradeUsd == null || !(tradeUsd > 0)) continue;
     const key = `${row.chain}:${(row.base_symbol ?? row.base_token).toUpperCase()}`;
     let acc = positions.get(key);
     if (!acc) {
