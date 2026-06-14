@@ -34,6 +34,7 @@
 import { ToolError } from "./errors.js";
 import { fetchWithTimeout } from "./http.js";
 import { getCoinGeckoId } from "./price.js";
+import { evictIfOverCap } from "./priceCacheShared.js";
 import { isOrderTriggered } from "./orders.js";
 import { evaluateTrailingTrigger, type TrailingOrderView } from "./trailingStop.js";
 import { parseCron, matchesAt, durationToCron, type ParsedCron } from "./cron.js";
@@ -81,10 +82,37 @@ export interface PriceSeries {
  *
  * `fetchImpl` is an injection seam for tests.
  */
+// v66: CoinGecko market_chart series cache. The spot-price layer has had a
+// 60s cache (iter132) for ages, but the SERIES fetch was uncached — so every
+// price_context call (v64), every open-position mark, and every backtest hit
+// CoinGecko fresh, and the free tier rate-limits hard (~10-30 req/min). An
+// agent screening several tokens or an operator iterating backtests would get
+// 429s. This adds the same shape the spot cache uses: a TTL cache keyed by
+// (coinId, days) + in-flight dedup so concurrent callers share one fetch.
+//
+// TTL is longer than the spot cache's 60s: a daily/hourly candle series barely
+// moves intra-window, and entry/exit-context decisions aren't HFT — a few
+// minutes of staleness on the "current" (last) point is an acceptable trade
+// for not getting rate-limited. Only SUCCESSFUL series are cached; thrown API
+// errors retry (not cached). null (no coinId) returns before the fetch anyway.
+interface SeriesCacheEntry { series: PriceSeries; fetchedMs: number; }
+const seriesCache = new Map<string, SeriesCacheEntry>();
+const seriesInFlight = new Map<string, Promise<PriceSeries>>();
+export const SERIES_CACHE_TTL = 300_000; // 5 minutes
+const SERIES_CACHE_MAX = 200;
+
+/** Test seam: drop all cached series + in-flight entries. */
+export function __clearSeriesCache(): void {
+  seriesCache.clear();
+  seriesInFlight.clear();
+}
+
 export async function fetchPriceSeries(
   tokenAddress: string,
   days: number,
   fetchImpl: (url: string) => Promise<unknown> = defaultFetchJson,
+  /** Test seam for TTL expiry; defaults to the wall clock. */
+  nowMs: number = Date.now(),
 ): Promise<PriceSeries | null> {
   const coinId = getCoinGeckoId(tokenAddress);
   if (!coinId) return null;
@@ -94,30 +122,49 @@ export async function fetchPriceSeries(
       `--since out of range — expected 1..3650 days, got ${days}.`,
     );
   }
-  const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`;
-  const raw = (await fetchImpl(url)) as { prices?: [number, number][] } | undefined;
-  const rows = raw?.prices ?? [];
-  if (rows.length === 0) {
-    throw new ToolError(
-      "API_ERROR",
-      `CoinGecko returned no price series for ${coinId} over ${days}d — token may be too new or the id mapping is wrong.`,
-    );
-  }
-  // CoinGecko returns [ms_epoch, price]. Sort + de-dupe by minute (rare
-  // duplicates at boundaries). Stable sort lets us pick the FIRST point
-  // at each minute (= boundary representative).
-  const seen = new Set<number>();
-  const points: PricePoint[] = [];
-  for (const [msEpoch, priceUsd] of rows) {
-    if (!Number.isFinite(msEpoch) || !Number.isFinite(priceUsd)) continue;
-    if (priceUsd <= 0) continue;
-    const minuteBucket = Math.floor(msEpoch / 60_000);
-    if (seen.has(minuteBucket)) continue;
-    seen.add(minuteBucket);
-    points.push({ ts: new Date(msEpoch).toISOString(), priceUsd });
-  }
-  points.sort((a, b) => a.ts.localeCompare(b.ts));
-  return { coinId, daysRequested: days, points };
+  const key = `${coinId}:${days}`;
+  const cached = seriesCache.get(key);
+  if (cached && nowMs - cached.fetchedMs < SERIES_CACHE_TTL) return cached.series;
+  // Coalesce concurrent fetches for the same (coinId, days).
+  const inFlight = seriesInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const promise = (async (): Promise<PriceSeries> => {
+    const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`;
+    const raw = (await fetchImpl(url)) as { prices?: [number, number][] } | undefined;
+    const rows = raw?.prices ?? [];
+    if (rows.length === 0) {
+      throw new ToolError(
+        "API_ERROR",
+        `CoinGecko returned no price series for ${coinId} over ${days}d — token may be too new or the id mapping is wrong.`,
+      );
+    }
+    // CoinGecko returns [ms_epoch, price]. Sort + de-dupe by minute (rare
+    // duplicates at boundaries). Stable sort lets us pick the FIRST point
+    // at each minute (= boundary representative).
+    const seen = new Set<number>();
+    const points: PricePoint[] = [];
+    for (const [msEpoch, priceUsd] of rows) {
+      if (!Number.isFinite(msEpoch) || !Number.isFinite(priceUsd)) continue;
+      if (priceUsd <= 0) continue;
+      const minuteBucket = Math.floor(msEpoch / 60_000);
+      if (seen.has(minuteBucket)) continue;
+      seen.add(minuteBucket);
+      points.push({ ts: new Date(msEpoch).toISOString(), priceUsd });
+    }
+    points.sort((a, b) => a.ts.localeCompare(b.ts));
+    const series: PriceSeries = { coinId, daysRequested: days, points };
+    seriesCache.set(key, { series, fetchedMs: nowMs });
+    evictIfOverCap(seriesCache, SERIES_CACHE_MAX);
+    return series;
+  })();
+  // Register synchronously so a same-tick concurrent caller coalesces; clear
+  // on settle (success OR error — errors must retry, not stick).
+  seriesInFlight.set(key, promise);
+  void promise.catch(() => undefined).finally(() => {
+    if (seriesInFlight.get(key) === promise) seriesInFlight.delete(key);
+  });
+  return promise;
 }
 
 async function defaultFetchJson(url: string): Promise<unknown> {

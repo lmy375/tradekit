@@ -15,6 +15,8 @@ import {
   simulateSchedule,
   simulatePlaybook,
   fetchPriceSeries,
+  __clearSeriesCache,
+  SERIES_CACHE_TTL,
   parseSinceDuration,
   type PriceSeries,
   type OrderBacktestSpec,
@@ -86,6 +88,10 @@ describe("parseSinceDuration", () => {
 // ── fetchPriceSeries ─────────────────────────────────────────
 
 describe("fetchPriceSeries", () => {
+  // v66: the series cache is module-level — clear it between cases so a
+  // prior test's cached (coinId, days) series doesn't leak into the next.
+  beforeEach(() => __clearSeriesCache());
+
   it("returns null for off-listing tokens", async () => {
     const res = await fetchPriceSeries("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef", 30, async () => ({}));
     expect(res).toBeNull();
@@ -144,6 +150,64 @@ describe("fetchPriceSeries", () => {
     expect(series).not.toBeNull();
     expect(series!.points.length).toBe(1);
     expect(series!.points[0].priceUsd).toBe(1900);
+  });
+
+  // ── v66: TTL + in-flight cache ──
+  const WETH = "0x4200000000000000000000000000000000000006";
+  const ok = (price: number) => ({ prices: [[1_700_000_000_000, price]] as [number, number][] });
+
+  it("serves a second call within the TTL from cache (one fetch)", async () => {
+    let calls = 0;
+    const fetchImpl = async () => { calls++; return ok(2000); };
+    const a = await fetchPriceSeries(WETH, 7, fetchImpl, 0);
+    const b = await fetchPriceSeries(WETH, 7, fetchImpl, SERIES_CACHE_TTL - 1);
+    expect(calls).toBe(1);
+    expect(b!.points[0].priceUsd).toBe(2000);
+    expect(a).toEqual(b);
+  });
+
+  it("re-fetches after the TTL expires", async () => {
+    let calls = 0;
+    const fetchImpl = async () => { calls++; return ok(2000 + calls); };
+    await fetchPriceSeries(WETH, 7, fetchImpl, 0);
+    await fetchPriceSeries(WETH, 7, fetchImpl, SERIES_CACHE_TTL + 1);
+    expect(calls).toBe(2);
+  });
+
+  it("keys the cache by (coinId, days) — different windows miss", async () => {
+    let calls = 0;
+    const fetchImpl = async () => { calls++; return ok(2000); };
+    await fetchPriceSeries(WETH, 7, fetchImpl, 0);
+    await fetchPriceSeries(WETH, 30, fetchImpl, 0);
+    expect(calls).toBe(2);
+  });
+
+  it("coalesces concurrent fetches for the same key (one fetch)", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 10));
+      return ok(2000);
+    };
+    const [a, b] = await Promise.all([
+      fetchPriceSeries(WETH, 7, fetchImpl, 0),
+      fetchPriceSeries(WETH, 7, fetchImpl, 0),
+    ]);
+    expect(calls).toBe(1);
+    expect(a).toEqual(b);
+  });
+
+  it("does NOT cache a thrown fetch — the next call retries", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls === 1) throw new Error("rate limited");
+      return ok(2000);
+    };
+    await expect(fetchPriceSeries(WETH, 7, fetchImpl, 0)).rejects.toThrow(/rate limited/);
+    const series = await fetchPriceSeries(WETH, 7, fetchImpl, 0); // not cached → retry
+    expect(calls).toBe(2);
+    expect(series!.points[0].priceUsd).toBe(2000);
   });
 });
 

@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 66 — 价格序列缓存（fetchPriceSeries TTL + in-flight cache — rate-limit resilience for the hot price path）** ✅
+- **硬化我最近功能依赖的核心热路径**，而非加新 feature：现价层早有 60s 缓存（iter132），但 **序列拉取（fetchPriceSeries / CoinGecko market_chart）一直无缓存**。v64 price_context、v65 持仓 mark、所有 backtest 都直打 CoinGecko，而免费档 ~10-30 req/min 限流很硬——agent 连续 screen 几个 token、或运营商迭代 backtest，就吃 429
+- 与 v38（批量化价格抓取减少 CoinGecko 调用）同一动机：减少对限流外部 API 的负载。这是"针对最重要的东西优化"——所有价格决策依赖的层
+- 实现（镜像现价层的缓存形状）：按 `(coinId, days)` 键的 TTL 缓存 + in-flight 去重（并发同键调用共享一次拉取）+ 容量上限 + 复用 `priceCacheShared.evictIfOverCap`。TTL **5 分钟**（比现价的 60s 长——日/小时级 candle 序列窗口内几乎不动，entry/exit 上下文非 HFT，几分钟"当前点"陈旧换不被限流是值得的，已注释说明）
+- 只缓存**成功**序列；抛错（API 限流/故障）**不**缓存→下次重试；null（无 coinId 映射）在拉取前就返回（无需缓存）。`nowMs` 注入 seam 测 TTL 过期、`__clearSeriesCache` 测试隔离
+- 测试覆盖：`backtest.test.ts` +5（TTL 内第二次命中缓存仅一次拉取 / TTL 过期重拉 / 按 (coinId,days) 键不同窗口 miss / 并发同键合并为一次拉取 / 抛错不缓存下次重试）+ 给既有 fetchPriceSeries describe 加 `beforeEach(__clearSeriesCache)` 隔离（模块级缓存会让相邻 case 串味——修了 1 个因此暴露的 case）
+- 向后兼容：纯加法——fetchPriceSeries 签名加可选 `nowMs`（4th，测试 seam，调用方不传）；行为对调用方透明（命中返回同样的序列）；3300 测试全绿
+- v1 限制：5min TTL 意味着 price_context 的"当前价"最多 5 分钟陈旧（对入/出场上下文可接受，非 HFT）；缓存进程内（重启清零，与现价层一致）；序列随时间推移会"漂移"（缓存的是 5min 前结束的窗口）但对 7d/30d 窗口可忽略
+
 **Phase 65 — 持仓复盘 / 退出时机（open-position review — cost basis, unrealized, holding period + projected tax term）** ✅
 - **退出决策的对位**：v64 price context 给**入场**时机，v60 给**已实现**收益的持有期+短/长期；本期补上 **OPEN 持仓** 的持有期+若现在卖的税务 term——退出时机。三者凑齐：入场（v64）、持有中（v65）、平仓后（v60）
 - 缺口：agent 持有仓位，要决定**何时退出**（止盈/止损/等长期税率），需要每个仓位的：成本基准、当前价值、未实现盈亏（绝对+%）、持有多久、**若现在卖是短期还是长期**、距离长期还差几天。此前无任何 surface 给这个——"WETH 已持 340 天，再 25 天转长期税率，等等" 这种具体退出决策无从下手
