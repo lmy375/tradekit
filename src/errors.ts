@@ -93,6 +93,15 @@ export type ErrorCode =
   // breaker (portfolio mark-to-market) — this gates a single strategy's
   // realized LOSSES. "Stop digging."
   | "STRATEGY_LOSS_BREAKER_TRIPPED"
+  // v96: `playbook promote --require-ready` refused to flip a paper strategy to
+  // REAL trading because its readiness check (promoteCheck) returned not_ready —
+  // the hard EVIDENCE floors failed (paper runtime < minimum days, or fills <
+  // minimum). Distinct from the funding gate (INSUFFICIENT_BALANCE — "can the
+  // wallet pay?") and the safety gate (SAFEGUARD_TRIGGERED — "is the wallet
+  // guarded?"): this is the strategy-QUALITY gate — "has the strategy actually
+  // proven itself on paper?". `caution`-level quality flags never block (a
+  // judgment call); only the evidence floors do.
+  | "PROMOTE_NOT_READY"
   // Iter20: portfolio drawdown circuit breaker tripped (safety.drawdownCircuitBreaker).
   // The portfolio's current USD value has fallen below peak × (1 - maxDrawdownPct/100),
   // OR the breaker was already tripped from a previous trade and hasn't been reset.
@@ -442,6 +451,7 @@ export function httpStatusForCode(code: ErrorCode): number {
     case "STRATEGY_BUDGET_EXCEEDED":
     case "POSITION_CAP_EXCEEDED":
     case "STRATEGY_LOSS_BREAKER_TRIPPED":
+    case "PROMOTE_NOT_READY":
     case "DRAWDOWN_CIRCUIT_BREAKER_TRIPPED":
     case "SAFETY_CONFIG_LOCKED":
     case "TRANSFER_RECIPIENT_NOT_ALLOWED":

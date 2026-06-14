@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 96 — promote 第三道闸：晋升真钱前先问"策略本身证明过自己了吗？"（the readiness gate — wire promote-check INTO promote, so the most important question can't be forgotten）** ✅
+- **把信任管道里最该问的问题接进唯一会真金白银的动作**：`playbook promote <id>`（纸面→真钱的那一刻）跑了两道 preflight——v36 资金（钱包付得起吗？`--require-funded`）+ v52 安全（钱包有护栏吗？`--require-safe`）。但它**从不查 promoteCheck**（v49，"这个纸面策略证明过自己了吗？"）——这个策略质量闸是一个**完全独立的命令**，运营商得自己记得去跑。代码注释自己都写着"promote-check 是 promote 决策的策略质量那一半（promote 本身只跑资金 preflight 那一半）"。结果：一个只跑了 1 天、2 笔成交、40% 纸面回撤的策略，可以零摩擦地被晋升上真钱，因为 promote 根本不看它的就绪度
+- 为什么是最重要的：整个产品最危险的动作就是"让 agent 开始用真钱交易"。今天三个问题里有两个被 gate 了（付得起 / 有护栏），唯独最重要的第三个——"这策略到底行不行？"——被留给运营商的记忆。把就绪度从"独立命令、advisory"变成"和另两道闸同一条 preflight 轨道上的 gate"，让最关键的判断不再可能被遗忘。这是 v49 就绪检查的收尾：detect（检查就绪度）→ **enforce**（接进 promote 动作）
+- 实现（对称三道闸 + 复用 v49 引擎，零阈值重复）：新纯函数 `promoteReadinessBlocker(report)`——镜像 `safetyPromoteBlocker` / `preflightBlocker`，仅当 verdict===`not_ready`（硬证据底线：纸面运行天数 < 最小 / 成交数 < 最小）时返回 blocker，`caution` 级质量旗标（亏损 PnL / 深回撤 / friction 吃掉 edge）是运营商自己的判断、绝不硬停。promote 命令加第三道闸：`to===real && !--skip-preflight` 时跑 `gatherPromoteCheck` 并打印就绪 verdict+reasons（advisory），`--require-ready` 时 verdict===not_ready 抛 `PROMOTE_NOT_READY`。gather 失败（RPC 不可用）降级为 advisory-skip，但真正的就绪 block 必须穿透（catch 里 re-throw PROMOTE_NOT_READY）
+- 新错误码 `PROMOTE_NOT_READY`（403 组——precondition/forbidden-state，同 SAFEGUARD_TRIGGERED）：与资金闸（INSUFFICIENT_BALANCE）、安全闸（SAFEGUARD_TRIGGERED）语义区分，agent/运营商可精确 branch
+- 测试覆盖：promoteCheck.test.ts +3（not_ready→block 且列出证据底线失败 / ready→不 block / caution-only→不 block，质量旗标不是底线）+ errors.test.ts +1（PROMOTE_NOT_READY→403）；3503 测试全绿（+3）；usage + 干净错误路径已烟测
+- 向后兼容：纯加法——三道闸全 advisory 默认（`--require-ready` 才硬停，同 `--require-funded`/`--require-safe`）；`--skip-preflight` 统一关全部三道；新错误码纯加；不改 promoteCheck 既有 verdict 逻辑
+
 **Phase 95 — promote-outcome 进 cron digest：主动抓住"纸面漂亮、实盘悄悄亏钱"的已晋升策略（promote-outcome divergence in the digest — surface the trust pipeline's most dangerous outcome PROACTIVELY）** ✅
 - **让信任管道最危险的信号变主动**：v49/v50 建了完整的纸面→实盘信任管道——promoteCheck（前向：这个纸面策略能上真钱吗？）+ promoteOutcome（后向：晋升后实盘兑现了纸面承诺吗？）。promoteOutcome 模块自己的注释说它抓的是"整个管道存在的意义就是防止的那个最危险结局：纸面看着很棒、实盘悄悄亏钱"。但它**只能按需查**（CLI/MCP），运营商得记得去跑。cron digest 是运营商的主动心跳；v88 把"原始亏损策略"放进了 digest，但一个策略可以**实盘正收益**（v88 不报警）却只兑现了纸面承诺的 30%、或滑点是纸面的 2 倍——这个 divergence 信号正是 digest 缺的
 - 为什么是最重要的：把真钱托付给自主 agent，最危险的不是单笔爆炸，而是**一个已晋升策略在"机械上成功"的同时持续低于预期地漏钱**——运营商不主动查就发现不了，等发现真金白银已经流走。把这个信号接进每 15 分钟的心跳，让管道最重要的判断从"按需"变"主动"。这收尾了 detect→journal→correlate→validate→**proactive surfacing** 这条可观测性弧

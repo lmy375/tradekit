@@ -241,6 +241,26 @@ export async function gatherPromoteCheck(args: {
   };
 }
 
+/**
+ * v96: the promote-gate half of the readiness check — mirrors
+ * safetyPromoteBlocker / preflightBlocker. Returns a blocker message when the
+ * strategy has NOT earned a real-money promotion, else null. Only the hard
+ * EVIDENCE floors block (verdict === "not_ready": insufficient paper runtime /
+ * fills) — `caution`-level quality flags (losing PnL, deep drawdown, friction
+ * eating the edge) are judgment calls the operator owns, never a hard stop.
+ * Used by `playbook promote --require-ready`.
+ */
+export function promoteReadinessBlocker(report: PromoteCheckReport): string | null {
+  if (report.verdict !== "not_ready") return null;
+  // The not_ready reasons ARE the evidence-floor failures (the flag() helper
+  // only escalates to not_ready for the runtime/fills floors).
+  return (
+    `paper strategy #${report.playbookId} "${report.name}" is NOT READY for real money:\n` +
+    report.reasons.map((r) => `  ✗ ${r}`).join("\n") +
+    `\nLet it run on paper longer (or promote anyway without --require-ready).`
+  );
+}
+
 // ── rendering ────────────────────────────────────────────────
 
 export function renderPromoteCheck(r: PromoteCheckReport): string {

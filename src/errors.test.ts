@@ -229,6 +229,7 @@ describe("httpStatusForCode", () => {
     expect(httpStatusForCode("CONTRACT_BLOCKED")).toBe(403);
     expect(httpStatusForCode("AMOUNT_EXCEEDS_LIMIT")).toBe(403);
     expect(httpStatusForCode("SLIPPAGE_TOO_HIGH")).toBe(403);
+    expect(httpStatusForCode("PROMOTE_NOT_READY")).toBe(403);
   });
 
   it("404 for not-found resources (tx hash unknown, wallet missing, unknown chain/token/account)", () => {

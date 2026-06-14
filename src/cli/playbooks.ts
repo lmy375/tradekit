@@ -681,6 +681,43 @@ export async function playbookPromoteCommand(flags: Record<string, string>, posi
     }
   }
 
+  // v96 readiness gate: the funding preflight asks "can the wallet PAY?", the
+  // safety preflight asks "is the wallet GUARDED?" — this asks the third, most
+  // important question: "has the STRATEGY actually proven itself on paper?".
+  // Previously promote-check (v49) was a wholly separate command the operator
+  // had to remember to run; now it rides the same preflight rail. Symmetric
+  // stance — advisory by default (prints the readiness verdict + reasons),
+  // --require-ready aborts on a not_ready verdict (hard evidence floors:
+  // insufficient paper runtime / fills), --skip-preflight disables all three.
+  if (to === "real" && flags["skip-preflight"] !== "true") {
+    const { gatherPromoteCheck, promoteReadinessBlocker } = await import("../promoteCheck.js");
+    try {
+      const check = await gatherPromoteCheck({ playbookId: id });
+      if (flags["json"] !== "true") {
+        const V = { ready: "✅ ready", caution: "⚠ caution", not_ready: "⛔ NOT READY" }[check.verdict];
+        console.log(
+          `  Readiness: ${V} — ${check.runtime.days.toFixed(1)}d paper runtime, ${check.runtime.fills} fill(s)` +
+            (check.performance ? `, paper PnL ${check.performance.totalQuote >= 0 ? "+" : "−"}$${Math.abs(check.performance.totalQuote).toFixed(2)}` : ""),
+        );
+        if (check.verdict !== "ready") {
+          for (const r of check.reasons) console.log(`    ${check.verdict === "not_ready" ? "✗" : "⚠"} ${r}`);
+          if (flags["require-ready"] !== "true" && check.verdict === "not_ready") {
+            console.log(`    (run with --require-ready to make this a hard stop; \`tradekit playbook promote-check ${id}\` for the full report)`);
+          }
+        }
+      }
+      if (flags["require-ready"] === "true") {
+        const blocker = promoteReadinessBlocker(check);
+        if (blocker) throw new ToolError("PROMOTE_NOT_READY", `Promote aborted — ${blocker}`);
+      }
+    } catch (e) {
+      // A genuine readiness block must propagate; only a gather FAILURE (e.g.
+      // RPC unavailable for the MTM/equity reads) degrades to advisory-skip.
+      if (e instanceof ToolError && e.code === "PROMOTE_NOT_READY") throw e;
+      if (flags["json"] !== "true") console.log(`  (readiness check unavailable: ${(e as Error).message})`);
+    }
+  }
+
   const { promotePlaybook } = await import("../playbooks.js");
   const result = promotePlaybook({ playbookId: id, to });
 

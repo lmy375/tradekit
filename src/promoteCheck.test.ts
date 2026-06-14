@@ -24,7 +24,7 @@ vi.mock("./paperPnl.js", async (importOriginal) => {
   };
 });
 
-const { gatherPromoteCheck, renderPromoteCheck, MIN_RUNTIME_DAYS, MIN_FILLS } =
+const { gatherPromoteCheck, renderPromoteCheck, promoteReadinessBlocker, MIN_RUNTIME_DAYS, MIN_FILLS } =
   await import("./promoteCheck.js");
 const { openDb, closeDb, insertPlaybook, updatePlaybookStatus, recordPaperTrade, insertTrade, insertPortfolioSnapshot } =
   await import("./db.js");
@@ -213,5 +213,40 @@ describe("render + errors", () => {
 
   it("unknown playbook → clean INVALID_PARAMS", async () => {
     await expect(check(99_999)).rejects.toMatchObject({ code: "INVALID_PARAMS" });
+  });
+});
+
+// v96: the promote-gate half — only the hard evidence floors block.
+describe("promoteReadinessBlocker (the --require-ready gate)", () => {
+  it("blocks a not_ready strategy, listing the evidence-floor failures", async () => {
+    const sparse = mkPlaybook(30);
+    seedFills(sparse, 2); // < MIN_FILLS → not_ready
+    const r = await check(sparse);
+    expect(r.verdict).toBe("not_ready");
+    const blocker = promoteReadinessBlocker(r);
+    expect(blocker).not.toBeNull();
+    expect(blocker).toMatch(/NOT READY/);
+    expect(blocker).toMatch(new RegExp(`< ${MIN_FILLS}`));
+    expect(blocker).toMatch(/promote anyway without --require-ready/);
+  });
+
+  it("does NOT block a ready strategy", async () => {
+    const id = mkPlaybook(14);
+    seedFills(id, 10, { slippageBps: 30 });
+    seedPaperSnapshots([1000, 1020, 1040, 1060]);
+    seedRealSlippage(20);
+    const r = await check(id);
+    expect(r.verdict).toBe("ready");
+    expect(promoteReadinessBlocker(r)).toBeNull();
+  });
+
+  it("does NOT block a caution-only strategy — quality flags are a judgment call, not a floor", async () => {
+    const id = mkPlaybook(14);
+    seedFills(id, 10, { slippageBps: 10 }); // paper optimistic vs real → caution
+    seedPaperSnapshots([1000, 1010, 1020]);
+    seedRealSlippage(80);
+    const r = await check(id);
+    expect(r.verdict).toBe("caution");
+    expect(promoteReadinessBlocker(r)).toBeNull();
   });
 });
