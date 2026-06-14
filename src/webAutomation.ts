@@ -747,4 +747,23 @@ export function registerAutomationRoutes(app: Express): void {
       res.json({ ok: true, posture, headroom });
     }),
   );
+
+  // ── risk posture (v86) ────────────────────────────────────
+  // Web parity for the v78 unified RUNTIME risk verdict — the single "is my
+  // book in danger right now?" answer (exposure headroom + concentration +
+  // unprotected value + MEV synthesized to ok/elevated/critical with ranked
+  // concerns). The most important operator signal, now on the dashboard
+  // instead of only `risk` on the CLI. Each component is best-effort: a dim
+  // that needs on-chain reads degrades into `skipped` (never fails the call),
+  // so the page renders even when an RPC is down.
+  app.get(
+    "/api/risk",
+    wrap(async (_req, res) => {
+      const config = loadConfig();
+      const { gatherRiskPosture } = await import("./riskPosture.js");
+      const { createSilentLogger } = await import("./logger.js");
+      const report = await gatherRiskPosture({ config, logger: createSilentLogger() });
+      res.json({ ok: true, ...report });
+    }),
+  );
 }

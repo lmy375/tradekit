@@ -27,6 +27,7 @@ import { PnL } from "./pages/PnL";
 import { Backtests } from "./pages/Backtests";
 import { Execution } from "./pages/Execution";
 import { Safety } from "./pages/Safety";
+import { Risk } from "./pages/Risk";
 import { Approvals } from "./pages/Approvals";
 import { Audit } from "./pages/Audit";
 import { ConfigPage } from "./pages/Config";
@@ -49,6 +50,7 @@ const TABS = [
   { value: "backtests", label: "Backtests", el: Backtests },
   { value: "execution", label: "Execution", el: Execution },
   { value: "safety", label: "Safety", el: Safety },
+  { value: "risk", label: "Risk", el: Risk },
   { value: "approvals", label: "Approvals", el: Approvals },
   { value: "audit", label: "Audit", el: Audit },
   { value: "config", label: "Config", el: ConfigPage },

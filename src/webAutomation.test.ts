@@ -772,3 +772,18 @@ describe("/api/safety", () => {
     expect(headroom.counts).toHaveProperty("tripped");
   });
 });
+
+describe("/api/risk", () => {
+  it("returns the unified runtime risk verdict + ranked concerns", async () => {
+    const r = await get("/api/risk");
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(["ok", "elevated", "critical"]).toContain(r.body.verdict);
+    expect(Array.isArray(r.body.concerns)).toBe(true);
+    // Each component is best-effort; the dims it could evaluate are listed in
+    // `checked` (headroom + mev are DB/config-only, so they always evaluate).
+    expect(Array.isArray(r.body.checked)).toBe(true);
+    expect(Array.isArray(r.body.skipped)).toBe(true);
+    expect(typeof r.body.summary).toBe("string");
+  });
+});

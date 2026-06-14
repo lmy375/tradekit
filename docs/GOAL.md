@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 86 — 风险态势上 Web（risk posture on the dashboard — bring the most important operator signal to the laggard interface）** ✅
+- **补齐三大界面里落后最多的那个，针对最重要的信号**：CLI/MCP/Web 三大一等界面，Web 自 v68（safety 页）以来落后了 ~17 个能力（concentration/protection/risk posture/strategy compare/calibration…全没上 Web）。用 Web 看盘的运营商，对**最重要的信号——风险**完全盲。本期把 v78 统一风险裁决搬上仪表盘
+- 为什么是最重要的：安全做满后，运营商信任的核心是"现在安不安全"。这个答案（risk posture）此前只在 CLI `risk`。用 Web 的运营商日常看不到。把它放进仪表盘 = 最重要的信号到达最该看的地方
+- 实现（复用 v68 可测模式）：(1) `registerAutomationRoutes` 加 `GET /api/risk` → `gatherRiskPosture`（v78），**每维度 best-effort**——需链上读的维度（concentration/protection）失败降级进 skipped，离线测试环境下路由仍返回有效裁决（headroom+mev 计算、RPC 维度优雅缺省）；(2) React `Risk.tsx` 镜像 v68 `Safety.tsx`（只读、防御性）：verdict 徽章（ok/elevated/critical 配色）+ summary + 排序 concerns（critical/elevated × source 标签 + 文案）+ checked/skipped 脚注；(3) App.tsx tab + api.ts `getRisk`/`RiskResp`
+- 为何 `registerAutomationRoutes`：那是**可单元测试**的注册器（webAutomation.test 真起 app.listen 打真 HTTP）。API 完全可验证，不依赖 React 渲染
+- 测试覆盖：`webAutomation.test.ts` +1（`/api/risk` 返回 verdict ∈ 三态 + concerns/checked/skipped 数组 + summary——离线环境验证 best-effort 降级仍出有效裁决）；webui `tsc -b` + `vite build` 全过（React 编译 + 打包验证）
+- 向后兼容：纯加法——新路由、新 React tab、api.ts 新 getRisk/RiskResp；既有界面不变；3447 测试全绿（+1）
+- v1 限制：Web 风险页与 CLI `risk` 同源（gatherRiskPosture）——但 Web 无 wallet 上下文时 concentration/protection 维度可能降级（skipped 脚注明示，CLI 全量）；只读（无操作按钮——配置/止损变更仍走 CLI 高权路径）；React 渲染本身无单测（靠 tsc+build+镜像久经考验的 Safety.tsx 降风险）
+
 **Phase 85 — 稳定币注册表合一（one stablecoin registry — the surfaces can no longer disagree on what a dollar is）** ✅
 - **修复一个 LIVE 的跨面不一致，硬化最重要的数字（而非加 feature）**：稳定币计价的 quote 按 $1 估值，是所有 P&L/税务/分类面确定性定价的基石。但**七个文件各有一份 `isStablecoin`，且集合彼此不同**——pnl/tradeExport/aggregatorStats/pairStats/importTrade 认 BUSD/USDP/TUSD，paperPnl 认 USDBC/LUSD/GUSD/USDS。后果：**同一笔 LUSD 计价交易在 paper 账本按 $1 计、在真实 PnL 和税务导出里却被当非稳定币跳过**；BUSD 计价的反之。和成本基准漂移（v71/v82）同类的跨面不一致——但这个是**当前就存在的活 bug**，不是潜在风险
 - 为什么是最重要的：安全做满后，"可信、一致的数字"是产品根基。同一笔交易在不同面给出不同 PnL/税务结果，是最坏的信任 bug（每个面单独看自洽，跨面对不上）。这是 v71/v82 成本基准合一的同类收尾——这次是 quote 定价

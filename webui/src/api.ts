@@ -717,3 +717,24 @@ export interface SafetyResp {
 }
 
 export const getSafety = () => api.get<SafetyResp>("/api/safety");
+
+export type RiskVerdict = "ok" | "elevated" | "critical";
+
+export interface RiskConcern {
+  severity: "critical" | "warn";
+  code: string;
+  message: string;
+  source: "headroom" | "concentration" | "protection" | "mev";
+}
+
+export interface RiskResp {
+  ok: true;
+  verdict: RiskVerdict;
+  concerns: RiskConcern[];
+  checked: string[];
+  skipped: string[];
+  summary: string;
+  generatedAt: string;
+}
+
+export const getRisk = () => api.get<RiskResp>("/api/risk");
