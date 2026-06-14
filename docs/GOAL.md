@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 116 — edge 指标上 Web 策略页：运营商在资金分配界面看到 profit factor，而非只看胜率（trading-edge metrics on the web Strategy table — capital allocation sees edge, not just win rate）** ✅
+- **把 v114 的 edge 信号搬到运营商做资金分配的界面**：v114 给策略对比加了 profit factor/payoff/expectancy，但 web Strategy 页（v87 的排名表，运营商在这里决定"加仓谁、砍谁"）只显示 realized $ / 胜率 / closes / trades / volume——**没有 profit factor**。胜率会骗人（70% 胜率仍可能流血），运营商在 web 上看不到真正判断 edge 的信号
+- 为什么重要：资金分配是 v83 的初衷。web 是运营商主盯的界面（v86/87/102 的"关键信号上滞后 web 界面"模式）。让 profit factor 在排名表里一眼可见——绿(≥1.2)/黄(1-1.2)/红(<1) 配色——把"看着不亏、实则脆弱"的策略当场标红，正是分配决策需要的
+- 实现（纯 web parity，后端 API 早已透传）：/api/strategy-compare 调 gatherStrategyComparison 本就 spread 全报告→edge 字段自动带上（无后端改动）。webui StrategyPerformance 类型加 4 个 edge 字段（optional，旧 server 缺省兼容）；Strategy.tsx 排名表加 profit factor 列（按阈值配色、null 且无亏损显示 ∞）+ payoff 列
+- 测试覆盖：webAutomation.test.ts +1（/api/strategy-compare 契约含 profitFactor/payoff/avgWin/avgLoss——web 依赖的字段，3.5/1.75 精确值）；3597 测试全绿（+1）；webui `tsc -b && vite build` 干净
+- 向后兼容：纯加法——后端零改动（passthrough）；类型字段 optional；web 表加两列；旧 server 字段缺省时显示 —
+
 **Phase 115 — edge 进 promote 就绪检查：晋升真钱前先看"边际优势稳不稳"，而非只看"总账没亏"（profit-factor edge in promote-check — readiness now assesses robustness of edge, not just positive total P&L）** ✅
 - **把 v114 的 edge 信号接进信任管道的前向闸**：promote-check（v49，纸面→真钱就绪度）检查运行天数/成交数/回撤/friction + "总 P&L > 0"。但**总 P&L 可能靠运气**（一笔大赢主导）——一个 profit factor 勉强 > 1、靠一两笔幸运交易的策略，能通过 promote-check（总账正、成交够）被晋升上真钱。就绪检查不看"边际优势稳不稳"
 - 为什么是 v114 的关键延伸：promote 是产品最重要的闸（真钱起点）。"总账没亏"远弱于"有稳健 edge"。profit factor < 1.2（足够多平仓时）立刻暴露"看着不亏、实则脆弱"的策略——正是晋升前最该知道的。且复用 v114 的 edge 计算（gatherStrategyComparison paper 模式，单一源、零 RPC、确定性）

@@ -845,6 +845,21 @@ describe("/api/strategy-compare", () => {
     expect(r.body.bleeding).toEqual(["loser"]);
     expect(typeof r.body.totalRealizedUsd).toBe("number");
   });
+
+  // v116: the edge fields (v114) the web Strategy table renders must be in the
+  // API contract — a strategy with both a win and a loss exposes profit factor.
+  it("includes v114 edge fields (profit factor / payoff / avg win-loss)", async () => {
+    paper("edge", "buy", "3", "6000", 1); // avg $2000/unit
+    paper("edge", "sell", "1", "2400", 2); // +400 win
+    paper("edge", "sell", "1", "2300", 3); // +300 win
+    paper("edge", "sell", "1", "1800", 4); // -200 loss
+    const r = await get("/api/strategy-compare?mode=paper");
+    const s = (r.body.strategies as Array<{ strategy: string; profitFactor: number | null; payoffRatio: number | null; avgWinUsd: number | null; avgLossUsd: number | null }>).find((x) => x.strategy === "edge")!;
+    expect(s.profitFactor).toBeCloseTo(700 / 200, 4); // grossWin 700 / grossLoss 200 = 3.5
+    expect(s.avgWinUsd).toBeCloseTo(350, 4);
+    expect(s.avgLossUsd).toBeCloseTo(200, 4);
+    expect(s.payoffRatio).toBeCloseTo(350 / 200, 4);
+  });
 });
 
 describe("/api/risk", () => {

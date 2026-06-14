@@ -430,6 +430,11 @@ export interface StrategyPerformance {
   winRatePct: number | null;
   volumeUsd: number;
   avgRealizedPerClose: number | null;
+  /** v114 edge metrics — absent on older servers. */
+  avgWinUsd?: number | null;
+  avgLossUsd?: number | null;
+  profitFactor?: number | null;
+  payoffRatio?: number | null;
   lastTradeAt: string | null;
 }
 export interface StrategyCompareResp {

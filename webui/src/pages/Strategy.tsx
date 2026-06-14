@@ -200,6 +200,8 @@ export function Strategy(_props: PageProps) {
                 <Table.Th><Text size="xs" c="dimmed">strategy</Text></Table.Th>
                 <Table.Th><Text size="xs" c="dimmed">realized $</Text></Table.Th>
                 <Table.Th><Text size="xs" c="dimmed">win rate</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed" title="gross win ÷ gross loss — >1 = profitable edge">profit factor</Text></Table.Th>
+                <Table.Th><Text size="xs" c="dimmed" title="avg win ÷ avg loss">payoff</Text></Table.Th>
                 <Table.Th><Text size="xs" c="dimmed">closes</Text></Table.Th>
                 <Table.Th><Text size="xs" c="dimmed">trades</Text></Table.Th>
                 <Table.Th><Text size="xs" c="dimmed">volume $</Text></Table.Th>
@@ -223,6 +225,12 @@ export function Strategy(_props: PageProps) {
                     </Table.Td>
                     <Table.Td><Text size="xs" ff="monospace" c={s.realizedUsd >= 0 ? "teal" : "red.4"}>{s.realizedUsd >= 0 ? "+" : "−"}${Math.abs(s.realizedUsd).toFixed(2)}</Text></Table.Td>
                     <Table.Td><Text size="xs" ff="monospace">{s.winRatePct != null ? `${s.winRatePct.toFixed(0)}% (${s.wins}/${s.wins + s.losses})` : "—"}</Text></Table.Td>
+                    <Table.Td>
+                      <Text size="xs" ff="monospace" c={s.profitFactor == null ? undefined : s.profitFactor >= 1.2 ? "teal" : s.profitFactor >= 1 ? "yellow.6" : "red.4"}>
+                        {s.profitFactor != null ? s.profitFactor.toFixed(2) : (s.closes > 0 && s.losses === 0 ? "∞" : "—")}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td><Text size="xs" ff="monospace">{s.payoffRatio != null ? `${s.payoffRatio.toFixed(2)}×` : "—"}</Text></Table.Td>
                     <Table.Td><Text size="xs" ff="monospace">{s.closes}</Text></Table.Td>
                     <Table.Td><Text size="xs" ff="monospace">{s.tradeCount}</Text></Table.Td>
                     <Table.Td><Text size="xs" ff="monospace">${s.volumeUsd.toFixed(0)}</Text></Table.Td>
