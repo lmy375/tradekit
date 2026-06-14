@@ -33,6 +33,24 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 51 — 安全态势审计（safety posture review — "what protects me, and what's wide open?"）** ✅
+- 关闭整个安全栈的**易读性**缺口：经过 ~50 个迭代，safety 栈累积到 **19 层独立护栏**（per-tx/daily USD 上限、slippage 上限、token 白/黑名单、honeypot 自动探测、infinite-approval 阻断、approval USD 上限、gas 预算、交易限频、portfolio 权重限制、净敞口上限、per-strategy 预算、drawdown 熔断、human approval gate）。每层都单独文档化，但运营商把 AI agent 托付真钱前的**第一个问题**——"此刻究竟有什么在保护我，哪些危险口子是敞开的？"——**没有单一答案**。回答它意味着读十几个嵌套 config key，**并且**得知道哪些缺失是无害的（gas 预算关着）vs 灾难性的（根本没有 USD 上限）。这个判断以前只活在维护者脑子里
+- 新模块 `safetyReview.ts`（~360 行）：纯函数 `reviewSafety(config)`，两半结构
+  - **guardrails[]**：每一层护栏，`active | off | partial` + 渲染出的配置值——"什么在保护我"的清单（运营商看到的是完整态势，不只是缺口）
+  - **gaps[]**：真正要紧的缺失，每条带 `severity`（critical | warn | info）**反映对 agent 部署的真实风险** + **关闭它的精确 config 命令**——"哪里敞开着"的审计
+- 严重度编码（文档化常量，这是核心价值——把"哪些缺失危险"变成代码）：
+  - **CRITICAL**：`safety.enabled=false`（整个栈被绕过）/ perTx **且** daily USD 上限都没设（"一笔 agent 交易、或一个失控循环可以花掉无上限的资金"）
+  - **WARN**：slippage 上限 ≥ 10%（sandwich/illiquid 敞口）/ `allowInfiniteApprovals=true`（"恶意 spender 能抽干整个余额，不只一笔"）/ 无 token 白名单**且**无黑名单**且** honeypot 探测关着（"agent 能交易任意 token，包括 scam/honeypot"）
+  - **INFO**：无 approval USD 上限 / 无 gas 预算 / 无限频 / 无敞口上限 / 无 drawdown 熔断 / 无 human approval gate（自主部署的合法选择，但值得让运营商看见）
+  - 智能降级：honeypot 探测开着但无名单 → token-safety 从 warn 降到 info（探测仍拦截 honeypot）
+- Verdict：任意 critical → `exposed`；否则任意 warn → `moderate`；否则 `hardened`。counts 给出 critical/warn/info 缺口数 + active/total 护栏数
+- 纯 + 确定性：只读 config，无 IO、无时钟（除注入的 generatedAt 戳）。适合 agent **自检**——读取约束自己交易的那些护栏，安全无副作用
+- Surfaces：CLI `tradekit safety review [--json]`（清单 + 按严重度分组的缺口 + 每条 fix 命令）+ MCP `safety_review`（无参只读，agent 在晋升真钱前确认自己被约束）
+- 测试覆盖：`safetyReview.test.ts` 14 case——三档 verdict（exposed via 无 USD 上限 / exposed via master off / moderate / hardened）+ USD 上限 critical 清除 + token-safety warn→info 降级 + 白名单清除缺口 + infinite-approval warn + 6 条 info 缺口各带 fix + counts 一致性 + 渲染
+- MCP_TOOLS 不变量：`safety_review` 加入 iter589/iter877 set（security-tools）
+- 向后兼容：纯加法——无 schema migration、无现有行为改动、无引擎触动；纯读现有 config。它让既有的安全投资**可审计、可读**，而不是再加一层护栏
+- v1 限制：基于 config 的静态审计——不查运行时状态（drawdown 是否已 tripped 看 `safety drawdown`；今日已用 USD 看 health）；token-safety 缺口不区分"agent 实际只交易白名单内"——它评估的是**配置授予的能力面**，不是观测到的行为；approval gate 关着记为 info（自主交易是合法部署模式），运营商按真钱与否自行判断其分量
+
 **Phase 50 — 晋升结果复盘（promote outcome — "did the promote deliver?"）** ✅
 - 闭合信任管道的**反向**缺口：v49 promote-check 是**前瞻**的（"这个 paper 策略准备好上真钱了吗？"），但晋升之后**没有任何东西**回答"晋升究竟兑现了 paper 承诺的东西吗？"。运营商/agent 无法发现整个管道存在的意义所要防的那个最危险结局——一个 paper 上看着很美、上线后悄悄亏钱的策略。`deploy --paper` → `promote-check` → `promote --to real` 这条链一直缺最后一环：上线后的回头验证
 - 关键洞察：两个时代的成交**已经**带同一个 strategy tag 分表存好了——`paper_trades` 是为晋升背书的**冻结基线**（晋升把 primitives 翻成 real 后 paper 表停止增长），`trades` 是上线以来的真实成交。无需新迁移、无需晋升时间戳：表本身就是时代分割线

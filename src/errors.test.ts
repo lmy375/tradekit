@@ -471,6 +471,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "allowances", "audit_allowances", "approve", "revoke", "revoke_all", "check_token",
     // Iter26: safety stack — drawdown breaker inspection + reset.
     "safety_drawdown", "safety_reset_drawdown",
+    // v51: consolidated guardrail posture audit.
+    "safety_review",
     // Iter26: strategy lifecycle (playbooks + backtests) exposed for agent control.
     // v2: playbook_diff + playbook_replace — strategy iteration over MCP.
     "playbook_validate", "playbook_deploy", "playbook_list", "playbook_show", "playbook_destroy",

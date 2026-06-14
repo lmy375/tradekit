@@ -179,6 +179,9 @@ export async function safetyCommand(
   _positional: string[],
 ) {
   switch (action) {
+    case "review":
+      await safetyReviewCommand(flags);
+      break;
     case "drawdown":
       await safetyDrawdownCommand(flags);
       break;
@@ -186,6 +189,18 @@ export async function safetyCommand(
       await safetyResetDrawdownCommand(flags);
       break;
     default:
-      throw subcommandError("safety", action, ["drawdown", "reset-drawdown"]);
+      throw subcommandError("safety", action, ["review", "drawdown", "reset-drawdown"]);
+  }
+}
+
+// v51: consolidated guardrail audit — "what protects me, and what's
+// wide open?" Pure read of the safety config + severity-ranked gaps.
+async function safetyReviewCommand(flags: Record<string, string>) {
+  const { reviewSafety, renderSafetyReview } = await import("../safetyReview.js");
+  const report = reviewSafety(loadConfig());
+  if (flags["json"] === "true") {
+    printJson({ ok: true, ...report });
+  } else {
+    console.log(renderSafetyReview(report));
   }
 }

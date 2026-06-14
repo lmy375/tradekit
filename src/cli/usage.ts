@@ -679,6 +679,16 @@ PAPER TRADING (virtual book, no on-chain submission)
     playbook deploy <file> --paper  ← cascades --paper across every order/schedule in the spec
 
 STATEFUL SAFETY
+  safety review [--json]
+        v51: consolidated guardrail audit — "what protects me, and what's wide
+        open?". Reviews all ~19 safety layers (USD caps, slippage cap, token
+        allow/deny + honeypot probe, infinite-approval block, gas budget, rate
+        limit, position/strategy exposure caps, drawdown breaker, human approval
+        gate) and reports each as active|off with its value, plus the gaps that
+        matter ranked critical|warn|info — each with the exact config command to
+        close it. Verdict hardened | moderate | exposed. CRITICAL = safety off,
+        or no USD ceiling at all. Pure + deterministic. Run it before promoting
+        a strategy to real money. MCP: safety_review.
   safety drawdown [--scope global] [--json]
         Show portfolio drawdown circuit-breaker state. Peak USD, last observed value, drawdown %,
         and tripped status per scope. Reveals whether the breaker would block trading right now.

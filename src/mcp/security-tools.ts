@@ -593,6 +593,30 @@ export const registerSecurityTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── safety_review (v51) ────────────────────────────────────
+  //
+  // Consolidated guardrail audit — "what protects me, and what's
+  // wide open?". Read-only + pure (config only); safe for an agent to
+  // self-inspect the very guardrails that bound its own trading.
+  server.tool(
+    "safety_review",
+    "v51: consolidated safety-posture audit — 'what protects this agent, and what's wide open?'. Reviews all ~19 guardrail layers (per-tx/daily USD caps, slippage cap, token allow/deny + honeypot probe, infinite-approval block, approval USD cap, gas budget, trade rate limit, position limits/caps, per-strategy budgets, drawdown circuit breaker, human approval gate) and returns: guardrails[] (every layer, active|off, with its configured value) + gaps[] (the absences that matter, each with severity critical|warn|info and the exact config command to close it) + a verdict (hardened | moderate | exposed). CRITICAL gaps = safety disabled, or no USD ceiling at all. WARN = loose slippage, infinite approvals permitted, or no token safety whatsoever. Pure + deterministic (reads config, no IO). Use before promoting a strategy to real money to confirm the agent is bounded.",
+    {},
+    async () => {
+      try {
+        return ok(
+          await runTool("safety_review", rt.opts, {}, undefined, async () => {
+            const { reviewSafety } = await import("../safetyReview.js");
+            const { loadConfig } = await import("../config.js");
+            return { ok: true, ...reviewSafety(loadConfig()) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── safety_reset_drawdown (iter26) ─────────────────────────
   //
   // Clear the tripped flag (manual reset). Optional `new_peak_usd`
