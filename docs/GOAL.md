@@ -33,6 +33,13 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 97 — readiness 闸到达 agent 侧：MCP promote 也问"策略证明过自己了吗？"（the readiness gate reaches the agent — MCP playbook_promote gains the same third gate）** ✅
+- **补上 v96 的 MCP 半边——agent 也会晋升真钱**：v96 给 CLI promote 接上了第三道就绪闸，但 `playbook_promote` **同样暴露在 MCP 上**（agent 可调）。MCP 工具跑了 v36 资金闸（requireFunded）+ v52 安全闸（requireSafe），却**完全跳过 v96 就绪检查**——agent 经 MCP 可以把一个只跑了 1 天、1 笔成交、零业绩的纸面策略零摩擦晋升上真钱。CLI 有质量闸、MCP 没有：v96 在 agent 侧是半残的
+- 为什么是 v96 的一部分而非新功能：产品最危险的动作是"让 agent 开始用真钱"，而 promote **正是 agent 自己能调的 MCP 工具**。只给运营商（CLI）装质量闸、却让 agent（更需要被 gate 的一方）经 MCP 绕过，等于护栏装在了没人闯的门上。要让 v96 真正成立，readiness 必须到达 agent 实际走的那条路径——这是让 v96 完整，不是第 N 个 feature（同 v92 让 v91 真正生效的逻辑）
+- 实现（三道闸对称，复用 v96 引擎）：MCP `playbook_promote` 加 `requireReady` 参数（同 requireFunded/requireSafe 形态：optional、默认 advisory、"strongly recommended for agent-driven promotes"）。`to===real && !skipPreflight` 时跑 `gatherPromoteCheck` 并把 `readiness` 报告**始终**挂进结果（agent 可 inspect），`requireReady===true` 时 verdict===not_ready 抛 `PROMOTE_NOT_READY`。gather 失败（RPC）降级 advisory，真正的 not_ready block 穿透。`skipPreflight` 现在统一关全部三道（funding/safety/readiness）
+- 测试覆盖：strategy-tools.test.ts +1（promote 暴露 requireReady 参数 + 描述含 PROMOTE_NOT_READY/readiness）；行为由 promoteCheck.test.ts 的纯 `promoteReadinessBlocker` 测试覆盖（同 requireSafe 的测试惯例——full handler 走 RPC 不在此驱动）；3504 测试全绿（+1）
+- 向后兼容：纯加法——`requireReady` optional 默认 advisory（同另两道闸）；`readiness` 结果字段纯加；复用 v96 的 `gatherPromoteCheck`/`promoteReadinessBlocker`（零阈值漂移）；不改既有 funding/safety 闸
+
 **Phase 96 — promote 第三道闸：晋升真钱前先问"策略本身证明过自己了吗？"（the readiness gate — wire promote-check INTO promote, so the most important question can't be forgotten）** ✅
 - **把信任管道里最该问的问题接进唯一会真金白银的动作**：`playbook promote <id>`（纸面→真钱的那一刻）跑了两道 preflight——v36 资金（钱包付得起吗？`--require-funded`）+ v52 安全（钱包有护栏吗？`--require-safe`）。但它**从不查 promoteCheck**（v49，"这个纸面策略证明过自己了吗？"）——这个策略质量闸是一个**完全独立的命令**，运营商得自己记得去跑。代码注释自己都写着"promote-check 是 promote 决策的策略质量那一半（promote 本身只跑资金 preflight 那一半）"。结果：一个只跑了 1 天、2 笔成交、40% 纸面回撤的策略，可以零摩擦地被晋升上真钱，因为 promote 根本不看它的就绪度
 - 为什么是最重要的：整个产品最危险的动作就是"让 agent 开始用真钱交易"。今天三个问题里有两个被 gate 了（付得起 / 有护栏），唯独最重要的第三个——"这策略到底行不行？"——被留给运营商的记忆。把就绪度从"独立命令、advisory"变成"和另两道闸同一条 preflight 轨道上的 gate"，让最关键的判断不再可能被遗忘。这是 v49 就绪检查的收尾：detect（检查就绪度）→ **enforce**（接进 promote 动作）

@@ -141,6 +141,18 @@ describe("registerStrategyTools — tool registration", () => {
     expect(promote.description).toMatch(/SAFEGUARD_TRIGGERED|safety/);
   });
 
+  // v96: the readiness gate reaches the agent-facing promote — the strategy-
+  // quality question (proven on paper?) joins funding + safety. Behavior is
+  // covered by the pure promoteReadinessBlocker tests in promoteCheck.test.ts;
+  // the full handler runs RPC-bound gathers, so it is not driven here.
+  it("playbook_promote exposes the requireReady gate param", () => {
+    const { server, registered } = makeMockServer();
+    registerStrategyTools(server as never, makeRuntime() as never);
+    const promote = registered.get("playbook_promote")!;
+    expect(Object.keys(promote.schema)).toContain("requireReady");
+    expect(promote.description).toMatch(/PROMOTE_NOT_READY|readiness/);
+  });
+
   it("every tool has a non-empty description", () => {
     const { server, registered } = makeMockServer();
     registerStrategyTools(server as never, makeRuntime() as never);
