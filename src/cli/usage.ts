@@ -727,6 +727,14 @@ STATEFUL SAFETY
         close it. Verdict hardened | moderate | exposed. CRITICAL = safety off,
         or no USD ceiling at all. Pure + deterministic. Run it before promoting
         a strategy to real money. MCP: safety_review.
+  safety harden [--per-trade-usd N] [--daily-usd N] [--max-strategy-loss-usd N] [--apply] [--json]
+        v93: the detect→ACTION half of 'safety review' — fill the guardrail GAPS
+        with sensible defaults in ONE step instead of running ~8 config commands.
+        Recommends: drawdown breaker (20%), concentration cap (50%), transfer/
+        approve allowlist, infinite-approval block; USD limits from the flags (or
+        flagged as still-needed). FILLS GAPS ONLY — never overrides what you've
+        already set. Dry-run by default; --apply writes. CLI-only (safety config
+        is operator-owned). Curate the address book first if enabling the allowlist.
   safety headroom [--account L] [--chain X] [--json]
         v53: runtime headroom — "how much room is left across every active
         limit, and what's the binding constraint right now?". One entry per

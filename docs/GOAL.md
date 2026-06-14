@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 93 — 一键加固（safety harden — make the safe path the easy path）** ✅
+- **让"安全"成为容易的默认，而非加新护栏**：整套护栏（断路器/集中度/转账白名单/无限授权块/USD 限额…）全是 opt-in——粗心的运营商会让 agent 全敞口跑。`safety review` 检测缺口+给逐条修复命令，但运营商得跑 ~8 条、还得自己定值。本期一步补齐：结构性护栏给安全默认值、scale-specific 的 USD 限额从 flag 取（或标为待补）
+- 为什么是最重要的：托管真钱给自主 agent，最大的真实风险或许是**运营商根本没开护栏**。我建了所有护栏（v70-v92），现在让它们一键打开。降低运营商失误=直接服务"安全自主交易"这一最重要的东西。这是整个安全弧的收尾（detect→action：review 检测，harden 行动）
+- 实现（纯计划 + 仅补缺口 + CLI-only apply）：纯函数 `buildHardeningPlan(config, {perTradeUsd, dailyUsd, maxStrategyLossUsd})` → { changes（带安全默认+理由）, stillNeeded（缺 scale-specific 值的护栏，不瞎猜）, alreadyHardened（已配的不动） }。结构默认：drawdown breaker 20%、concentration 50%、transferAllowlistOnly、allowInfiniteApprovals=false。**只补缺口**——绝不覆盖运营商已设的值
+- CLI `safety harden [--per-trade-usd --daily-usd --max-strategy-loss-usd --apply]`：默认 dry-run（显示计划+待补+已配），--apply 写入。**CLI-only**（写 safety.* 配置，运营商所有——与 v89 锁一致，agent 不能 harden）
+- 测试覆盖：`safetyHarden.test.ts` 6——fresh 配置得结构默认 / USD 限额无 flag→stillNeeded、有 flag→changes / **只补缺口**（已配的 drawdown/concentration/allowlist/perTx 不动、入 alreadyHardened）/ 无限授权开着→建议关 / 已加固配置→零 changes / **推荐配置 schema-valid**（每个默认值 setConfigPath 后 configSchema.parse 不抛——防坏默认）；CLI 烟雾（dry-run 显示 4 changes+2 stillNeeded+1 already / --apply 写入、verify transferAllowlistOnly=true）
+- 向后兼容：纯加法——新模块、新 CLI 子命令；dry-run 默认（--apply 才写）；只补缺口（零覆盖）；3489 测试全绿（+6）
+- v1 限制：opt-in 默认值是有主张的（20%/50% 等——但只在缺口处建议，运营商 dry-run 审阅）；USD 限额 scale-specific 需 flag（不从组合估值自动推导——保持确定性无 RPC）；CLI-only（无 MCP harden——agent 经 safety review gaps 已能建议）
+
 **Phase 92 — 堵住 approve 侧门（close the approve drain side-door — make the v91 fund-movement lock actually sound）** ✅
 - **修复 v91 的旁路，使其真正生效（而非新主题）**：v91 锁住 transfer 到任意地址。但有个**旁路**：`approve(恶意 spender, max)` → 该合约用 transferFrom 直接抽走代币，完全绕过转账白名单。运营商开了 transferAllowlistOnly 以为"资金移动锁住了"，但 approve 仍开着（contractWhitelist 默认空=放行任意 spender）。前门锁了、侧门敞着——v91 的保护是虚的
 - 为什么是 v91 的一部分而非新功能：半关的门比明知敞着更糟。要让 v91 真正成立，approve 必须用同一开关一起关。这是让 v91 实际生效，不是第 N 个安全功能

@@ -21,7 +21,7 @@ import {
   listDrawdownStates,
   type DrawdownStateRow,
 } from "../db.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, saveConfig, setConfigPath } from "../config.js";
 import { printJson, parseFloatFlag, prompt, subcommandError } from "./helpers.js";
 
 // ── shared helpers ───────────────────────────────────────────
@@ -188,6 +188,9 @@ export async function safetyCommand(
     case "sizing":
       await safetySizingCommand(flags);
       break;
+    case "harden":
+      await safetyHardenCommand(flags);
+      break;
     case "drawdown":
       await safetyDrawdownCommand(flags);
       break;
@@ -195,7 +198,7 @@ export async function safetyCommand(
       await safetyResetDrawdownCommand(flags);
       break;
     default:
-      throw subcommandError("safety", action, ["review", "headroom", "sizing", "drawdown", "reset-drawdown"]);
+      throw subcommandError("safety", action, ["review", "headroom", "sizing", "harden", "drawdown", "reset-drawdown"]);
   }
 }
 
@@ -223,6 +226,30 @@ async function safetyHeadroomCommand(flags: Record<string, string>) {
     printJson({ ok: true, ...report });
   } else {
     console.log(renderSafetyHeadroom(report));
+  }
+}
+
+// v93: one-command safety hardening — fill the guardrail gaps `safety review`
+// detects with sensible defaults. Dry-run by default; --apply writes (operator-
+// authorized; safety config is operator-owned, so this is CLI-only).
+async function safetyHardenCommand(flags: Record<string, string>) {
+  const { buildHardeningPlan, renderHardeningPlan } = await import("../safetyHarden.js");
+  const config = loadConfig();
+  const plan = buildHardeningPlan(config, {
+    perTradeUsd: parseFloatFlag(flags["per-trade-usd"], "--per-trade-usd", { min: 0.01 }),
+    dailyUsd: parseFloatFlag(flags["daily-usd"], "--daily-usd", { min: 0.01 }),
+    maxStrategyLossUsd: parseFloatFlag(flags["max-strategy-loss-usd"], "--max-strategy-loss-usd", { min: 0.01 }),
+  });
+  const apply = flags["apply"] === "true" || flags["apply"] === "";
+  if (apply && plan.changes.length > 0) {
+    let next = config;
+    for (const c of plan.changes) next = setConfigPath(next, c.path, c.recommended);
+    saveConfig(next);
+  }
+  if (flags["json"] === "true") {
+    printJson({ ok: true, applied: apply, ...plan });
+  } else {
+    console.log(renderHardeningPlan(plan, apply && plan.changes.length > 0));
   }
 }
 
