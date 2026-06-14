@@ -592,6 +592,12 @@ function renderHealthText(r: HealthReport) {
       const badge = b.status === "tripped" || b.status === "exhausted" ? "🔴" : b.status === "approaching" ? "🟡" : "✓";
       console.log(`  Binding limit: ${badge} ${b.label} (${b.scope})${b.utilizationPct != null ? ` — ${b.utilizationPct.toFixed(0)}% used` : ""}`);
     }
+    // v81: unified runtime risk verdict (concentration + headroom + MEV).
+    if (r.risk) {
+      const rv = { ok: "🟢 ok", elevated: "🟡 ELEVATED", critical: "🔴 CRITICAL" }[r.risk.verdict];
+      console.log(`  Risk:         ${rv}${r.risk.verdict !== "ok" ? ` (${r.risk.criticalCount} critical, ${r.risk.elevatedCount} elevated)` : ""}`);
+      if (r.risk.topConcern) console.log(`                ${r.risk.topConcern}`);
+    }
     console.log("");
   }
 

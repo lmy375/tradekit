@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 81 — 风险态势进主仪表盘（risk posture in the health dashboard — make the v78 verdict visible where the operator looks）** ✅
+- **让最重要的信号到达运营商，而非加新检测器**：v78 把运行时风险合成为单一裁决，但只在 `risk` 命令里——运营商跑自主 agent 时**永不会被告知** book 转危，得记得去 poll。本期把统一风险裁决折进 `health`（运营商日常看的主仪表盘），可见性即价值
+- 为什么是最重要的：安全检测做透了，但**检测到没人看见 = 没检测**。health 是 agent/运营商的"晨报"，是评估信任的地方。把"Risk: ELEVATED — WETH 占 80%"放进去，运营商一眼看到，不必记得跑 `risk`
+- **关键：零额外抓取**——`composeHealthReport` 是纯合成器，已收到 portfolio（带 v72 concentrationRisk）+ headroom（v53）；MEV 是纯配置（v77）。所以 health 用**已有数据**经纯函数 `combineRiskPosture` 算出风险裁决，不多拉一次链。protection（v76 需持仓）是 health 不抓的唯一维度→放进 `notChecked`，标准 `risk` 命令补全
+- 实现：health.ts 加 `HealthRiskSection`（verdict/criticalCount/elevatedCount/topConcern/concernCodes/notChecked）；composeHealthReport 从 concentration+headroom+MEV 合成（纯）；**不重复 action**——headroom 维度已由既有 limit_near_exhaustion 驱动，故只为 health 此前**缺失**的维度加 action：`concentration_high`（high，单 token 过度集中）+ `mev_exposed`（medium，建议）。CLI health 渲染 Risk 行（🟢/🟡/🔴 + topConcern）
+- Surfaces：CLI `health`（SAFETY 区加 Risk 行）+ MCP `health`（返回 `risk` 段 + 新 next-action codes）。无新 MCP 工具（折进既有 health）——纯合成不piling
+- 测试覆盖：`health.test.ts` +3——concentration warn→risk elevated + concentration_high action + protection 入 notChecked / ethereum 激活无 MEV 保护→mev_exposed concern+action / ok 集中度+base 链→risk ok 无 risk action；既有 78 case 不变
+- 向后兼容：纯加法——health 新可选 `risk` 段、新 next-action codes；纯合成零额外抓取（不碰执行/不加 RPC）；3420 测试全绿（+3）
+- v1 限制：health 的风险裁决省略 protection 维度（health 不抓持仓——`notChecked` 明示，`risk`/`risk_posture` 全量含之）；MEV 看 activeChain；与 SAFETY 区的 headroom 维度有意复用（一个是 binding 明细，一个是合成裁决）
+
 **Phase 80 — 入场即保护（protect-on-entry — buy auto-attaches a trailing stop so a position is never born unprotected）** ✅
 - **源头保护 > 事后修复**：v76 检测裸仓、v79 事后修复。本期更根本：**让 buy 在成交后自动挂保护性移动止损**——持仓诞生即受保护，自主 agent 永不积累无保护敞口。条件单早有 onFill 钩子（TP+SL bracket），但**即时 buy/sell 无任何 post-fill 钩子**——市价买入的 agent 无法在入场时自动保护
 - 为什么是最重要的：安全 = 不亏钱。预防裸仓存在 > 事后扫描修复。"买入并保护"一步完成，agent 不会忘。完成保护三部曲：入场即保护（本期）→ 审计（v76）→ 事后修复（v79）

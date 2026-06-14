@@ -1253,3 +1253,51 @@ describe("deriveNextActions — v55 safety rules", () => {
     expect(actions.some((x) => x.code === "limit_near_exhaustion")).toBe(false);
   });
 });
+
+describe("health risk section (v81)", () => {
+  const cfg = (over: Partial<Config["safety"]> = {}): Config =>
+    ({ ...configSchema.parse({}), activeChain: "base", safety: { ...configSchema.parse({}).safety, ...over } } as Config);
+
+  function compose(portfolioOver: Record<string, unknown>, config: Config) {
+    return composeHealthReport({
+      scope: { accounts: [{ label: "alice", address: "0x1111111111111111111111111111111111111111" as Address }], chains: ["base"] },
+      portfolio: makePortfolio(portfolioOver),
+      analyses: [], recentRows: [], since7d: "2026-05-22T00:00:00.000Z", config,
+    });
+  }
+
+  it("surfaces a risk verdict composed from concentration (base chain → no MEV concern)", () => {
+    const r = compose(
+      { concentrationRisk: { thresholdPct: 50, verdict: "warn", largestPct: 80, largestSymbol: "WETH", breaches: [{ symbol: "WETH", percentOfPortfolio: 80, overByPct: 30 }], summary: "CONCENTRATED: WETH 80%" } },
+      cfg({ perTxUsdLimit: 100 }),
+    );
+    expect(r.risk).toBeDefined();
+    expect(r.risk!.verdict).toBe("elevated");
+    expect(r.risk!.concernCodes).toContain("concentration_high");
+    expect(r.risk!.notChecked).toContain("protection");
+    // The dashboard gains the otherwise-missing concentration action.
+    expect(r.nextActions.some((a) => a.code === "concentration_high")).toBe(true);
+  });
+
+  it("ethereum active with no MEV protection → mev_exposed concern + advisory action", () => {
+    const r = compose({}, cfg({ perTxUsdLimit: 100 }) /* default activeChain overridden below */);
+    // Re-compose with ethereum active.
+    const eth = composeHealthReport({
+      scope: { accounts: [{ label: "a", address: "0x1111111111111111111111111111111111111111" as Address }], chains: ["ethereum"] },
+      portfolio: makePortfolio({}), analyses: [], recentRows: [], since7d: "2026-05-22T00:00:00.000Z",
+      config: { ...cfg({ perTxUsdLimit: 100 }), activeChain: "ethereum" } as Config,
+    });
+    expect(eth.risk!.concernCodes).toContain("mev_exposed");
+    expect(eth.nextActions.some((a) => a.code === "mev_exposed")).toBe(true);
+    expect(r).toBeDefined();
+  });
+
+  it("ok concentration + base chain → risk ok, no risk actions", () => {
+    const r = compose(
+      { concentrationRisk: { thresholdPct: 50, verdict: "ok", largestPct: 40, largestSymbol: "WETH", breaches: [], summary: "ok" } },
+      cfg({ perTxUsdLimit: 100 }),
+    );
+    expect(r.risk!.verdict).toBe("ok");
+    expect(r.nextActions.some((a) => a.code === "concentration_high" || a.code === "mev_exposed")).toBe(false);
+  });
+});

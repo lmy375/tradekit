@@ -34,6 +34,8 @@ import { failureReasonHistogram } from "./db.js";
 import { computeAggregatorStats } from "./aggregatorStats.js";
 import { reviewSafety } from "./safetyReview.js";
 import type { SafetyHeadroomReport } from "./safetyHeadroom.js";
+import { combineRiskPosture } from "./riskPosture.js";
+import { assessMevExposure } from "./mev.js";
 import { computePairStats } from "./pairStats.js";
 
 export interface HealthSectionError {
@@ -160,6 +162,22 @@ export interface HealthSafetySection {
   };
 }
 
+/** v81: the unified runtime risk verdict (v78) folded into the dashboard —
+ *  composed from data health already has (portfolio concentration + headroom +
+ *  pure MEV), so it costs no extra fetch. The standalone `risk` command adds
+ *  the protection dimension health doesn't fetch. */
+export interface HealthRiskSection {
+  verdict: "ok" | "elevated" | "critical";
+  criticalCount: number;
+  elevatedCount: number;
+  /** Worst concern message — the at-a-glance headline. */
+  topConcern: string | null;
+  /** Concern codes present (for the rule layer + dashboards). */
+  concernCodes: string[];
+  /** Dimensions NOT evaluated here (e.g. "protection" — run `risk` for it). */
+  notChecked: string[];
+}
+
 export interface NextAction {
   code:
     | "reconcile_pending"
@@ -197,7 +215,14 @@ export interface NextAction {
     // v55: an active runtime guardrail is near (or past) its limit — daily
     // USD nearly spent, a strategy budget/position cap approaching, or the
     // drawdown breaker tripped. Surfaced from the v53 safety_headroom.
-    | "limit_near_exhaustion";
+    | "limit_near_exhaustion"
+    // v81: a single token dominates the book past safety.maxConcentrationPct —
+    // the cross-strategy aggregate per-strategy caps miss (v72). Surfaced from
+    // the unified risk posture (v78).
+    | "concentration_high"
+    // v81: trading on a public-mempool chain with no MEV protection (v77) —
+    // ~0.5-3% sandwich leak per trade. Advisory.
+    | "mev_exposed";
   /** Imperative description an operator can act on. */
   message: string;
   /** Suggested CLI invocation. */
@@ -232,6 +257,9 @@ export interface HealthReport {
   security?: SecuritySection;
   /** v55: config posture (v51) + binding runtime limit (v53). */
   safety?: HealthSafetySection;
+  /** v81: unified runtime risk verdict (v78) — concentration + headroom + MEV
+   *  synthesized into one headline. Present when a portfolio + config exist. */
+  risk?: HealthRiskSection;
   errors: HealthSectionError[];
   /** Composed list of next-action suggestions derived from the section data
    *  (e.g. "you have 2 pending trades — run reconcile"). Empty array when
@@ -296,6 +324,9 @@ export function deriveNextActions(args: {
    *  has a critical gap) + limit_near_exhaustion (a runtime guardrail is
    *  near/past its limit). */
   safety?: HealthSafetySection;
+  /** v81: the unified risk verdict — drives concentration_high + mev_exposed
+   *  (the dimensions limit_near_exhaustion / safety_exposed don't cover). */
+  risk?: HealthRiskSection;
 }): NextAction[] {
   const actions: NextAction[] = [];
 
@@ -511,6 +542,28 @@ export function deriveNextActions(args: {
       command: "tradekit safety headroom",
       severity,
     });
+  }
+
+  // v81: risk dimensions the headroom binding above doesn't cover. The unified
+  // risk verdict's concentration + MEV concerns are otherwise invisible in the
+  // dashboard's action list (headroom drives limit_near_exhaustion already).
+  if (args.risk) {
+    if (args.risk.concernCodes.includes("concentration_high")) {
+      actions.push({
+        code: "concentration_high",
+        message: `Portfolio over-concentrated${args.risk.topConcern && args.risk.concernCodes[0] === "concentration_high" ? ` — ${args.risk.topConcern}` : ""}. One token dominates the book past your limit.`,
+        command: "tradekit risk",
+        severity: "high",
+      });
+    }
+    if (args.risk.concernCodes.includes("mev_exposed")) {
+      actions.push({
+        code: "mev_exposed",
+        message: `Trading on a public-mempool chain with no MEV protection — ~0.5-3% sandwich leak per trade. Configure mev.privateRpcs.`,
+        command: "tradekit safety review",
+        severity: "medium",
+      });
+    }
   }
 
   // Iter693: sort by severity so the CLI render (which iterates in order)
@@ -900,6 +953,27 @@ export function composeHealthReport(args: {
     safety = buildSafetySection(args.config, headroom);
   }
 
+  // v81: unified runtime risk verdict — composed from data we already have
+  // (portfolio concentration v72 + headroom v53 + pure MEV v77). No extra
+  // fetch. Protection (v76) needs positions we don't fetch here — left to the
+  // standalone `risk` command and noted in notChecked.
+  let risk: HealthRiskSection | undefined;
+  if (args.config) {
+    const concentration =
+      args.portfolio && !("error" in args.portfolio) ? args.portfolio.concentrationRisk : null;
+    const headroomForRisk = args.headroom && !("error" in args.headroom) ? args.headroom : null;
+    const mev = assessMevExposure(args.config.activeChain, args.config.mev);
+    const posture = combineRiskPosture({ concentration, headroom: headroomForRisk, mev, protection: null });
+    risk = {
+      verdict: posture.verdict,
+      criticalCount: posture.concerns.filter((c) => c.severity === "critical").length,
+      elevatedCount: posture.concerns.filter((c) => c.severity === "warn").length,
+      topConcern: posture.concerns[0]?.message ?? null,
+      concernCodes: posture.concerns.map((c) => c.code),
+      notChecked: ["protection"],
+    };
+  }
+
   const nextActions = deriveNextActions({
     portfolio,
     trades,
@@ -908,6 +982,7 @@ export function composeHealthReport(args: {
     legacyBackfillCounts: args.legacyBackfillCounts,
     ...(staleBookmarks && staleBookmarks.length > 0 ? { staleBookmarks } : {}),
     ...(safety ? { safety } : {}),
+    ...(risk ? { risk } : {}),
   });
 
   // Iter764: pre-compute severity counts so dashboard consumers don't have to.
@@ -947,6 +1022,7 @@ export function composeHealthReport(args: {
     trades,
     security,
     ...(safety ? { safety } : {}),
+    ...(risk ? { risk } : {}),
     errors,
     nextActions,
     nextActionsSummary,
