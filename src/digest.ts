@@ -47,6 +47,7 @@ import { loadConfig, type Config } from "./config.js";
 import { buildEquityCurve } from "./equity.js";
 import { reviewSafety } from "./safetyReview.js";
 import { gatherSafetyHeadroom } from "./safetyHeadroom.js";
+import { gatherStrategyComparison } from "./strategyCompare.js";
 
 // ── window parsing ───────────────────────────────────────────
 
@@ -238,6 +239,19 @@ export interface EquitySection {
   points: number;
 }
 
+/** v88: per-strategy realized-P&L roll-up for the window — the proactive
+ *  effectiveness signal (v83 comparison surfaced in the cron briefing).
+ *  `bleeding` is the capital-allocation flag: strategies losing money. */
+export interface StrategyDigestSection {
+  /** Strategies with priced (stablecoin-quoted) trades in the window. */
+  count: number;
+  totalRealizedUsd: number;
+  best: { strategy: string; realizedUsd: number } | null;
+  worst: { strategy: string; realizedUsd: number } | null;
+  /** Strategies with negative realized P&L — review/cut candidates. */
+  bleeding: string[];
+}
+
 /** v47.5: agent trade-approval queue activity. pendingNow is the
  *  actionable number — an open intent means an agent is BLOCKED
  *  waiting on a human. */
@@ -276,6 +290,9 @@ export interface DigestReport {
   intents: IntentsSection;
   /** v38: null when the snapshot feed has < 2 points in the window. */
   equity: EquitySection | null;
+  /** v88: per-strategy realized P&L for the window (null when no priced
+   *  strategy trades fall in it). Surfaces bleeders proactively. */
+  strategy?: StrategyDigestSection | null;
   /** When `--compare` was set, the same digest for the immediately-
    *  prior window with the same length. */
   comparison: {
@@ -368,6 +385,26 @@ function gatherEquity(args: { since: string; until?: string }): EquitySection | 
   }
 }
 
+// v88: per-strategy realized performance for the window — deterministic
+// (DB-only, stablecoin-$1 model), so it fits the digest's no-RPC nature. Null
+// when no priced strategy trades fall in the window.
+function gatherStrategyPerf(args: { since: string; until?: string }): StrategyDigestSection | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const r = gatherStrategyComparison({ sinceIso: args.since });
+    if (r.strategies.length === 0) return null;
+    return {
+      count: r.strategies.length,
+      totalRealizedUsd: r.totalRealizedUsd,
+      best: r.best ? { strategy: r.best.strategy, realizedUsd: r.best.realizedUsd } : null,
+      worst: r.worst ? { strategy: r.worst.strategy, realizedUsd: r.worst.realizedUsd } : null,
+      bleeding: r.bleeding,
+    };
+  } catch {
+    return null; // feed unavailable — the digest never fails on strategy perf
+  }
+}
+
 function gatherWindow(args: {
   nowMs: number;
   windowMs: number;
@@ -387,8 +424,9 @@ function gatherWindow(args: {
   const equity = gatherEquity({ since: windowStart });
   const intents = gatherIntents({ since: windowStart, now: new Date(args.nowMs) });
   const posture = gatherPosture(args.config);
+  const strategy = gatherStrategyPerf({ since: windowStart });
 
-  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture });
+  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture, strategy });
 
   let comparison: DigestReport["comparison"] = null;
   if (args.includeComparison) {
@@ -449,6 +487,7 @@ function gatherWindow(args: {
     paper,
     intents,
     equity,
+    strategy,
     comparison,
   };
 }
@@ -839,6 +878,9 @@ export function classifyVerdict(args: {
   /** v57: standing config posture + binding runtime limit. Optional so
    *  pre-existing callers/tests stay valid. */
   posture?: PostureSection | null;
+  /** v88: per-strategy realized performance — a bleeding strategy is an
+   *  effectiveness concern (losing money), distinct from operational health. */
+  strategy?: StrategyDigestSection | null;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
@@ -897,6 +939,17 @@ export function classifyVerdict(args: {
   }
   if (args.fires.rebalanceFailureCount > 0) {
     reasons.push(`${args.fires.rebalanceFailureCount} rebalance failure${args.fires.rebalanceFailureCount === 1 ? "" : "s"} during window`);
+    attention = true;
+  }
+  // v88: a strategy bleeding money in the window is an effectiveness concern —
+  // operationally everything may be "fine" (trades fill) while capital leaks.
+  if (args.strategy != null && args.strategy.bleeding.length > 0) {
+    const w = args.strategy.worst;
+    reasons.push(
+      `${args.strategy.bleeding.length} strateg${args.strategy.bleeding.length === 1 ? "y" : "ies"} bleeding` +
+        (w && w.realizedUsd < 0 ? ` (worst: ${w.strategy} −$${Math.abs(w.realizedUsd).toFixed(2)})` : "") +
+        " — tradekit strategies compare",
+    );
     attention = true;
   }
   // v28: a strategy alert firing inside the window is by definition

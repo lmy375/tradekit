@@ -86,6 +86,16 @@ function renderText(r: DigestReport): string {
   lines.push(renderAlertsText(r.alerts));
   lines.push(``);
   lines.push(renderEquityText(r.equity));
+  // v88: per-strategy realized performance for the window — proactive bleeders.
+  if (r.strategy) {
+    const s = r.strategy;
+    const total = `${s.totalRealizedUsd >= 0 ? "+" : "−"}$${Math.abs(s.totalRealizedUsd).toFixed(2)}`;
+    lines.push(``);
+    lines.push(`STRATEGIES (${s.count}): realized ${total}${s.best && s.best.realizedUsd > 0 ? ` · best ${s.best.strategy} +$${s.best.realizedUsd.toFixed(2)}` : ""}`);
+    if (s.bleeding.length > 0) {
+      lines.push(`  ⚠ bleeding: ${s.bleeding.join(", ")}${s.worst && s.worst.realizedUsd < 0 ? ` (worst ${s.worst.strategy} −$${Math.abs(s.worst.realizedUsd).toFixed(2)})` : ""} — review/cut`);
+    }
+  }
   lines.push(``);
   lines.push(renderPaperText(r.paper));
   lines.push(``);

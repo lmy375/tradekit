@@ -683,3 +683,65 @@ describe("gatherDigest — signal counts (v36.5)", () => {
     }
   });
 });
+
+// ── strategy section (v88) ───────────────────────────────────
+
+describe("gatherDigest — strategy section", () => {
+  const WETH = "0xeeee";
+  const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+  function tr(strategy: string, dir: "buy" | "sell", amount: string, quote: string, ts: string) {
+    insertTrade({
+      timestamp: ts, chain: "base", account: "default", direction: dir,
+      base_token: WETH, base_symbol: "WETH", base_amount: amount,
+      quote_token: USDC, quote_symbol: "USDC", quote_amount: quote, price: "0",
+      tx_hash: freshTxHash(), status: "success",
+      gas_used: null, gas_price_wei: null, gas_cost_native: null,
+      aggregator: null, fee_tier: null, notes: null, strategy,
+    });
+  }
+
+  it("rolls up per-strategy realized P&L + flags bleeders", () => {
+    const now = new Date("2026-05-30T12:00:00Z");
+    tr("winner", "buy", "1", "2000", "2026-05-30T09:00:00Z");
+    tr("winner", "sell", "1", "2600", "2026-05-30T10:00:00Z"); // +600
+    tr("loser", "buy", "1", "2000", "2026-05-30T09:00:00Z");
+    tr("loser", "sell", "1", "1700", "2026-05-30T10:00:00Z"); // -300
+    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.strategy).not.toBeNull();
+    expect(r.strategy!.count).toBe(2);
+    expect(r.strategy!.best!.strategy).toBe("winner");
+    expect(r.strategy!.best!.realizedUsd).toBeCloseTo(600, 6);
+    expect(r.strategy!.bleeding).toEqual(["loser"]);
+    // a bleeding strategy pushes the verdict to attention with a named reason.
+    expect(r.verdict === "attention" || r.verdict === "critical").toBe(true);
+    expect(r.verdictReasons.some((x) => /bleeding/.test(x))).toBe(true);
+  });
+
+  it("is null when no priced strategy trades fall in the window", () => {
+    const now = new Date("2026-05-30T12:00:00Z");
+    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now });
+    expect(r.strategy ?? null).toBeNull();
+  });
+});
+
+describe("classifyVerdict — strategy bleeding (v88)", () => {
+  const base = {
+    trades: { total: 0, success: 0, failed: 0, pending: 0, usdVolume: 0, successRatePct: null } as unknown as Parameters<typeof classifyVerdict>[0]["trades"],
+    fires: { ordersFilled: 0, ordersFailed: 0, scheduleFireFailures: 0, rebalanceFailureCount: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["fires"],
+    safety: { drawdownTrips: 0, drawdownCurrentlyTripped: [], budgetWarnings: [], budgetBlocks: 0, positionLimitBlocks: 0, honeypotBlocks: 0, gasBudgetBlocks: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["safety"],
+    errors: { errorRows: 0, errorRatePct: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["errors"],
+    alerts: { fired: 0 } as unknown as Parameters<typeof classifyVerdict>[0]["alerts"],
+    paper: {} as unknown as Parameters<typeof classifyVerdict>[0]["paper"],
+  };
+
+  it("a bleeding strategy → attention", () => {
+    const r = classifyVerdict({ ...base, strategy: { count: 2, totalRealizedUsd: -50, best: null, worst: { strategy: "dca", realizedUsd: -300 }, bleeding: ["dca"] } });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /bleeding.*dca/.test(x))).toBe(true);
+  });
+
+  it("no bleeders → healthy (strategy section doesn't false-trigger)", () => {
+    const r = classifyVerdict({ ...base, strategy: { count: 2, totalRealizedUsd: 900, best: { strategy: "a", realizedUsd: 900 }, worst: { strategy: "b", realizedUsd: 100 }, bleeding: [] } });
+    expect(r.verdict).toBe("healthy");
+  });
+});

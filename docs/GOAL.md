@@ -33,6 +33,15 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 88 — 策略业绩进 digest（strategy performance in the cron digest — surface bleeders PROACTIVELY）** ✅
+- **把有效性信号变主动，而非又一个 pull 面**：v83 比较、v84 熔断**检测/拦截**流血策略，但运营商得记得去查。digest 是 cron 主动简报通道——本期把策略业绩 roll-up 进 digest，运营商定时收到"策略 X 在流血"，不必 poll
+- 为什么有价值：自主 agent 跑数周，运营商要的是**被告知**坏消息而非主动找。digest 是那个通道。一个机械上"正常"（每笔成交）却在亏钱的策略，此前在 digest 里完全不可见——本期补上，且让它**贡献 digest verdict**（流血→attention）
+- **干净契合 digest**：策略比较是**确定性**的（DB-only、stablecoin-$1、无 RPC），完美契合 digest 的无-RPC 性质（不像风险需链上读）。复用 v83 `gatherStrategyComparison`
+- 实现：(1) `StrategyDigestSection`（count/totalRealizedUsd/best/worst/bleeding）+ `gatherStrategyPerf({since})`（窗口内确定性 roll-up，无策略则 null）；(2) 接入 gatherWindow + DigestReport（可选字段）；(3) **classifyVerdict** 加策略维度——bleeding>0 → attention + 具名理由（"N strategies bleeding (worst: X −$Y)"）；(4) CLI digest 渲染 STRATEGIES 段 + bleeding 警告行
+- 测试覆盖：`digest.test.ts` +4——gatherDigest 策略段（winner +600/loser −300→best=winner、bleeding=[loser]、verdict attention、理由含 bleeding）/ 无策略交易→段为 null / classifyVerdict 流血→attention 具名 / 无流血→healthy 不误触发；CLI 离线烟雾（momentum +$700 / dca-eth −$250 → digest 🟡attention + STRATEGIES 段 + bleeding 行）
+- 向后兼容：纯加法——digest 新可选 section、classifyVerdict 新可选参数（既有调用/测试不变）；3452 测试全绿（+4）
+- v1 限制：策略段 realized-only（与 v83 一致——非稳定币计价排除）；只在当前窗口（prior-window 比较里 strategy 省略，与 posture 同）；按 since 窗口（recentTrades 无 until——窗口内已实现，足够简报）
+
 **Phase 87 — 策略对比上 Web（strategy comparison on the dashboard — capital-allocation parity for the web operator）** ✅
 - **继续收 Web 落后差，补有效性支柱的关键视图（增强既有页而非加 tab）**：v86 把风险上了 Web；本期把 v83 策略业绩排名上 Web。既有 Strategy tab 只是**单策略深挖**（下拉选一个看详情）——用 Web 的运营商无法一眼看到"哪些策略赚钱/流血"做资本配置。本期在既有 Strategy 页**顶部加排名对比表**，不新增 tab（避免 tab 膨胀）
 - 为什么有价值：资本配置是多策略 agent 的核心有效性决策。Web 运营商此前只能逐个钻取，看不到横向排名。补上 = 仪表盘有了"加码谁、砍掉谁"的一眼视图
