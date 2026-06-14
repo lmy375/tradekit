@@ -92,6 +92,48 @@ describe("gatherRiskSize — clamp against the safety ceiling", () => {
   });
 });
 
+describe("gatherRiskSize — executable entry (v105.1)", () => {
+  it("emits a ready-to-run buy with the sized quoteAmount + the protective trailing stop", () => {
+    // risk $50 @ 5% trail → $1000; USDC quote (price 1) → quoteAmount 1000.
+    const r = sizeRisk({}, { riskUsd: 50, trailPct: 5, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.finalQuoteAmount).toBeCloseTo(1000, 6);
+    expect(r.recommendedActions).toHaveLength(1);
+    const a = r.recommendedActions[0];
+    expect(a.tool).toBe("buy");
+    expect(a.params).toMatchObject({ base: "WETH", quote: "USDC", protectTrailPct: 5 });
+    expect(Number(a.params!.quoteAmount)).toBeCloseTo(1000, 3);
+  });
+
+  it("a non-stablecoin quote price converts finalUsd → quoteAmount (WETH quote @ $2000)", () => {
+    const r = sizeRisk({}, { riskUsd: 50, trailPct: 5, token: "PEPE", quote: "WETH", quotePriceUsd: 2000 });
+    expect(r.finalQuoteAmount).toBeCloseTo(0.5, 6); // $1000 / $2000
+    expect(Number(r.recommendedActions[0].params!.quoteAmount)).toBeCloseTo(0.5, 6);
+  });
+
+  it("a stop-loss (not trailing) source does NOT pre-attach protectTrailPct", () => {
+    const r = sizeRisk({}, { riskUsd: 50, stopLossPct: 5, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.recommendedActions[0].params!.protectTrailPct).toBeUndefined();
+  });
+
+  it("no quote price → no executable action, with a caveat", () => {
+    const r = sizeRisk({}, { riskUsd: 50, trailPct: 5, token: "WETH" });
+    expect(r.finalQuoteAmount).toBeNull();
+    expect(r.recommendedActions).toHaveLength(0);
+    expect(r.caveats.some((c) => /no executable buy action/.test(c))).toBe(true);
+  });
+
+  it("a sell never emits a buy action", () => {
+    const r = gatherRiskSize({ direction: "sell", config: cfg({}), now: NOW, ...seams, riskUsd: 50, trailPct: 5, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.recommendedActions).toHaveLength(0);
+  });
+
+  it("the executable amount respects the clamp (ceiling-bound size, not the recommendation)", () => {
+    const r = sizeRisk({ perTxUsdLimit: 500 }, { riskUsd: 50, trailPct: 5, token: "WETH", quote: "USDC", quotePriceUsd: 1 });
+    expect(r.finalUsd).toBe(500);
+    expect(Number(r.recommendedActions[0].params!.quoteAmount)).toBeCloseTo(500, 3); // not 1000
+  });
+});
+
 describe("gatherRiskSize — honest errors", () => {
   it("no risk source → throws", () => {
     expect(() => sizeRisk({}, { stopLossPct: 5 })).toThrow(/riskUsd/);

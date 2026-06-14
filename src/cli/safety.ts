@@ -247,6 +247,12 @@ async function safetySizeByRiskCommand(flags: Record<string, string>) {
     if (!Number.isFinite(n) || n <= min) throw new ToolError("INVALID_PARAMS", `${label} must be a number > ${min} (got "${raw}").`);
     return n;
   };
+  const quoteSym = flags["quote"] ?? "USDC";
+  // Default the quote price to $1 for a stablecoin quote (the common case) so
+  // the executable buy command appears without a network call — stays offline.
+  // Non-stablecoin quotes need an explicit --quote-price-usd.
+  const { isStablecoin } = await import("../stablecoins.js");
+  const quotePriceUsd = num("quote-price-usd", "--quote-price-usd") ?? (isStablecoin(quoteSym) ? 1 : null);
   try {
     const report = gatherRiskSize({
       direction: directionRaw,
@@ -260,6 +266,8 @@ async function safetySizeByRiskCommand(flags: Record<string, string>) {
       strategy: flags["strategy"] ?? null,
       token: flags["token"] ?? null,
       priceUsd: num("price", "--price"),
+      quote: quoteSym,
+      quotePriceUsd,
     });
     if (flags["json"] === "true") printJson({ ok: true, ...report });
     else console.log(renderRiskSize(report));

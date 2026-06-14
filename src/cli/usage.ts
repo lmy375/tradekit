@@ -755,7 +755,7 @@ STATEFUL SAFETY
         pass --price to convert maxTradeUsd to a token amount (the MCP
         trade_sizing tool fetches the live price). Caveats flag anything not
         folded in. MCP: trade_sizing.
-  safety size-by-risk (--risk-usd N | --risk-pct N --portfolio-usd N) (--stop-pct N | --trail-pct N) [--token T] [--price USD] [--direction buy|sell] [--strategy TAG] [--account L] [--chain X] [--json]
+  safety size-by-risk (--risk-usd N | --risk-pct N --portfolio-usd N) (--stop-pct N | --trail-pct N) [--token T] [--quote Q] [--price USD] [--quote-price-usd USD] [--direction buy|sell] [--strategy TAG] [--account L] [--chain X] [--json]
         v105: risk-based position sizing — "how much SHOULD I trade so hitting
         my stop loses only my risk budget?". recommendedUsd = risk ÷ stop
         distance (risk $50 at a 5% stop → $1000). Risk budget: --risk-usd
@@ -763,7 +763,10 @@ STATEFUL SAFETY
         --stop-pct (stop-loss) or --trail-pct (the protect-on-entry trail you'll
         attach). The recommendation is CLAMPED by the 'safety sizing' ceiling —
         the safe path never exceeds policy; the report shows which bound the
-        size + the effective risk at the final size. Offline. MCP: risk_size.
+        size + the effective risk at the final size. v105.1: prints a ready-to-run
+        'trade buy' for the sized amount with the protective stop attached (the
+        risk-disciplined entry in one command) — quoteAmount uses --quote-price-usd
+        (defaults to $1 for a stablecoin --quote). Offline. MCP: risk_size.
   safety drawdown [--scope global] [--json]
         Show portfolio drawdown circuit-breaker state. Peak USD, last observed value, drawdown %,
         and tripped status per scope. Reveals whether the breaker would block trading right now.

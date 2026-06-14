@@ -26,6 +26,7 @@
 import { gatherTradeSizing, type SizingConstraint } from "./tradeSizing.js";
 import type { FillRowLite } from "./positionCaps.js";
 import type { Config } from "./config.js";
+import type { NextAction } from "./errors.js";
 
 /** Pure: the position USD whose loss at the stop equals the risk budget.
  *  Returns null on a non-positive risk budget or stop distance (nothing to
@@ -61,9 +62,17 @@ export interface RiskSizeReport {
   priceUsd: number | null;
   /** finalUsd ÷ price. Null when no price. */
   baseAmount: number | null;
+  /** v105.1: finalUsd ÷ quote-token USD price — the `quoteAmount` to pass to
+   *  buy. Null when the quote price wasn't supplied. */
+  finalQuoteAmount: number | null;
   /** Effective risk at finalUsd: finalUsd × stopDistancePct/100. ≤ riskUsd when
    *  the safety ceiling clamped the size (you're risking LESS than budgeted). */
   effectiveRiskUsd: number;
+  /** v105.1: the executable next step — a ready-to-run BUY for the sized amount
+   *  with the protective stop attached (protectTrailPct = the stop distance when
+   *  trailing). Turns advisory sizing into a one-call risk-disciplined entry.
+   *  Empty for sells, or when no quote price was available to size the spend. */
+  recommendedActions: NextAction[];
   caveats: string[];
   generatedAt: string;
 }
@@ -83,6 +92,11 @@ export function gatherRiskSize(args: {
   strategy?: string | null;
   token?: string | null;
   priceUsd?: number | null;
+  /** USD price of the QUOTE token — to convert finalUsd → the quoteAmount the
+   *  buy tool spends. ~1 for stablecoin quotes. Null → no executable action. */
+  quotePriceUsd?: number | null;
+  /** Quote token symbol/address, for the buy next-action's `quote` param. */
+  quote?: string | null;
   walletUsd?: number | null;
   now?: Date;
   // ── injection seams (tests) ──
@@ -153,6 +167,33 @@ export function gatherRiskSize(args: {
   const priceUsd = sizing.priceUsd;
   const baseAmount = priceUsd != null && priceUsd > 0 ? finalUsd / priceUsd : null;
   if (baseAmount == null) caveats.push("No base-token price — finalUsd is not converted to a token amount.");
+
+  // ── the executable entry: BUY the sized amount, protected by the stop ──
+  const finalQuoteAmount = args.quotePriceUsd != null && args.quotePriceUsd > 0 ? finalUsd / args.quotePriceUsd : null;
+  const recommendedActions: NextAction[] = [];
+  if (args.direction === "buy" && finalQuoteAmount != null && finalQuoteAmount > 0 && args.token) {
+    const params: Record<string, unknown> = {
+      base: args.token,
+      quoteAmount: finalQuoteAmount.toFixed(6),
+    };
+    if (args.quote) params.quote = args.quote;
+    if (args.strategy) params.strategy = args.strategy;
+    // The trail % IS the stop distance — attach the protective stop that the
+    // sizing assumed, so the realized risk matches the budget.
+    if (stopSource === "trailing_stop") params.protectTrailPct = stopDistancePct;
+    recommendedActions.push({
+      tool: "buy",
+      params,
+      reason:
+        `Risk-disciplined entry: spend ~$${finalUsd.toFixed(2)} (quoteAmount ${finalQuoteAmount.toFixed(6)})` +
+        (stopSource === "trailing_stop"
+          ? ` and attach the ${stopDistancePct}% trailing stop the sizing assumed`
+          : ` — attach your ${stopDistancePct}% stop so the realized risk matches the $${riskUsd.toFixed(2)} budget`) +
+        `. Preflight first if unsure.`,
+    });
+  } else if (args.direction === "buy" && args.quotePriceUsd == null) {
+    caveats.push("No quote-token price supplied — finalUsd not converted to a quoteAmount, so no executable buy action.");
+  }
   caveats.push("Risk sizing is advisory; preflight the chosen size before dispatching (preflight_trade).");
 
   return {
@@ -171,7 +212,9 @@ export function gatherRiskSize(args: {
     boundBy,
     priceUsd,
     baseAmount,
+    finalQuoteAmount,
     effectiveRiskUsd: finalUsd * (stopDistancePct / 100),
+    recommendedActions,
     caveats,
     generatedAt: sizing.generatedAt,
   };
@@ -195,6 +238,16 @@ export function renderRiskSize(r: RiskSizeReport): string {
       `  [bound by ${r.boundBy === "risk_budget" ? "risk budget" : r.ceilingBinding?.label ?? r.boundBy}]`,
   );
   lines.push(`    effective risk at stop: $${r.effectiveRiskUsd.toFixed(2)}`);
+  if (r.recommendedActions.length > 0) {
+    // Translate the agent-facing buy params to the CLI's flag names
+    // (--quoteAmount / --protect-trail), so the printed command runs as-is.
+    const p = r.recommendedActions[0].params ?? {};
+    lines.push("");
+    lines.push(
+      `  Entry: tradekit trade buy --base ${p.base ?? r.token}${p.quote ? ` --quote ${p.quote}` : ""}` +
+        ` --quoteAmount ${p.quoteAmount}${p.protectTrailPct != null ? ` --protect-trail ${p.protectTrailPct}` : ""}`,
+    );
+  }
   for (const c of r.caveats) lines.push(`    · ${c}`);
   return lines.join("\n");
 }

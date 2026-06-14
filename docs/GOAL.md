@@ -33,6 +33,14 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 105.1 — 让风险定仓可执行：一条命令完成"按风险定仓 + 入场即挂止损"（make risk sizing actionable — emit a ready-to-run protected entry, the disciplined path in one call）** ✅
+- **把 v105 从"建议数字"变成"可执行的纪律入场"**：v105 算出该买多少（advisory），但 agent 还得手动把数字穿进 buy、还得记得用同一个止损距离挂保护单——两步、易错（数字穿错、忘挂止损）。本期用 v98 的 detect→respond 模式，让 `risk_size` 直接产出一条**现成的 buy**（带算好的 quoteAmount + 把止损距离作为 protectTrailPct 挂上），把"按风险定仓→执行→保护"合成一次原子操作
+- 为什么重要：自主 agent 里，让正确的事成为容易的事（同 v93 一键加固的哲学）。两步之间的缝隙正是出错处——算了风险尺寸却 fat-finger 金额、或忘了挂止损裸奔。一条 recommendedActions 消除这整类错误：尺寸来自风险预算（被安全天花板夹住）、止损就是定仓假设的那个距离——realized 风险=预算
+- 实现（report/MCP/CLI 层，不碰关键交易路径）：gatherRiskSize 加 `quotePriceUsd`（finalUsd→quoteAmount 转换）+ `recommendedActions: NextAction[]`——direction=buy 且有 quote 价时产出 `{tool:'buy', params:{base, quote, quoteAmount, protectTrailPct(=trail 止损距离时), strategy}}`；sell / 无 quote 价 → 空 + caveat。MCP risk_size 解析并定价 quote 代币（默认 USDC≈$1）；CLI 渲染成 `trade buy --base … --quoteAmount … --protect-trail …`（翻译成 CLI flag 名）+ 用 isStablecoin（v85）对稳定币 quote 默认 \$1 价、保持离线
+- 关键正确性细节：amount 走 finalUsd（被夹住的尺寸，非原始推荐）——ceiling 夹到 \$500 时 buy 就是 \$500 不是 \$1000；MCP 工具 param 名（quoteAmount/protectTrailPct）vs CLI flag 名（--quoteAmount/--protect-trail）各自正确翻译；protectTrailPct 确认在 buy 工具 schema 内
+- 测试覆盖：+6——产出带 quoteAmount+protectTrailPct 的 buy / 非稳定币 quote 价换算 / stop-loss 源不预挂 trail / 无 quote 价→空+caveat / sell 不产出 / **夹住的尺寸进 amount（\$500 非 \$1000）**；3562 测试全绿（+6）；CLI 已烟测（输出可直接运行的 entry 命令）
+- 向后兼容：纯加法——新增 report 字段 + MCP/CLI flag；不改 buy/executeTrade 关键路径（next-action 只是建议，agent 自行执行）
+
 **Phase 105 — 按风险定仓：止损会亏多少决定买多少（risk-based position sizing — size by risk budget ÷ stop distance, clamped by the safety ceiling）** ✅
 - **补上"该买多少"这个交易核心原语（有效性支柱，非又一个安全护栏）**：v70 的 `trade_sizing` 回答"安全策略允许我最多买多少"（硬上限）。但缺了纪律交易每笔都要问的正交问题——"为了让止损命中时只亏掉我的风险预算，我应该买多少？"。`recommendedUsd = riskUsd ÷ (止损距离%)`（风险 \$50、止损 5% → \$1000：\$1000 跌 5% 正好亏 \$50）。这是把仓位大小和风险挂钩的纪律，是自主 agent **不爆仓**的基石——框架之前只给安全天花板，不给风险适配的尺寸
 - 为什么是最重要的：交易产品在安全之外，最重要的是帮 agent 有纪律地活下来。无纪律定仓（每笔风险无界）是爆仓的头号原因。这个原语和已有件无缝组合——agent 用 v80 入场即挂的追踪止损（trail %），风险定仓说"挂 5% 追踪止损、想冒 \$50 风险 → 买 \$1000"；再由 v70 天花板夹住（绝不超出策略允许）
