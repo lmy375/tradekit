@@ -62,7 +62,7 @@ const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-protect-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 const { openDb, closeDb, recordPaperTrade, listOrders } = await import("./db.js");
-const { protectPositions } = await import("./protect.js");
+const { protectPositions, createEntryStop } = await import("./protect.js");
 const { configSchema } = await import("./config.js");
 
 const USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
@@ -123,5 +123,36 @@ describe("protectPositions (paper, temp DB)", () => {
     const r = await protectPositions({ config, logger: silentLogger, mode: "paper" });
     expect(r.created).toHaveLength(0);
     expect(r.summary).toMatch(/No open positions/);
+  });
+});
+
+describe("createEntryStop (v79 source-level protection)", () => {
+  const buyResult = {
+    direction: "buy" as const, status: "success" as const,
+    baseToken: WETH, baseSymbol: "WETH", quoteToken: USDC, baseAmount: "1.5",
+  };
+
+  it("creates a trailing stop for a successful BUY's received amount", async () => {
+    const r = await createEntryStop({ result: buyResult, trailPct: 10, config, account: "default", chain: "base", paper: true });
+    expect(r.created).toBe(true);
+    expect(r.amount).toBeCloseTo(1.5, 6);
+    expect(r.trailPct).toBe(10);
+    const orders = listOrders({ status: "active" });
+    expect(orders).toHaveLength(1);
+    expect(orders[0].trigger_type).toBe("trailing");
+    expect(parseFloat(orders[0].base_amount!)).toBeCloseTo(1.5, 6);
+  });
+
+  it("skips a SELL (reduces exposure, nothing to protect)", async () => {
+    const r = await createEntryStop({ result: { ...buyResult, direction: "sell" }, trailPct: 10, config, account: "default", chain: "base", paper: true });
+    expect(r.created).toBe(false);
+    expect(r.skipped).toMatch(/sell/i);
+    expect(listOrders({ status: "active" })).toHaveLength(0);
+  });
+
+  it("skips a failed trade", async () => {
+    const r = await createEntryStop({ result: { ...buyResult, status: "failed" }, trailPct: 10, config, account: "default", chain: "base", paper: true });
+    expect(r.created).toBe(false);
+    expect(r.skipped).toMatch(/fill/i);
   });
 });

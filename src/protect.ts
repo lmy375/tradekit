@@ -176,6 +176,82 @@ export async function protectPositions(args: {
   };
 }
 
+export interface EntryStopResult {
+  created: boolean;
+  orderId?: number;
+  trailPct?: number;
+  amount?: number;
+  symbol?: string | null;
+  /** Why no stop was created (not a buy / not filled / no amount). */
+  skipped?: string;
+  /** Order creation threw (e.g. token blacklisted) — the TRADE still happened. */
+  error?: string;
+}
+
+/**
+ * v79: source-level protection — create a trailing stop for a just-filled BUY,
+ * so the position is guarded the moment it exists (vs. protectPositions, which
+ * fixes already-unprotected holdings after the fact). Called by buy/sell at the
+ * caller level AFTER executeTrade returns success — it never touches the
+ * execution path. Best-effort: a stop-creation failure leaves the (successful)
+ * trade intact and is reported, never thrown.
+ */
+export async function createEntryStop(args: {
+  result: {
+    direction: "buy" | "sell";
+    status?: "success" | "failed";
+    baseToken: string;
+    baseSymbol?: string;
+    quoteToken: string;
+    baseAmount: string;
+  };
+  trailPct: number;
+  config: Config;
+  account: string;
+  chain: string;
+  paper?: boolean;
+}): Promise<EntryStopResult> {
+  const symbol = args.result.baseSymbol ?? null;
+  if (args.result.direction !== "buy") {
+    return { created: false, symbol, skipped: "only buys are auto-protected (a sell reduces exposure)" };
+  }
+  if (args.result.status !== "success") {
+    return { created: false, symbol, skipped: "trade did not fill" };
+  }
+  const amount = parseFloat(args.result.baseAmount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { created: false, symbol, skipped: "no base amount received to protect" };
+  }
+  try {
+    const { resolveProfile } = await import("./config.js");
+    const { NATIVE_TOKEN } = await import("./tokens.js");
+    const { createOrderRow } = await import("./orders.js");
+    const isNative = args.result.baseToken.toLowerCase() === NATIVE_TOKEN.toLowerCase();
+    const base = isNative ? ("ETH" as const) : (args.result.baseToken as `0x${string}`);
+    const profile = resolveProfile(args.chain, args.config);
+    // Sell back to the quote the buy used (fallback to the chain's USDC).
+    const quote = (args.result.quoteToken ?? profile.usdc) as `0x${string}`;
+    const row = createOrderRow(
+      {
+        side: "sell",
+        trigger: "trailing",
+        trailPct: args.trailPct,
+        chain: args.chain,
+        account: args.account,
+        base,
+        quote,
+        baseAmount: String(amount),
+        paper: args.paper ?? false,
+        note: `auto-protect on entry (v79): ${args.trailPct}% trailing stop on the ${symbol ?? "position"} just bought`,
+      },
+      args.config,
+    );
+    return { created: true, orderId: row.id, trailPct: args.trailPct, amount, symbol };
+  } catch (e) {
+    return { created: false, symbol, error: (e as Error).message };
+  }
+}
+
 export function renderProtectResult(r: ProtectResult): string {
   const lines: string[] = [];
   lines.push(`Protect positions — ${r.summary}`);

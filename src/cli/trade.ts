@@ -9,7 +9,7 @@ import { resolveToken, resolveTradePair, assertAddressEIP55, unknownTokenError }
 import { executeTrade, type TradeRequest } from "../trade.js";
 import { formatUsd } from "../holdings.js";
 import { ToolError } from "../errors.js";
-import { makeCliLogger, printJson, requirePassword, assertTxHash, parseIntFlag, resolveStrategy } from "./helpers.js";
+import { makeCliLogger, printJson, requirePassword, assertTxHash, parseIntFlag, parseFloatFlag, resolveStrategy } from "./helpers.js";
 
 export async function quoteCommand(flags: Record<string, string>) {
   // Infer direction from amount flag if not explicit. Use ToolError so the CLI error
@@ -127,8 +127,19 @@ async function tradeOrQuote(direction: "buy" | "sell", flags: Record<string, str
       console.log(`⚠ replayed: this key already completed — showing the RECORDED outcome; nothing was executed now.`);
     }
 
+    // v79: --protect attaches a trailing stop to a fresh BUY fill, so the new
+    // position is never unprotected. Best-effort + caller-level (executeTrade
+    // untouched). Only on a real, non-replayed, successful buy.
+    let autoProtect: import("../protect.js").EntryStopResult | undefined;
+    const protectOn = flags["protect"] === "true" || flags["protect"] === "" || flags["protect-trail"] != null;
+    if (direction === "buy" && protectOn && !replayed && !isSimulateOnly && result.status === "success") {
+      const trailPct = parseFloatFlag(flags["protect-trail"], "--protect-trail", { min: 0.1, max: 99 }) ?? 15;
+      const { createEntryStop } = await import("../protect.js");
+      autoProtect = await createEntryStop({ result, trailPct, config, account: wallet.label, chain: chainName });
+    }
+
     if (flags["json"] === "true") {
-      printJson(replayed ? { ...result, replayed: true } : result);
+      printJson(replayed ? { ...result, replayed: true } : (autoProtect ? { ...result, autoProtect } : result));
     } else {
       console.log(`${result.direction.toUpperCase()} ${result.simulated ? "(SIMULATION)" : (result.status?.toUpperCase() ?? "SENT")}`);
       // Iter684/iter687: predictive failure pattern at the TOP of the output.
@@ -205,6 +216,16 @@ async function tradeOrQuote(direction: "buy" | "sell", flags: Record<string, str
       if (result.phaseTiming && flags["verbose"] === "true") {
         const t = result.phaseTiming;
         console.log(`  Timing (ms): quote=${t.quoteMs} simulate=${t.simulateMs} send=${t.sendMs} receipt=${t.receiptMs} total=${t.totalMs}`);
+      }
+      // v79: --protect outcome.
+      if (autoProtect) {
+        if (autoProtect.created) {
+          console.log(`  🛡 Auto-protect: ${autoProtect.trailPct}% trailing stop on ${autoProtect.amount?.toPrecision(4)} ${autoProtect.symbol ?? "base"} (order #${autoProtect.orderId})`);
+        } else if (autoProtect.error) {
+          console.log(`  ⚠ Auto-protect FAILED (trade is fine): ${autoProtect.error}`);
+        } else if (autoProtect.skipped) {
+          console.log(`  Auto-protect skipped: ${autoProtect.skipped}`);
+        }
       }
     }
   } finally {

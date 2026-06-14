@@ -144,6 +144,18 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
           .describe(
             "v45: replay protection — STRONGLY recommended for every real (non-simulate) trade an agent sends. 8–128 chars [A-Za-z0-9_-]; generate a UUID per logical trade and REUSE it on transport-timeout retries: the retry replays the recorded outcome (marked replayed:true) instead of double-trading. Same key + different request → IDEMPOTENCY_CONFLICT. Key still executing → REQUEST_IN_FLIGHT (do NOT assume the original died; the tx may be in the mempool — check recent_trades first). A recorded failure replays as that failure: fixing the problem and retrying is a NEW logical trade → new key.",
           ),
+        ...(direction === "buy"
+          ? {
+              protectTrailPct: z
+                .number()
+                .min(0.1)
+                .max(99)
+                .optional()
+                .describe(
+                  "v79: SOURCE-LEVEL protection — after this buy fills, auto-create a trailing-stop sell for the received amount at this % retracement, so the new position is never unprotected. The proactive twin of position_protection (detect) / protect_positions (fix after the fact). Response carries `autoProtect` { created, orderId, trailPct, amount }. Ignored on simulate. Reuses the validated order_create path (whitelist/amount/audit); a stop-creation failure leaves the successful trade intact (reported, never thrown).",
+                ),
+            }
+          : {}),
       },
       async (input) => {
         try {
@@ -239,6 +251,28 @@ export const registerTradeTools: RegisterFn = (server, rt) => {
                   return await executeTrade(req, ctx);
                 },
               });
+              // v79: source-level protection — attach a trailing stop to a
+              // fresh BUY fill. Only on a non-replayed real success (a replay's
+              // stop was created on the original run; a sim/approval-gate result
+              // has no fill). Best-effort: never disturbs the trade result.
+              const protectTrailPct = (input as { protectTrailPct?: number }).protectTrailPct;
+              if (
+                direction === "buy" &&
+                protectTrailPct != null &&
+                !replayed &&
+                !(input.simulate ?? false) &&
+                (result as { status?: string }).status === "success"
+              ) {
+                const { createEntryStop } = await import("../protect.js");
+                const autoProtect = await createEntryStop({
+                  result: result as unknown as Parameters<typeof createEntryStop>[0]["result"],
+                  trailPct: protectTrailPct,
+                  config,
+                  account: wallet.label,
+                  chain: wallet.chain,
+                });
+                return { ...result, autoProtect };
+              }
               return replayed ? { ...result, replayed: true } : result;
             }),
           );

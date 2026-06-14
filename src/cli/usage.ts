@@ -108,6 +108,10 @@ TRADING
   quote --direction buy|sell --base <t> --quote <t> --baseAmount|--quoteAmount <n|max>
         [--slippage <bps>] [--account <label>] [--chain X] [--json]
   trade buy | sell                    Send a swap via aggregator
+        v79: buy --protect [--protect-trail N (default 15)] auto-creates a trailing-stop
+        sell for the received amount after the buy fills — source-level protection so the
+        new position is never unguarded (the proactive twin of 'positions --protection' /
+        'protect'). Best-effort; a stop-creation failure leaves the successful trade intact.
   trade preview buy|sell --base X --quote Y --baseAmount A | --quoteAmount A [--slippage N] [--strict] [--json]
         Read-only pre-trade analysis: price impact, slippage cushion, gas %, balance fraction, safety pre-flight.
         --strict exits 1 when safety pre-flight fails (iter798 — pipeline gate before actual swap).

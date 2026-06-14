@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 80 — 入场即保护（protect-on-entry — buy auto-attaches a trailing stop so a position is never born unprotected）** ✅
+- **源头保护 > 事后修复**：v76 检测裸仓、v79 事后修复。本期更根本：**让 buy 在成交后自动挂保护性移动止损**——持仓诞生即受保护，自主 agent 永不积累无保护敞口。条件单早有 onFill 钩子（TP+SL bracket），但**即时 buy/sell 无任何 post-fill 钩子**——市价买入的 agent 无法在入场时自动保护
+- 为什么是最重要的：安全 = 不亏钱。预防裸仓存在 > 事后扫描修复。"买入并保护"一步完成，agent 不会忘。完成保护三部曲：入场即保护（本期）→ 审计（v76）→ 事后修复（v79）
+- 实现（caller 级，**不碰执行路径**）：纯/best-effort 辅助 `createEntryStop({ result, trailPct, config, account, chain })`——buy 成交后由**调用方**（MCP buy 工具 / CLI）在 executeTrade 返回 success 后调用，用 result.baseAmount（收到的 base 量）经**同一个** createOrderRow 建 trailing sell。只保护成功的 BUY（sell 降敞口→skip；失败→skip；无量→skip）。止损建单失败**不影响**已成功的交易（报告不抛）
+- 关键：**零执行路径改动**——v79 的教训延续，在 executeTrade 之外组合，不动关键路径。幂等友好：MCP 路径仅在 **非 replayed** 的新成功上挂（replay 的止损在原始运行已建）
+- Surfaces：MCP `buy { protectTrailPct }`（返回 `autoProtect` { created, orderId, trailPct, amount }）+ CLI `trade buy --protect [--protect-trail N]`（🛡 行）。sell 无此参数（降敞口无需保护）
+- 测试覆盖：`protect.test.ts` +3——createEntryStop 成功 BUY 建 trailing 覆盖收到量 / SELL 跳过（降敞口）/ 失败交易跳过；既有 8 case 不变
+- 向后兼容：纯加法——buy 新可选参数、新辅助；caller 级组合（executeTrade 不变）；3417 测试全绿（+3）
+- v1 限制：仅 buy（sell 降敞口）；trail 默认 15%；保护收到的 base 量（既有持仓的保护仍靠 v79 protect / 单独）；MCP 仅非 replayed 新成功挂止损（避免重复）；止损用该链 USDC 作 quote（与买入 quote 一致）
+
 **Phase 79 — 一键保护（protect action — turn the unprotected-position audit into a one-call FIX）** ✅
 - **检测→行动：连续 9 期只读检测/合成后的第一个行动能力**：v72-v78 把风险讲透了，但全是只读。自主 agent 用 v76 发现"WBTC $64k 无下行退出"后，还得手动拼一个 order_create（side/token/amount/trail）。本期闭合回路：`protect` 审计 book，对每个无保护（或部分保护）持仓**自动建移动止损**，size 精确等于裸露量，跳过已保护的。对自主 agent，检测无 easy-fix 只有一半价值
 - 为什么是最重要的：安全 = 不亏钱，但**检测到风险却不能修复**对自主 agent 几乎无用——它需要的是"看到裸仓 → 一句话保护它"。这是产品从"告诉你风险"转向"帮你修复"的能力转变，长检测期后正当其时
