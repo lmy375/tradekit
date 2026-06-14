@@ -39,7 +39,7 @@ import { listStrategyAlertStates } from "../db.js";
 import { getCurrentPrice } from "../price.js";
 import { loadConfig } from "../config.js";
 import { defaultPaperPriceFetcher } from "../paperPnl.js";
-import { createLogger } from "../logger.js";
+import { createSilentLogger } from "../logger.js";
 import { printJson, subcommandError } from "./helpers.js";
 import { strategiesListCommand } from "./inspect.js";
 import { strategyAlertsCommand } from "./strategyAlerts.js";
@@ -530,7 +530,7 @@ export async function strategyReportCommand(
     sections = [...VALID_SECTIONS];
   }
 
-  const quietLogger = createLogger({ stderrLevel: "silent" });
+  const quietLogger = createSilentLogger();
   const livePriceFn = noPrices
     ? undefined
     : async (tokenAddr: string): Promise<number | null> => {

@@ -80,30 +80,54 @@ export interface Logger {
 }
 
 export interface LoggerOptions {
-  /** Minimum level to mirror to stderr. The on-disk log always captures DEBUG and up. */
+  /** Minimum level to mirror to stderr. Default "warn". */
   stderrLevel?: LogLevel;
+  /**
+   * Minimum level to write to the on-disk `server.log`. Default "debug"
+   * (capture everything — the long-standing behavior). Set to "silent" for
+   * a TRANSIENT / throwaway logger (e.g. the one-shot logger handed to a
+   * price fetcher inside a gather function) that must NOT touch the shared
+   * log file at all: no stream is opened, so there's no leaked file handle
+   * whose async writes can outlive an ephemeral data dir (the root cause of
+   * the long-standing test-suite "ENOENT … server.log" noise) and no
+   * server.log growth from read-only/one-shot work.
+   */
+  fileLevel?: LogLevel;
 }
 
 /**
- * Create a logger that writes everything to `~/.tradekit/server.log` and mirrors
- * messages to stderr at or above `stderrLevel` (default: warn).
+ * Create a logger that writes to `~/.tradekit/server.log` (at `fileLevel`
+ * and up — default DEBUG, i.e. everything) and mirrors messages to stderr
+ * at or above `stderrLevel` (default: warn).
  *
- * CLI commands should leave this at the default; pass `stderrLevel: "debug"` when
- * the user opts into verbose mode (--verbose), or `"silent"` for --quiet.
- * MCP / web mode should use `"info"` since stdout is reserved for protocol output.
+ * CLI commands should leave this at the default; pass `stderrLevel: "debug"`
+ * when the user opts into verbose mode (--verbose), or `"silent"` for --quiet.
+ * MCP / web mode should use `"info"` since stdout is reserved for protocol
+ * output. For a throwaway logger that should leave NO trace on disk, prefer
+ * `createSilentLogger()`.
  */
 export function createLogger(opts: LoggerOptions = {}): Logger {
   const stderrLevel = opts.stderrLevel ?? "warn";
   const stderrMin = LEVEL_RANK[stderrLevel];
+  const fileLevel = opts.fileLevel ?? "debug";
+  const fileMin = LEVEL_RANK[fileLevel];
+  const fileEnabled = fileLevel !== "silent";
 
-  ensureDataDir(DATA_DIR);
-  rotateIfTooLarge(SERVER_LOG_PATH);
-  // Server log can contain RPC error bodies, tool failure messages, agent params. Not
-  // key material, but operationally sensitive — same 0600 treatment as the DB.
-  chmodSecureIfExists(SERVER_LOG_PATH);
-  const logStream: WriteStream = createWriteStream(SERVER_LOG_PATH, { flags: "a" });
+  // Only open (and prepare) the shared log file when file logging is on.
+  // A silent-file logger opens nothing — no handle to leak, no IO cost.
+  let logStream: WriteStream | null = null;
+  if (fileEnabled) {
+    ensureDataDir(DATA_DIR);
+    rotateIfTooLarge(SERVER_LOG_PATH);
+    // Server log can contain RPC error bodies, tool failure messages, agent params. Not
+    // key material, but operationally sensitive — same 0600 treatment as the DB.
+    chmodSecureIfExists(SERVER_LOG_PATH);
+    logStream = createWriteStream(SERVER_LOG_PATH, { flags: "a" });
+  }
 
   function write(level: LogLevel, msg: string) {
+    const rank = LEVEL_RANK[level];
+    if (logStream == null && rank < stderrMin) return; // nothing to do — skip formatting
     // Iter480: defense-in-depth newline collapse at the logger chokepoint. Iter473-479
     // explicitly sanitize at known sites with `(e as Error).message` content, but
     // other call sites pass through token-derived strings (symbol/name from on-chain
@@ -112,8 +136,10 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
     // truncate — explicit sites still apply their own caps via sanitizeForLogLine.
     const safe = msg.replace(/[\r\n]+/g, "\\n");
     const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${safe}\n`;
-    logStream.write(line);
-    if (LEVEL_RANK[level] >= stderrMin) {
+    if (logStream != null && rank >= fileMin) {
+      logStream.write(line);
+    }
+    if (rank >= stderrMin) {
       process.stderr.write(line);
     }
   }
@@ -137,9 +163,19 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
     },
 
     close() {
-      logStream.end();
+      logStream?.end();
     },
   };
+}
+
+/**
+ * A transient logger that writes NOTHING — no on-disk file, no stderr.
+ * Use for throwaway loggers handed to a helper (e.g. a one-shot price
+ * fetch) purely to satisfy a signature: they should leave no operational
+ * trace and must not open the shared log file (which would leak a handle).
+ */
+export function createSilentLogger(): Logger {
+  return createLogger({ stderrLevel: "silent", fileLevel: "silent" });
 }
 
 /** Backwards-compat for the old createLogger(boolean) signature. */

@@ -197,8 +197,8 @@ export async function gatherPromoteOutcome(args: {
     fetchPrice = args.markPriceFn;
   } else {
     const { defaultPaperPriceFetcher } = await import("./paperPnl.js");
-    const { createLogger } = await import("./logger.js");
-    fetchPrice = defaultPaperPriceFetcher(config, createLogger({ stderrLevel: "silent" }));
+    const { createSilentLogger } = await import("./logger.js");
+    fetchPrice = defaultPaperPriceFetcher(config, createSilentLogger());
   }
 
   // ── the two eras, same walker ──

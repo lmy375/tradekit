@@ -127,8 +127,8 @@ export async function gatherPromoteCheck(args: {
   let performance: PromoteCheckReport["performance"] = null;
   if (fills.length > 0) {
     const { computePaperPnlMtm, defaultPaperPriceFetcher } = await import("./paperPnl.js");
-    const { createLogger } = await import("./logger.js");
-    const mtm = await computePaperPnlMtm(fills, defaultPaperPriceFetcher(config, createLogger({ stderrLevel: "silent" })), {
+    const { createSilentLogger } = await import("./logger.js");
+    const mtm = await computePaperPnlMtm(fills, defaultPaperPriceFetcher(config, createSilentLogger()), {
       nowIso: now.toISOString(),
     });
     const bucket = mtm.summaries.find((s) => s.strategy === tag) ?? mtm.summaries[0];

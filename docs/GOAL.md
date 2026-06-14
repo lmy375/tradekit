@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 59 — Logger 无文件模式 + 测试套件归零（quality, not breadth）** ✅
+- **刻意不加 feature**：连续 8 个 feature 迭代后，最有价值的不是第 9 个 feature，而是消除整个代码库里我每次跑全套都看到的、唯一客观可测的缺陷——全套测试每次都报的 **9 个未捕获异常**（`promoteCheck.test.ts` 的 `server.log` ENOENT race）。生产级框架的测试套件每次跑都漏 9 个 uncaught exception，是会侵蚀信任、掩盖新错误、可能让严格 CI 失败的真实瑕疵
+- 根因是真正的 **logger 正确性缺口**（不是测试小问题）：`createLogger` **无条件**打开 `createWriteStream(SERVER_LOG_PATH)`，没有任何方式拿到一个不碰文件的 logger。后果：每个为满足 price-fetcher 签名而在 gather 函数里创建的**临时 silent logger** 都开一个真实文件句柄——在测试里与临时 data dir 清理 race（那 9 个错误），生产里是"对已删文件的异步写"这一类潜在健壮性 bug，且只读/一次性工作也在污染 server.log
+- 真正的能力补全（非 hack）：logger 新增 `fileLevel?: LogLevel`（与 `stderrLevel` 对称，默认 `"debug"` = 一直以来的"全捕获"行为，**逐字节向后兼容**）。`fileLevel: "silent"` → **根本不开 stream**，无句柄可漏、无 IO 成本；`write()` 按 fileMin 逐级 gate 文件写入。新增 `createSilentLogger()` 便捷构造器 = 完全不落盘不落 stderr 的瞬时 logger
+- 应用到 5 个临时 logger 站点（promoteCheck / promoteOutcome / strategy-tools ×2 / cli strategy）——它们创建 silent logger 纯粹为传给 price fetcher，本就不该开共享日志文件 → 全改 `createSilentLogger()`
+- 结果：**全套从 9 errors → 0 errors**（123 files / 3256 tests 全绿且零未捕获异常——9 次迭代以来第一次完全干净）
+- 测试覆盖：`logger.test.ts` +5（默认 createLogger 开并写文件 / createSilentLogger 完全不落盘不开文件 / `fileLevel:"silent"` 等价 / `fileLevel:"warn"` 逐级 gate 落盘 / silent logger 仍能 recordTrade/recordAudit——文件日志与 DB 记录正交）
+- 向后兼容：纯加法——`fileLevel` 默认 `"debug"` 保留全部既有行为；既有 createLogger 调用者零改动
+- v1 限制：只把 5 个**临时**站点改成 silent；CLI/MCP/engine 的主 logger **仍**写 server.log（运营商要完整操作 trail，故意不改默认）；只读 CLI 是否该落盘留作未来策略决定（本迭代不改行为，只补能力 + 修瑕疵）
+
 **Phase 58 — 聚合器路由调优（aggregator tuning — close the execution-quality learning loop）** ✅
 - **转向产品的字面核心**：交易执行质量（路由 → 成交质量 → 每笔交易省下的真实滑点钱），不是又一个观察面板。这是连续 8 个迭代后第一次碰执行本身
 - 开着的学习闭环：`aggregatorStats`（iter623）**描述**每个聚合器的成交质量，`deriveRecommendation` **点名**单个最佳，`health` 的 `aggregator_underperformer` **提醒**运营商重排 `config.aggregator.preferred`——但把这份"已实现成交"数据变成**实际路由配置**（完整排序 + 一键应用）的那块一直缺失。运营商得手动改

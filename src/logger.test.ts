@@ -1,11 +1,22 @@
 // Tests for the rotate-on-open behavior in createLogger. A long-running MCP/web
 // server's append-only log file is unbounded; without rotation, disk fills.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { mkdtempSync, writeFileSync, existsSync, rmSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rotateIfTooLarge, sanitizeForLogLine } from "./logger.js";
+
+// Set the data dir BEFORE importing the logger so SERVER_LOG_PATH (resolved
+// at module load from TRADEKIT_DATA_DIR) points at a temp dir, not the real
+// ~/.tradekit — lets the createLogger file-behavior tests assert on it safely.
+const loggerDataDir = mkdtempSync(join(tmpdir(), "tradekit-logger-datadir-"));
+process.env.TRADEKIT_DATA_DIR = loggerDataDir;
+const { rotateIfTooLarge, sanitizeForLogLine, createLogger, createSilentLogger } = await import("./logger.js");
+const serverLogPath = join(loggerDataDir, "server.log");
+
+afterAll(() => {
+  rmSync(loggerDataDir, { recursive: true, force: true });
+});
 
 let tmpDir: string;
 let logPath: string;
@@ -141,5 +152,68 @@ describe("createLogger central newline-collapse (iter480)", () => {
     expect(lines[2]).toContain("triple\\nblank");
     // Sanity: no raw CR slipped through (the collapse must be greedy).
     expect(lines[0]).not.toContain("\r");
+  });
+});
+
+// ── createLogger fileLevel / createSilentLogger (v59) ──────────
+
+describe("createLogger fileLevel + createSilentLogger", () => {
+  beforeEach(() => {
+    if (existsSync(serverLogPath)) rmSync(serverLogPath);
+  });
+
+  it("default createLogger opens + writes the server log", async () => {
+    const logger = createLogger({ stderrLevel: "silent" });
+    logger.info("hello-from-default");
+    logger.close();
+    await new Promise((r) => setTimeout(r, 50)); // let the async stream flush
+    expect(existsSync(serverLogPath)).toBe(true);
+    expect(readFileSync(serverLogPath, "utf8")).toContain("hello-from-default");
+  });
+
+  it("createSilentLogger writes NOTHING to disk and never opens the file", () => {
+    const logger = createSilentLogger();
+    // Every level is a no-op to disk; none of these throw.
+    logger.debug("d");
+    logger.info("i");
+    logger.warn("w");
+    logger.error("e");
+    logger.close();
+    // The whole point: no file handle was ever opened, so the shared log
+    // is untouched (and there's no stream to leak / race with cleanup).
+    expect(existsSync(serverLogPath)).toBe(false);
+  });
+
+  it("fileLevel: 'silent' is equivalent to createSilentLogger for disk output", () => {
+    const logger = createLogger({ stderrLevel: "silent", fileLevel: "silent" });
+    logger.error("should-not-persist");
+    logger.close();
+    expect(existsSync(serverLogPath)).toBe(false);
+  });
+
+  it("fileLevel gates which levels reach the disk (e.g. 'warn' drops debug/info)", async () => {
+    const logger = createLogger({ stderrLevel: "silent", fileLevel: "warn" });
+    logger.debug("dbg-skip");
+    logger.info("info-skip");
+    logger.warn("warn-keep");
+    logger.error("error-keep");
+    logger.close();
+    await new Promise((r) => setTimeout(r, 50)); // let the async stream flush
+    const body = readFileSync(serverLogPath, "utf8");
+    expect(body).not.toContain("dbg-skip");
+    expect(body).not.toContain("info-skip");
+    expect(body).toContain("warn-keep");
+    expect(body).toContain("error-keep");
+  });
+
+  it("a silent logger still records trades/audit (DB-backed, not file-backed)", () => {
+    // recordTrade/recordAudit go to SQLite, independent of the log stream —
+    // a no-file logger must not break them. We only assert the methods exist
+    // and are callable shape-wise (no DB open here); the contract is that
+    // file logging and DB recording are orthogonal.
+    const logger = createSilentLogger();
+    expect(typeof logger.recordTrade).toBe("function");
+    expect(typeof logger.recordAudit).toBe("function");
+    logger.close();
   });
 });

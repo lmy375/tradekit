@@ -449,8 +449,8 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
         const gas = recentGasStats(args.profile.name, null);
         if (gas && args.profile.weth) {
           const { getCurrentPrice } = await import("../price.js");
-          const { createLogger } = await import("../logger.js");
-          const nativeUsd = await getCurrentPrice(args.profile.weth, createLogger({ stderrLevel: "silent" })).catch(() => null);
+          const { createSilentLogger } = await import("../logger.js");
+          const nativeUsd = await getCurrentPrice(args.profile.weth, createSilentLogger()).catch(() => null);
           if (nativeUsd != null && nativeUsd > 0) {
             gasUsdPerFire = Math.round(gas.avgGasNative * nativeUsd * 10_000) / 10_000;
             provenance.push(`gas $${gasUsdPerFire}/fire = avg ${gas.avgGasNative.toPrecision(3)} native over last ${gas.samples} real fill(s) × native price $${nativeUsd.toFixed(2)}`);
@@ -1037,8 +1037,8 @@ export const registerStrategyTools: RegisterFn = (server, rt) => {
             async () => {
               const { buildStrategyReport } = await import("../strategyReport.js");
               const { getCurrentPrice } = await import("../price.js");
-              const { createLogger } = await import("../logger.js");
-              const quietLogger = createLogger({ stderrLevel: "silent" });
+              const { createSilentLogger } = await import("../logger.js");
+              const quietLogger = createSilentLogger();
               const livePriceFn = includePrices
                 ? async (token: string): Promise<number | null> => {
                     try {
