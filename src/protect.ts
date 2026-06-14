@@ -1,0 +1,194 @@
+/**
+ * Protect action (v79) — turn the v76 unprotected-position AUDIT into a
+ * one-call FIX: create trailing-stop sell orders that cover the exposed amount.
+ *
+ * Iterations v72–v78 made the product tell you about risk comprehensively — but
+ * it was all read-only. An autonomous agent that detects $64k of WBTC with no
+ * downside exit (v76) then had to hand-compose an order_create with the right
+ * side / token / amount / trail. This closes the loop: `protect` audits the
+ * book, and for each unprotected (or partially-protected) position creates a
+ * trailing stop sized to exactly the UNCOVERED amount, skipping what's already
+ * protected. The first action-oriented capability after a long detection streak
+ * — detection without an easy fix is half the value for an autonomous agent.
+ *
+ * Orders are created through the SAME validated createOrderRow path order_create
+ * uses (whitelist / amount / slippage checks + audit), so this adds no new
+ * trust surface. Idempotent across runs: a position protected by a prior run is
+ * skipped. Supports simulate (plan only).
+ */
+
+import type { Config } from "./config.js";
+import type { Logger } from "./logger.js";
+import type { OrderRow } from "./db.js";
+import type { PositionProtectionReport } from "./positionProtection.js";
+
+/** Default trailing-stop retracement when the caller doesn't specify one. A
+ *  protective stop wants room to ride normal volatility without whipsawing —
+ *  15% is a sane crash-protection default, not a tight trade stop. */
+export const DEFAULT_PROTECT_TRAIL_PCT = 15;
+
+export interface ProtectionTarget {
+  chain: string;
+  token: string;
+  symbol: string | null;
+  /** Base units to cover — exactly the position's UNPROTECTED remainder. */
+  amount: number;
+  /** Prior status (unprotected | partial) — partial means a stop already
+   *  covers part of it and we're topping up the remainder. */
+  priorStatus: string;
+}
+
+/**
+ * Pure: from a protection audit, pick the positions that need a protective
+ * order + the amount to cover. Skips fully-protected positions; covers only the
+ * unprotected remainder of partials (no double-counting existing stops).
+ */
+export function selectPositionsToProtect(
+  report: PositionProtectionReport,
+  opts: { token?: string } = {},
+): ProtectionTarget[] {
+  const want = opts.token?.toLowerCase();
+  return report.positions
+    .filter((p) => p.status !== "protected")
+    .filter((p) => p.unprotectedAmount > 0)
+    .filter(
+      (p) =>
+        want == null ||
+        p.token.toLowerCase() === want ||
+        (p.symbol != null && p.symbol.toLowerCase() === want),
+    )
+    .map((p) => ({
+      chain: p.chain,
+      token: p.token,
+      symbol: p.symbol,
+      amount: p.unprotectedAmount,
+      priorStatus: p.status,
+    }));
+}
+
+export interface ProtectResult {
+  trailPct: number;
+  simulate: boolean;
+  /** Orders created (or, when simulate, the specs that WOULD be created). */
+  created: Array<{
+    chain: string;
+    symbol: string | null;
+    amount: number;
+    trailPct: number;
+    orderId?: number;
+  }>;
+  /** Positions left as-is because a stop already fully covers them. */
+  alreadyProtected: Array<{ chain: string; symbol: string | null }>;
+  /** Targets that errored at creation (e.g. token blacklisted) — never aborts the batch. */
+  failed: Array<{ chain: string; symbol: string | null; error: string }>;
+  summary: string;
+  generatedAt: string;
+}
+
+/**
+ * Audit the book + create a trailing stop for every unprotected position.
+ * `simulate` returns the plan without creating. Per-target failures are
+ * captured (the batch never half-aborts).
+ */
+export async function protectPositions(args: {
+  config: Config;
+  logger: Logger;
+  account?: string;
+  chain?: string;
+  token?: string;
+  mode?: "real" | "paper";
+  trailPct?: number;
+  simulate?: boolean;
+  now?: Date;
+}): Promise<ProtectResult> {
+  const trailPct = args.trailPct ?? DEFAULT_PROTECT_TRAIL_PCT;
+  const simulate = args.simulate ?? false;
+  const mode = args.mode ?? "real";
+  const account = args.account ?? args.config.activeAccount ?? "default";
+
+  const { gatherPositionProtection } = await import("./positionProtection.js");
+  const report = await gatherPositionProtection({ mode, account, chain: args.chain, config: args.config, now: args.now });
+  const targets = selectPositionsToProtect(report, { token: args.token });
+
+  const { resolveProfile } = await import("./config.js");
+  const { NATIVE_TOKEN } = await import("./tokens.js");
+  const { createOrderRow } = await import("./orders.js");
+
+  const created: ProtectResult["created"] = [];
+  const failed: ProtectResult["failed"] = [];
+
+  for (const t of targets) {
+    try {
+      const profile = resolveProfile(t.chain, args.config);
+      const isNative = t.token.toLowerCase() === NATIVE_TOKEN.toLowerCase();
+      const base = isNative ? ("ETH" as const) : (t.token as `0x${string}`);
+      const quote = profile.usdc as `0x${string}`;
+      if (simulate) {
+        created.push({ chain: t.chain, symbol: t.symbol, amount: t.amount, trailPct });
+        continue;
+      }
+      const row = createOrderRow(
+        {
+          side: "sell",
+          trigger: "trailing",
+          trailPct,
+          chain: t.chain,
+          account,
+          base,
+          quote,
+          baseAmount: String(t.amount),
+          // Crash protection is long-lived — no expiry. Paper book gets a
+          // paper order so a dry-run book is protected symmetrically.
+          paper: mode === "paper",
+          note: `auto-protect (v79): ${trailPct}% trailing stop on the unprotected ${t.symbol ?? "position"}`,
+        },
+        args.config,
+      );
+      created.push({ chain: t.chain, symbol: t.symbol, amount: t.amount, trailPct, orderId: row.id });
+    } catch (e) {
+      failed.push({ chain: t.chain, symbol: t.symbol, error: (e as Error).message });
+    }
+  }
+
+  const alreadyProtected = report.positions
+    .filter((p) => p.status === "protected")
+    .map((p) => ({ chain: p.chain, symbol: p.symbol }));
+
+  const verb = simulate ? "Would create" : "Created";
+  const summary =
+    targets.length === 0
+      ? report.positions.length === 0
+        ? "No open positions to protect."
+        : `All ${report.positions.length} position(s) already protected — nothing to do.`
+      : `${verb} ${created.length} trailing-stop(s) at ${trailPct}%` +
+        (failed.length > 0 ? ` · ${failed.length} failed` : "") +
+        (alreadyProtected.length > 0 ? ` · ${alreadyProtected.length} already protected` : "") +
+        ".";
+
+  return {
+    trailPct,
+    simulate,
+    created,
+    alreadyProtected,
+    failed,
+    summary,
+    generatedAt: (args.now ?? new Date()).toISOString(),
+  };
+}
+
+export function renderProtectResult(r: ProtectResult): string {
+  const lines: string[] = [];
+  lines.push(`Protect positions — ${r.summary}`);
+  if (r.created.length > 0) {
+    lines.push("");
+    lines.push(`  ${r.simulate ? "Planned" : "Created"} trailing stops:`);
+    for (const c of r.created) {
+      lines.push(`   ${r.simulate ? "•" : "✓"} ${(c.symbol ?? "?")}  ${c.amount.toPrecision(4)} @ ${c.trailPct}% trailing${c.orderId != null ? `  (order #${c.orderId})` : ""}`);
+    }
+  }
+  if (r.failed.length > 0) {
+    lines.push("");
+    for (const f of r.failed) lines.push(`   ✗ ${f.symbol ?? "?"} (${f.chain}): ${f.error}`);
+  }
+  return lines.join("\n");
+}

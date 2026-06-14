@@ -439,6 +439,8 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "position_protection",
     // v78: unified runtime risk posture — one verdict synthesizing the risk signals.
     "risk_posture",
+    // v79: action half of position_protection — create stops covering unprotected positions.
+    "protect_positions",
     // v70: solve for the max admissible trade size (inverse of safety_headroom).
     "trade_sizing",
     // v74: preflight decision journal (verdicts incl. refused trades).

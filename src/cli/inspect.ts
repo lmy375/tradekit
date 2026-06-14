@@ -2888,6 +2888,40 @@ export async function riskPostureCommand(flags: Record<string, string>) {
   }
 }
 
+// v79: turn the v76 unprotected audit into action — create trailing-stop
+// orders covering unprotected positions. Requires --all or --token (no
+// accidental protect-everything); --simulate plans without creating.
+export async function protectCommand(flags: Record<string, string>) {
+  const logger = makeCliLogger(flags);
+  try {
+    const config = loadConfig();
+    const token = flags["token"];
+    const all = flags["all"] === "true" || flags["all"] === "";
+    if (!token && !all) {
+      throw new ToolError("INVALID_PARAMS", "protect requires --all (protect every unprotected position) or --token <symbol|addr> (one). Add --simulate to preview.");
+    }
+    const trailPct = parseFloatFlag(flags["trail"], "--trail", { min: 0.1, max: 99 }) ?? undefined;
+    const { protectPositions, renderProtectResult } = await import("../protect.js");
+    const result = await protectPositions({
+      config,
+      logger,
+      account: flags["account"],
+      chain: flags["chain"],
+      token: token,
+      mode: flags["paper"] === "true" ? "paper" : "real",
+      trailPct,
+      simulate: flags["simulate"] === "true" || flags["simulate"] === "",
+    });
+    if (flags["json"] === "true") {
+      printJson({ ok: true, ...result });
+    } else {
+      console.log(renderProtectResult(result));
+    }
+  } finally {
+    logger.close();
+  }
+}
+
 // v64: recent price range / trend / position — entry-timing context the
 // spot lookup can't give. Reuses the backtester's CoinGecko series fetch.
 async function priceContextCommand(flags: Record<string, string>, positional: string[]) {

@@ -991,6 +991,13 @@ INSPECT (read-only — all support --watch [N] except viewTx/audit)
         separately. Adds no new analysis (pure synthesis). --strict exits 1 on
         critical (cron page gate); --strict-elevated exits 1 on elevated too.
         MCP: risk_posture.
+  protect (--all | --token X) [--trail N (default 15)] [--simulate] [--paper] [--account L] [--chain X] [--json]
+        v79: turn the protection audit into ACTION — create a trailing-stop SELL
+        order covering every unprotected position (or just --token), sized to the
+        uncovered amount. The fix half of 'positions --protection'. --simulate
+        previews the plan without creating. Idempotent (skips already-protected);
+        per-position failures don't abort the batch. Goes through the same
+        validated path as 'order create'. MCP: protect_positions.
   positions --protection [--account L] [--chain X] [--paper] [--strict] [--json]
         v76: PROTECTION AUDIT — cross-references open positions against active stop /
         trailing SELL orders. Per position: held vs protected vs unprotected amount +

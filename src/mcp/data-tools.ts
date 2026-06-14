@@ -543,6 +543,39 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
+  // ── protect_positions (v79) ───────────────────────────────
+  // The ACTION half of position_protection: create trailing-stop orders that
+  // cover unprotected holdings. Detection without an easy fix is half the
+  // value for an autonomous agent.
+  server.tool(
+    "protect_positions",
+    "v79: turn the position_protection AUDIT into a one-call FIX. Audits the book and creates a trailing-stop SELL order for every UNPROTECTED (or partially-protected) position, sized to exactly the uncovered amount — the agent doesn't hand-compose order params per holding. Returns { ok, trailPct, simulate, created: [{ chain, symbol, amount, trailPct, orderId? }], alreadyProtected[], failed[], summary }. Pass `token` to protect one holding, or `all: true` to protect every unprotected position. `simulate: true` returns the PLAN without creating orders (preview before committing). `trailPct` sets the stop width (default 15 — crash protection wants room, not a tight trade stop). Orders go through the SAME validated path as order_create (whitelist/amount/slippage checks + audit) — no new trust surface. IDEMPOTENT across calls: a position protected by a prior call is skipped (no duplicate stops). Per-position creation failures (e.g. blacklisted token) are captured in failed[] and never abort the batch. mode='real' (default) protects real holdings; 'paper' the virtual book. Pair with position_protection (detect) → protect_positions (fix).",
+    {
+      all: z.boolean().optional().describe("Protect EVERY unprotected position. Required if `token` is omitted."),
+      token: z.string().optional().describe("Protect just this holding (symbol or address)."),
+      trailPct: z.number().min(0.1).max(99).optional().describe("Trailing-stop retracement %. Default 15."),
+      simulate: z.boolean().optional().describe("Return the plan without creating orders."),
+      mode: z.enum(["real", "paper"]).optional().describe("Default real. paper protects the virtual book."),
+      account: z.string().optional(),
+      chain: z.string().optional(),
+    },
+    async ({ all, token, trailPct, simulate, mode, account, chain }) => {
+      try {
+        if (!all && !token) {
+          throw new ToolError("INVALID_PARAMS", "protect_positions requires `all: true` or `token` — refusing to guess scope.");
+        }
+        return ok(
+          await runTool("protect_positions", rt.opts, { all, token, trailPct, simulate, mode, account, chain }, chain, async () => {
+            const { protectPositions } = await import("../protect.js");
+            return { ok: true, ...(await protectPositions({ config: rt.getConfig(), logger: rt.opts.logger, account, chain, token, mode: mode ?? "real", trailPct, simulate })) };
+          }),
+        );
+      } catch (e) {
+        return fail(toToolError(e));
+      }
+    },
+  );
+
   // ── risk_posture (v78) ────────────────────────────────────
   // Unified runtime risk verdict: synthesizes exposure headroom + portfolio
   // concentration + unprotected value-at-risk + MEV exposure into ONE

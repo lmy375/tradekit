@@ -33,6 +33,16 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 79 — 一键保护（protect action — turn the unprotected-position audit into a one-call FIX）** ✅
+- **检测→行动：连续 9 期只读检测/合成后的第一个行动能力**：v72-v78 把风险讲透了，但全是只读。自主 agent 用 v76 发现"WBTC $64k 无下行退出"后，还得手动拼一个 order_create（side/token/amount/trail）。本期闭合回路：`protect` 审计 book，对每个无保护（或部分保护）持仓**自动建移动止损**，size 精确等于裸露量，跳过已保护的。对自主 agent，检测无 easy-fix 只有一半价值
+- 为什么是最重要的：安全 = 不亏钱，但**检测到风险却不能修复**对自主 agent 几乎无用——它需要的是"看到裸仓 → 一句话保护它"。这是产品从"告诉你风险"转向"帮你修复"的能力转变，长检测期后正当其时
+- 实现（纯选择 + 复用既有创建路径）：纯函数 `selectPositionsToProtect(report, {token?})`——从 v76 审计选出 unprotected/partial 持仓 + 要覆盖的量（partial 只补**裸露余量**，不重复已有止损；token 过滤）。`protectPositions` 做 IO：gatherPositionProtection（v76）→ 对每个目标用**同一个** `createOrderRow`（order_create 的校验路径：白名单/额度/滑点 + audit）建 trailing sell（base_amount=裸露量、trailPct 默认 15=崩盘保护要留空间非紧贴止损、quote=该链 USDC、无 expiry=长效、native→ETH）
+- 安全 + 健壮：**跨调用幂等**（已保护持仓被跳过→不重复建单）；逐持仓失败（如 token 黑名单）进 failed[] **不中断批量**；`simulate` 出计划不建单（写操作前预览）；CLI 要求 --all 或 --token（拒绝瞎猜范围）；走既有创建路径=零新信任面
+- Surfaces：CLI `protect (--all | --token) [--trail --simulate --paper]` + MCP `protect_positions { all|token, trailPct, simulate, mode }`。MCP_TOOLS 不变量加 `protect_positions`。与 v76 配对：position_protection（detect）→ protect_positions（fix）
+- 测试覆盖：`protect.test.ts` 8——纯 selectPositionsToProtect 4（选 unprotected 全额 / 跳过 protected / partial 只补余量 / token 过滤 symbol+addr）+ 集成 4（临时 DB + paper 持仓：建 trailing sell 覆盖全额 trail 正确 / 二次运行幂等不重复 / simulate 出计划不建单 / 无持仓 nothing-to-do）；CLI 离线烟雾（无范围→错误 / simulate 计划 / 真实建单 #1）
+- 向后兼容：纯加法——新模块、新 CLI 命令、新 MCP 工具；建单走既有校验路径；3414 测试全绿（+8）
+- v1 限制：固定额覆盖裸露量（快照——持仓后续增长需重跑 protect；用 fixed 而非 "max" 避免与已有止损在 partial 上重复计数）；quote 默认该链 USDC（标准报价）；trail 默认 15% 可调；保护=移动止损（trailing），价跌触发卖出
+
 **Phase 78 — 统一风险态势（unified risk posture — one "is my book in danger RIGHT NOW?" verdict, synthesis not piling）** ✅
 - **合成而非再加检测面**：v53/v72/v76/v77 各加了一个运行时风险信号——敞口余量、组合集中度、裸仓价值、MEV 暴露——但分散在不同命令里。运营商（或 agent 自己）**没有一个地方**说"你的风险是 critical/elevated/ok"并排序原因。连续多期加检测器后，最该做的是**把它们合成一个答案**，而非再加第 N 个检测器
 - 为什么是最重要的：自主 agent 托管真钱，运营商最需要的是"现在安不安全"的**单一可分支信号**——监控 cron 可以在 `risk=critical` 时告警/page，agent 可以在自己的 book 转危时**自动停手**。此前要轮询 headroom + concentration + protection + mev 四个命令各自判断；现在一次调用得到一个裁决
