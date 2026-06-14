@@ -74,6 +74,14 @@ function renderText(r: DigestReport): string {
   }
   lines.push(``);
   lines.push(renderSafetyText(r.safety));
+  if (r.posture) {
+    const v = { hardened: "🛡 hardened", moderate: "⚠ moderate", exposed: "⛔ EXPOSED" }[r.posture.verdict];
+    lines.push(`  Posture:          ${v} (${r.posture.criticalGaps} critical, ${r.posture.warnGaps} warn gaps)${r.posture.topGap ? ` — ${r.posture.topGap}` : ""}`);
+    if (r.posture.binding && r.posture.binding.status !== "ok") {
+      const b = r.posture.binding;
+      lines.push(`  Binding limit:    ${b.label} (${b.scope}) ${b.status}${b.utilizationPct != null ? ` ${b.utilizationPct.toFixed(0)}%` : ""}`);
+    }
+  }
   lines.push(``);
   lines.push(renderAlertsText(r.alerts));
   lines.push(``);

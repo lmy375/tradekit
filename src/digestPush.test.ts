@@ -46,6 +46,10 @@ function cfg(over: Partial<{ enabled: boolean; hourUtc: number; window: string; 
   const base = loadConfig();
   return {
     ...base,
+    // v57: a per-tx USD ceiling keeps the standing safety posture out of the
+    // EXPOSED state, so these PUSH-GATING tests exercise a genuinely-healthy
+    // window (posture verdict ≤ moderate doesn't elevate the digest verdict).
+    safety: { ...base.safety, perTxUsdLimit: 1000 },
     notifications: {
       ...base.notifications,
       digest: { enabled: true, hourUtc: 9, window: "24h", minVerdict: "healthy" as const, ...over },

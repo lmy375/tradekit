@@ -353,6 +353,44 @@ describe("classifyVerdict", () => {
     expect(r.verdictReasons).toEqual([]);
   });
 
+  it("v57: EXPOSED posture lifts a clean window to attention", () => {
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+      posture: { verdict: "exposed", criticalGaps: 1, warnGaps: 0, topGap: "no per-trade OR daily USD ceiling", binding: null },
+    });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /posture EXPOSED/.test(x))).toBe(true);
+  });
+
+  it("v57: moderate posture does NOT elevate a clean window", () => {
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+      posture: { verdict: "moderate", criticalGaps: 0, warnGaps: 1, topGap: "no token allow/deny list", binding: null },
+    });
+    expect(r.verdict).toBe("healthy");
+  });
+
+  it("v57: a binding limit approaching/exhausted → attention", () => {
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+      posture: { verdict: "hardened", criticalGaps: 0, warnGaps: 0, topGap: null, binding: { label: "Daily USD cap", scope: "account:default × base", status: "approaching", utilizationPct: 92 } },
+    });
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /Daily USD cap.*approaching/.test(x))).toBe(true);
+  });
+
+  it("v57: a tripped DRAWDOWN binding is NOT double-counted (left to drawdownCurrentlyTripped)", () => {
+    // Drawdown trips are already a critical signal; the posture binding rule
+    // must skip drawdown to avoid a duplicate reason. With a clean safety
+    // section, a drawdown-labelled binding contributes nothing.
+    const r = classifyVerdict({
+      trades: emptyTrades(), fires: emptyFires(), safety: emptySafety(), errors: emptyErrors(), alerts: emptyAlerts(), paper: emptyPaper(),
+      posture: { verdict: "hardened", criticalGaps: 0, warnGaps: 0, topGap: null, binding: { label: "Drawdown circuit breaker", scope: "global", status: "tripped", utilizationPct: 100 } },
+    });
+    expect(r.verdict).toBe("healthy");
+    expect(r.verdictReasons).toEqual([]);
+  });
+
   it("critical on drawdown trip in window", () => {
     const r = classifyVerdict({
       trades: emptyTrades(), fires: emptyFires(),
@@ -485,12 +523,27 @@ describe("gatherDigest — full shape", () => {
     expect(r.windowLabel).toBe("24h");
   });
 
-  it("zero-state digest is shaped", () => {
-    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now: new Date("2026-05-30T12:00:00Z") });
+  it("zero-state digest is shaped", async () => {
+    // v57: the digest verdict now reflects the STANDING safety posture. A
+    // zero-activity window is only "healthy" when the config isn't EXPOSED,
+    // so seed a per-tx USD ceiling (the default config has no ceiling →
+    // exposed → attention, which is the posture rule working as intended).
+    const { configSchema } = await import("./config.js");
+    const baseCfg = configSchema.parse({});
+    const config = { ...baseCfg, safety: { ...baseCfg.safety, perTxUsdLimit: 1000 } };
+    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now: new Date("2026-05-30T12:00:00Z"), config });
     expect(r.verdict).toBe("healthy");
     expect(r.trades.total).toBe(0);
     expect(r.fires.ordersFilled).toBe(0);
     expect(r.errors.errorRows).toBe(0);
+    expect(r.posture?.verdict).toBe("moderate"); // ceiling set, but no token list → moderate
+  });
+
+  it("v57: an EXPOSED config (no USD ceiling) lifts a zero-activity digest to attention", () => {
+    const r = gatherDigest({ windowLabel: "24h", windowMs: 24 * 3_600_000, now: new Date("2026-05-30T12:00:00Z") });
+    expect(r.posture?.verdict).toBe("exposed");
+    expect(r.verdict).toBe("attention");
+    expect(r.verdictReasons.some((x) => /posture EXPOSED/.test(x))).toBe(true);
   });
 });
 

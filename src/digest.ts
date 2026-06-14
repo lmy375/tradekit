@@ -45,6 +45,8 @@ import {
 import { computeBudgetConsumption } from "./strategyBudget.js";
 import { loadConfig, type Config } from "./config.js";
 import { buildEquityCurve } from "./equity.js";
+import { reviewSafety } from "./safetyReview.js";
+import { gatherSafetyHeadroom } from "./safetyHeadroom.js";
 
 // ── window parsing ───────────────────────────────────────────
 
@@ -159,6 +161,29 @@ export interface SafetyEventsSection {
   budgetWarnings: Array<{ tag: string; window: "lifetime" | "daily"; utilizationPct: number }>;
 }
 
+/**
+ * v57: STANDING safety posture — distinct from SafetyEventsSection (which
+ * counts what HAPPENED in the window). This is the config posture (v51) +
+ * the binding runtime limit (v53) AT digest time. Closes the same gap v55
+ * closed for `health`: a cron-monitored digest could read "healthy" while
+ * the wallet is wide-open (no USD ceiling) or about to halt on a limit.
+ * Null when the config couldn't be reviewed (best-effort).
+ */
+export interface PostureSection {
+  verdict: "hardened" | "moderate" | "exposed";
+  criticalGaps: number;
+  warnGaps: number;
+  /** Worst-severity config gap finding, for the one-liner. */
+  topGap: string | null;
+  /** Tightest active runtime limit (v53 binding). Null when none configured. */
+  binding: {
+    label: string;
+    scope: string;
+    status: "ok" | "approaching" | "exhausted" | "tripped";
+    utilizationPct: number | null;
+  } | null;
+}
+
 export interface ErrorsSection {
   totalAuditRows: number;
   errorRows: number;
@@ -241,6 +266,9 @@ export interface DigestReport {
   trades: TradesSection;
   fires: FiresSection;
   safety: SafetyEventsSection;
+  /** v57: standing config posture + binding runtime limit (null when the
+   *  config couldn't be reviewed). */
+  posture: PostureSection | null;
   errors: ErrorsSection;
   alerts: AlertsSection;
   paper: PaperSection;
@@ -279,6 +307,41 @@ export function gatherDigest(args: GatherDigestArgs): DigestReport {
     config,
     includeComparison: args.compare ?? false,
   });
+}
+
+/** v57: standing posture — config review (v51) + binding runtime limit
+ *  (v53), composed from the primitives (not via health, to avoid coupling).
+ *  Best-effort: any failure → null so the digest never breaks on it. */
+function gatherPosture(config: Config): PostureSection | null {
+  try {
+    const review = reviewSafety(config);
+    const worst =
+      review.gaps.find((g) => g.severity === "critical") ??
+      review.gaps.find((g) => g.severity === "warn");
+    let binding: PostureSection["binding"] = null;
+    try {
+      const hr = gatherSafetyHeadroom({ config });
+      if (hr.binding) {
+        binding = {
+          label: hr.binding.label,
+          scope: hr.binding.scope,
+          status: hr.binding.status,
+          utilizationPct: hr.binding.utilizationPct,
+        };
+      }
+    } catch {
+      // headroom reads the DB; a failure leaves binding null (posture half).
+    }
+    return {
+      verdict: review.verdict,
+      criticalGaps: review.counts.critical,
+      warnGaps: review.counts.warn,
+      topGap: worst?.finding ?? null,
+      binding,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** v38: equity delta from the snapshot feed. Scope-disciplined like
@@ -323,8 +386,9 @@ function gatherWindow(args: {
   const paper = gatherPaper({ since: windowStart });
   const equity = gatherEquity({ since: windowStart });
   const intents = gatherIntents({ since: windowStart, now: new Date(args.nowMs) });
+  const posture = gatherPosture(args.config);
 
-  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents });
+  const { verdict, verdictReasons } = classifyVerdict({ trades, fires, safety, errors, alerts, paper, intents, posture });
 
   let comparison: DigestReport["comparison"] = null;
   if (args.includeComparison) {
@@ -350,6 +414,9 @@ function gatherWindow(args: {
       verdict: priorVerdict.verdict,
       verdictReasons: priorVerdict.verdictReasons,
       trades: priorTrades, fires: priorFires, safety: priorSafety, errors: priorErrors,
+      // Posture is a CURRENT-standing concept, not window-scoped — the prior
+      // window has no distinct posture, so it's null in the comparison.
+      posture: null,
       alerts: priorAlerts, paper: priorPaper, intents: priorIntents, equity: priorEquity,
       comparison: null,
     };
@@ -376,6 +443,7 @@ function gatherWindow(args: {
     trades,
     fires,
     safety,
+    posture,
     errors,
     alerts,
     paper,
@@ -768,6 +836,9 @@ export function classifyVerdict(args: {
   /** v47.5: optional so pre-existing callers/tests stay valid —
    *  omitted means "no queue activity". */
   intents?: IntentsSection;
+  /** v57: standing config posture + binding runtime limit. Optional so
+   *  pre-existing callers/tests stay valid. */
+  posture?: PostureSection | null;
 }): { verdict: HealthVerdict; verdictReasons: string[] } {
   const reasons: string[] = [];
   let critical = false;
@@ -837,6 +908,22 @@ export function classifyVerdict(args: {
   if (args.alerts.currentlyActive > 0) {
     reasons.push(`${args.alerts.currentlyActive} strategy alert${args.alerts.currentlyActive === 1 ? "" : "s"} currently active`);
     attention = true;
+  }
+
+  // v57: standing posture. EXPOSED config (no USD ceiling / safety off) is
+  // a config-level danger no other window signal surfaces → attention. The
+  // binding limit nearing its edge is surfaced too, EXCEPT drawdown (already
+  // covered above by drawdownCurrentlyTripped) — avoids double-counting.
+  if (args.posture) {
+    if (args.posture.verdict === "exposed") {
+      reasons.push(`wallet safety posture EXPOSED${args.posture.topGap ? `: ${args.posture.topGap}` : ""} — tradekit safety review`);
+      attention = true;
+    }
+    const b = args.posture.binding;
+    if (b && b.label.toLowerCase().indexOf("drawdown") === -1 && (b.status === "approaching" || b.status === "exhausted")) {
+      reasons.push(`${b.label} (${b.scope}) ${b.status}${b.utilizationPct != null ? ` at ${b.utilizationPct.toFixed(0)}%` : ""} — tradekit safety headroom`);
+      attention = true;
+    }
   }
 
   let verdict: HealthVerdict = "healthy";

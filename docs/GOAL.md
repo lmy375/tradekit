@@ -33,6 +33,20 @@ Phase 1/2/3 全部实现完毕。生产级使用中。
 - 加密备份：`backup export/restore`（CLI-only，故意不暴露给 MCP 以保护 agent 安全边界）
 - 测试覆盖：1376+ 单元测试 + bash 烟雾集成测试 + 3 个不变量回归守卫（iter589/877/878）
 
+**Phase 57 — 安全态势进 cron digest（standing posture in the digest verdict）** ✅
+- 对称完成 v55 在交互式 `health` 做的事——把**标准安全态势**接进 `digest`，即 **cron 监控面**。这是无人值守自主 agent 最关键的监控路径（`--summary` 单行 + `--strict` 退出码 + `--watch` JSONL 流）：运营商不盯着看，靠 cron digest + alert
+- 缺口：digest 已有 `SafetyEventsSection`（统计窗口内**发生**了什么——drawdown 触发、budget block、honeypot block）+ verdict（healthy/attention/critical），但 verdict 对**当下站立的危险**完全盲——配置 EXPOSED（safety 关掉 / 根本没有 USD 上限）或运行时逼近某个会停掉交易的限额。一个 cron digest 可以报 "healthy" 而钱包大开
+- 这是 coherence（接通既有 v51/v53）而非新护栏。**不新增工具**——digest_summary MCP 返回完整报告，`posture` 字段自动随附
+- digest.ts 新增 `PostureSection`（站立态势，区别于"窗口内事件"的 SafetyEventsSection）：v51 配置 verdict（hardened/moderate/exposed）+ critical/warn gap 数 + 最严重 gap 一行 + v53 binding（最紧运行时限额）。在 digest 内**用原语就地组合**（reviewSafety + gatherSafetyHeadroom），不依赖 health 模块（避免 digest→health 耦合）。best-effort：失败 → null，digest 永不因态势而崩
+- `classifyVerdict` 新增 posture 贡献，**精心避免双计**：
+  - 配置 EXPOSED → attention（这是其他窗口信号完全没覆盖的新信号——cron 运营商以前永远看不到"钱包配置大开"）
+  - binding 限额 approaching/exhausted → attention，**但跳过 drawdown**（已由 drawdownCurrentlyTripped 作 critical 覆盖），避免重复 reason
+- posture 是"当下"概念非窗口范围——comparison 的 prior 窗口 posture=null
+- CLI digest 文本新增 Posture 行（verdict 徽章 + 最严重 gap + 非 ok 的 binding）；verdict reasons 自动把 EXPOSED/near-limit 信号带进 `--summary` 和 markdown 渲染
+- 测试覆盖：`digest.test.ts` +6（classifyVerdict：EXPOSED→attention / moderate 不抬升 / binding approaching→attention / tripped drawdown binding **不**双计；gatherDigest 集成：EXPOSED 配置把零活动窗口抬到 attention + healthy 需非 exposed 配置）；修了 2 个既有测试（digestPush 的 cfg() helper + zero-state——它们假设默认配置 healthy，但默认无 USD 上限=exposed，给它们加 perTxUsdLimit 恢复"健康窗口"本意——这本身证明了规则在正确工作）
+- 向后兼容：纯加法——`posture` 字段 + classifyVerdict 的 posture 参数都 optional；既有 classifyVerdict 调用者/测试零改动。无 schema migration、无新工具
+- v1 限制：posture 用 active account/chain 的 headroom（与 v55 health 同款）；binding 的 drawdown 维度故意让给既有 drawdown 信号；EXPOSED→attention（非 critical）——它是站立配置问题非活动事故，运营商按真钱与否自行加权（可用 `--strict` + minVerdict 把 attention 变成 cron 退出码 1）
+
 **Phase 56 — 临时再平衡预览（ad-hoc rebalance preview — "if I targeted this, what's my drift + corrective trades RIGHT NOW?"）** ✅
 - **刻意离开安全主题**（v50–v55 连续 6 个安全/信任迭代）转向另一条核心腿：**持仓管理（position management）**。诚实自检——再在安全栈上加东西就是指令警告的"疯狂加量"
 - 真实缺口：drift + 交易计划的纯函数（`computeDrift` + `planRebalanceTrades`）此前**只在引擎 tick 内、针对已部署 plan**运行。一个运营商/agent 想问"我该不该再平衡、平衡到什么比例？"必须先建一个 plan row + `rebalance run --dry-run` 才能**看到**答案。没有一次性的"给定目标配比，我现在的 drift 是多少、需要哪些交易"的分析入口
