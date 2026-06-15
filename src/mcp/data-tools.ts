@@ -1437,48 +1437,6 @@ export const registerDataTools: RegisterFn = (server, rt) => {
     },
   );
 
-  // ── slippage_suggest (iter644) ────────────────────────────
-  // Preview the iter642 auto-slippage recommendation without executing a
-  // trade. Same pure logic the trade flow uses with autoSlippage=true.
-  server.tool(
-    "slippage_suggest",
-    "Preview the data-driven slippage suggestion for a token pair. Returns { ok, pairSymbol, pairAddress?, account, since, defaultBps, maxBps, suggestion: { suggestedBps, sampleCount, p95Bps, medianBps, flooredAtDefault, cappedAtMax, reason } }. Reason codes: 'from_history' (happy path: p95+25% recommended), 'from_history_floored' (suggestion below default — using default), 'from_history_capped' (above safety max — capped), 'insufficient_history' (<5 samples, using default), 'no_history' (0 samples, using default). Uses iter641-stored realized_slippage_bps for cheap lookup. Operators with pre-iter641 data should run `reconcile { backfillSlippage: N }` first. Use as the read-only counterpart to trade tools' autoSlippage param.",
-    {
-      base: z.string().describe("Base token symbol (e.g. 'ETH') or 0x-prefixed address."),
-      quote: z.string().describe("Quote token symbol (e.g. 'USDC') or 0x-prefixed address."),
-      chain: z.string().optional(),
-      account: z.string().optional().describe("HD account label override; defaults to active."),
-      lookbackDays: z.number().int().positive().max(365).optional().describe("Days of trade history to consider. Default 30."),
-    },
-    async ({ base, quote, chain, account, lookbackDays }) => {
-      try {
-        return ok(
-          await runTool("slippage_suggest", rt.opts, { base, quote, chain, account, lookbackDays }, chain, async () => {
-            const config = rt.getConfig();
-            const wallet = await rt.getContext(chain, account);
-            const profile = resolveProfile(wallet.chain, config);
-            const { resolveTradePair } = await import("../chains.js");
-            const resolved = resolveTradePair(profile, base, quote);
-            const { previewSlippageSuggestion } = await import("../slippageSuggest.js");
-            const report = await previewSlippageSuggestion({
-              config,
-              logger: rt.opts.logger,
-              account: wallet.label,
-              baseSymbol: base.toUpperCase(),
-              quoteSymbol: quote.toUpperCase(),
-              baseAddress: resolved.base === "ETH" ? undefined : (resolved.base as string),
-              quoteAddress: resolved.quote as string,
-              lookbackDays,
-            });
-            return { ok: true, ...report };
-          }),
-        );
-      } catch (e) {
-        return fail(toToolError(e));
-      }
-    },
-  );
-
   // ── trending ──────────────────────────────────────────────
   server.tool(
     "trending",

@@ -462,8 +462,6 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "token_info",
     // Iter634: per-pair slippage stats.
     "pair_stats",
-    // Iter644: standalone slippage suggestion.
-    "slippage_suggest",
     // Iter651: distinct strategy tags directory.
     "strategies_list",
     // v83: ranked per-strategy performance comparison for capital allocation.
@@ -530,8 +528,6 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "timeline_query",
     // Iter38: per-provider price-fetch observability.
     "price_stats",
-    // Iter39: durable engine state transitions.
-    "engine_events",
     // v28: durable strategy-alert transition journal.
     "alert_history",
     // Iter40: DB lifecycle observability.
