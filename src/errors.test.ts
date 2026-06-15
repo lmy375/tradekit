@@ -521,8 +521,6 @@ describe("nextAction tool names map to real MCP tools (iter586/587/588 invariant
     "gains_report",
     // Operator notes — the timeline's human layer.
     "note_add", "note_list",
-    // One-command postmortem (read-only composition).
-    "incident_report",
     "execution_report",
     "intents_list",
     "playbook_promote_check",

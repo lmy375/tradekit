@@ -1,6 +1,6 @@
 # Tradekit 项目目标
 
-为 AI Agent 提供一个生产级的 Crypto DEX 交易框架。任何 AI Agent 都可以通过 MCP / CLI 方便、安全地完成 EVM 链上的 DEX 交易、行情查询、持仓管理等操作。
+为 AI Agent 提供一个生产级的 Crypto DEX 交易框架。任何 AI Agent 都可以通过 MCP / CLI 方便、安全地完成 EVM 链上的 DEX 交易、行情查询、持仓管理等操作。除 MCP / CLI 外，要提供一个便于人类查看、观察的 Web UI 看板。
 
 ## 约束条件
 
