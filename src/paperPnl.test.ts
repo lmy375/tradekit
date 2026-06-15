@@ -46,6 +46,7 @@ function row(overrides: Partial<PaperTradeRow>): PaperTradeRow {
     slippage_bps: null,
     strategy: "dca-eth",
     notes: null,
+    value_usd: null,
     ...overrides,
   };
 }

@@ -1377,6 +1377,19 @@ const MIGRATIONS: string[] = [
     updated_at            TEXT    NOT NULL
   );
   `,
+
+  // v126: paper cumulative-USD parity. v125 aligned the per-tx USD cap, slippage,
+  // token lists, and the loss breaker between paper and live, but DEFERRED the two
+  // CUMULATIVE windows (daily-USD cap + strategy budget) for one reason: paper_trades
+  // had no value_usd column, so it could only sum raw quote_amount — correct for a
+  // stablecoin quote, but ~1000× wrong for a WETH-quoted fill. This column closes
+  // that gap with the SAME convention as the trades.value_usd column (v65): store the
+  // real trade-time USD (base USD price × base amount, quote-token-independent), NULL
+  // for legacy rows + unpriceable quotes. The cumulative-window queries COALESCE to
+  // quote_amount as the fallback — symmetric with dailyUsdVolume / usdSpentUnderStrategy.
+  `
+  ALTER TABLE paper_trades ADD COLUMN value_usd REAL;
+  `,
 ];
 
 // ── interfaces ───────────────────────────────────────────────
@@ -3135,6 +3148,28 @@ export function listSyncBookmarks(): SyncBookmark[] {
  * traffic. Non-USD quotes would need a price-aware conversion, but
  * deferring that until an operator actually trades quote=WETH at scale.
  */
+/**
+ * Single source of truth for the cumulative-USD summing convention shared by
+ * every USD window — live (dailyUsdVolume, usdSpentUnderStrategy) AND paper
+ * (paperDailyUsdVolume, paperUsdSpentUnderStrategy). Prefer the recorded
+ * trade-time USD value (value_usd); fall back to quote_amount only when it's
+ * missing (legacy rows + unpriceable quotes), which is correct for a stablecoin
+ * quote and the only number available for legacy rows. NaN rows are skipped.
+ *
+ * Keeping this one function means the four windows can never silently diverge on
+ * "how we value a trade for a cumulative cap" — the parity the trust pipeline
+ * depends on (paper must reject exactly where live would) is structural, not a
+ * coincidence of two copy-pasted loops.
+ */
+export function sumUsdRows(rows: { value_usd: number | null; quote_amount: string }[]): number {
+  let total = 0;
+  for (const r of rows) {
+    const n = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
+    if (Number.isFinite(n)) total += n;
+  }
+  return total;
+}
+
 export function usdSpentUnderStrategy(tag: string, sinceIso?: string): number {
   const db = openDb();
   const args: (string | number)[] = [tag];
@@ -3147,12 +3182,7 @@ export function usdSpentUnderStrategy(tag: string, sinceIso?: string): number {
     args.push(sinceIso);
   }
   const rows = db.prepare(sql).all(...args) as unknown as { value_usd: number | null; quote_amount: string }[];
-  let total = 0;
-  for (const r of rows) {
-    const n = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
-    if (Number.isFinite(n)) total += n;
-  }
-  return total;
+  return sumUsdRows(rows);
 }
 
 export function dailyUsdVolume(account: string, chain?: string): number {
@@ -3173,12 +3203,48 @@ export function dailyUsdVolume(account: string, chain?: string): number {
     args.push(chain.toLowerCase()); // see recentTrades comment
   }
   const rows = db.prepare(sql).all(...(args as never[])) as unknown as { value_usd: number | null; quote_amount: string }[];
-  let total = 0;
-  for (const r of rows) {
-    const n = r.value_usd != null && Number.isFinite(r.value_usd) ? r.value_usd : parseFloat(r.quote_amount);
-    if (Number.isFinite(n)) total += n;
+  return sumUsdRows(rows);
+}
+
+// ── paper cumulative-USD windows (v126) ──────────────────────
+//
+// Paper twins of dailyUsdVolume / usdSpentUnderStrategy. They reuse the SAME
+// sumUsdRows convention (value_usd ?? quote_amount) so the daily-USD cap and
+// strategy budget reject in paper exactly where they would live. Two deliberate
+// differences from the live queries:
+//   - table is paper_trades, not trades
+//   - NO status filter: paper_trades has no status column — a paper fill IS the
+//     fill (no pending/failed states), so every recorded row counts, which is the
+//     paper analogue of live's "success + pending count" rule.
+
+/** 24h-rolling paper USD volume for an account (optionally one chain). Paper
+ *  twin of dailyUsdVolume — feeds the paper daily-USD cap. */
+export function paperDailyUsdVolume(account: string, chain?: string): number {
+  const db = openDb();
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const args: unknown[] = [account, since];
+  let sql = `SELECT value_usd, quote_amount FROM paper_trades WHERE account = ? AND timestamp > ?`;
+  if (chain) {
+    sql += ` AND chain = ?`;
+    args.push(chain.toLowerCase());
   }
-  return total;
+  const rows = db.prepare(sql).all(...(args as never[])) as unknown as { value_usd: number | null; quote_amount: string }[];
+  return sumUsdRows(rows);
+}
+
+/** USD spent under a strategy tag in the paper book. Paper twin of
+ *  usdSpentUnderStrategy — feeds the paper strategy budget via the
+ *  enforceStrategyBudget spentLookup seam. Omit sinceIso for lifetime totals. */
+export function paperUsdSpentUnderStrategy(tag: string, sinceIso?: string): number {
+  const db = openDb();
+  const args: (string | number)[] = [tag];
+  let sql = `SELECT value_usd, quote_amount FROM paper_trades WHERE strategy = ?`;
+  if (sinceIso) {
+    sql += ` AND timestamp > ?`;
+    args.push(sinceIso);
+  }
+  const rows = db.prepare(sql).all(...args) as unknown as { value_usd: number | null; quote_amount: string }[];
+  return sumUsdRows(rows);
 }
 
 // ── orders (v10) ─────────────────────────────────────────────
@@ -6535,6 +6601,12 @@ export interface PaperTradeRow {
   slippage_bps: number | null;
   strategy: string | null;
   notes: string | null;
+  /** v126: trade-time USD value (base USD price × base amount, quote-token-
+   *  independent). The correct number for the paper daily-USD cap + strategy
+   *  budget — quote_amount alone is only USD when the quote is a stablecoin.
+   *  NULL for legacy rows + unpriceable-quote fills; consumers fall back to
+   *  quote_amount via sumUsdRows. */
+  value_usd: number | null;
 }
 
 export interface PaperBalanceRow {
@@ -6562,6 +6634,11 @@ export interface InsertPaperTradeArgs {
   slippage_bps: number | null;
   strategy: string | null;
   notes: string | null;
+  /** v126: trade-time USD value (base USD price × base amount). NULL/omitted when
+   *  the base couldn't be priced — symmetric with live trade.ts (estimatedUsd ??
+   *  null). Optional so backfill/import callers that don't price still compile;
+   *  the column is REAL NULL and consumers fall back to quote_amount. */
+  value_usd?: number | null;
 }
 
 /** Append a row to the paper_trades journal. Returns the inserted id. */
@@ -6573,15 +6650,15 @@ export function recordPaperTrade(args: InsertPaperTradeArgs): number {
          timestamp, source_type, source_id, chain, account, direction,
          base_token, base_symbol, base_amount,
          quote_token, quote_symbol, quote_amount,
-         price, slippage_bps, strategy, notes
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         price, slippage_bps, strategy, notes, value_usd
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .run(
       args.timestamp, args.source_type, args.source_id,
       args.chain.toLowerCase(), args.account, args.direction,
       args.base_token, args.base_symbol, args.base_amount,
       args.quote_token, args.quote_symbol, args.quote_amount,
-      args.price, args.slippage_bps, args.strategy, args.notes,
+      args.price, args.slippage_bps, args.strategy, args.notes, args.value_usd ?? null,
     );
   return Number(result.lastInsertRowid);
 }

@@ -195,37 +195,13 @@ export function enforceSafety(input: SafetyCheckInput, config: Config, logger: L
     // where real would). Stateless (this trade vs the cap), so it's safe to
     // share verbatim.
     enforcePerTxUsdLimit(input.estimatedUsd, config);
-    // 5. Daily USD limit (sums all SUCCESSful trades in the last 24h for this account)
-    if (s.dailyUsdLimit != null) {
-      const usedToday = dailyUsdVolume(input.account, input.chain);
-      if (usedToday + input.estimatedUsd > s.dailyUsdLimit) {
-        const remaining = Math.max(0, s.dailyUsdLimit - usedToday);
-        throw new ToolError(
-          "AMOUNT_EXCEEDS_LIMIT",
-          `Trade would push 24h volume to $${(usedToday + input.estimatedUsd).toFixed(
-            2,
-          )}, over daily limit $${s.dailyUsdLimit.toFixed(2)}.`,
-          {
-            details: {
-              estimatedUsd: input.estimatedUsd,
-              usedToday,
-              dailyUsdLimit: s.dailyUsdLimit,
-              remainingToday: remaining,
-            },
-            // Iter307: surface the EXACT remaining budget so the agent can resize the
-            // trade. "Wait for older trades to age out" is the alternative but harder to
-            // automate against — the remaining-budget number is actionable right now.
-            nextActions: [
-              {
-                // Iter587: `quote` instead of nonexistent `trade` umbrella.
-                tool: "quote",
-                reason: `Remaining 24h budget for this account is $${remaining.toFixed(2)}. Reduce the trade amount to fit (quote first to verify), wait for older trades to roll out of the 24h window, or use a different account.`,
-              },
-            ],
-          },
-        );
-      }
-    }
+    // 5. Daily USD limit (sums all SUCCESSful trades in the last 24h for this
+    // account). v126: extracted to enforceDailyUsdLimit with an injectable volume
+    // lookup so executePaperTrade enforces the SAME cumulative-USD cap off the
+    // paper book (the dry-run must reject exactly where real would).
+    enforceDailyUsdLimit(input.estimatedUsd, config, () =>
+      dailyUsdVolume(input.account, input.chain),
+    );
   }
 
   logger.debug("Safety checks passed");
@@ -254,6 +230,55 @@ export function enforcePerTxUsdLimit(estimatedUsd: number | null, config: Config
           {
             tool: "quote",
             reason: `Reduce the trade amount to keep estimated value ≤ $${s.perTxUsdLimit.toFixed(2)}, or split into multiple smaller trades. Quote first to verify the resized amount.`,
+          },
+        ],
+      },
+    );
+  }
+}
+
+/**
+ * v126: the daily (24h-rolling) USD cap, extracted so BOTH the live path
+ * (enforceSafety) and the paper dry-run (executePaperTrade) enforce it from one
+ * definition — a paper strategy that exceeds the daily volume cap live must
+ * reject exactly where a real one would, or the dry-run overstates how much
+ * capital the strategy could deploy in a day. The 24h volume is supplied via
+ * `volumeLookup` so live sums the real `trades` table and paper sums the
+ * `paper_trades` book (both via the same value_usd ?? quote_amount convention in
+ * sumUsdRows). No-op when safety is disabled, the cap is unset, or the trade
+ * couldn't be priced. The lookup is only called once the cap is active, to keep
+ * the hot path cheap.
+ */
+export function enforceDailyUsdLimit(
+  estimatedUsd: number | null,
+  config: Config,
+  volumeLookup: () => number,
+): void {
+  const s = config.safety;
+  if (!s.enabled || s.dailyUsdLimit == null || estimatedUsd == null) return;
+  const usedToday = volumeLookup();
+  if (usedToday + estimatedUsd > s.dailyUsdLimit) {
+    const remaining = Math.max(0, s.dailyUsdLimit - usedToday);
+    throw new ToolError(
+      "AMOUNT_EXCEEDS_LIMIT",
+      `Trade would push 24h volume to $${(usedToday + estimatedUsd).toFixed(
+        2,
+      )}, over daily limit $${s.dailyUsdLimit.toFixed(2)}.`,
+      {
+        details: {
+          estimatedUsd,
+          usedToday,
+          dailyUsdLimit: s.dailyUsdLimit,
+          remainingToday: remaining,
+        },
+        // Iter307: surface the EXACT remaining budget so the agent can resize the
+        // trade. "Wait for older trades to age out" is the alternative but harder to
+        // automate against — the remaining-budget number is actionable right now.
+        nextActions: [
+          {
+            // Iter587: `quote` instead of nonexistent `trade` umbrella.
+            tool: "quote",
+            reason: `Remaining 24h budget for this account is $${remaining.toFixed(2)}. Reduce the trade amount to fit (quote first to verify), wait for older trades to roll out of the 24h window, or use a different account.`,
           },
         ],
       },

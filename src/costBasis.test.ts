@@ -95,6 +95,7 @@ function walkerRows(fills: Fill[]): PaperTradeRow[] {
     slippage_bps: null,
     strategy: "dca-eth",
     notes: null,
+    value_usd: null,
   }));
 }
 

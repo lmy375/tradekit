@@ -14,7 +14,7 @@ const tmpDataDir = mkdtempSync(join(tmpdir(), "tradekit-db-test-"));
 process.env.TRADEKIT_DATA_DIR = tmpDataDir;
 
 // Static imports happen before tmp dir is set, so use dynamic import after env var.
-const { dailyUsdVolume, usdSpentUnderStrategy, insertTrade, hasPriorTokenFill, recordNotificationDelivery, listNotificationHealth, closeDb } = await import("./db.js");
+const { dailyUsdVolume, usdSpentUnderStrategy, insertTrade, hasPriorTokenFill, recordNotificationDelivery, listNotificationHealth, closeDb, sumUsdRows, recordPaperTrade, paperDailyUsdVolume, paperUsdSpentUnderStrategy } = await import("./db.js");
 type TradeRow = Awaited<ReturnType<typeof import("./db.js").recentTrades>>[number];
 
 const ACCOUNT = "test-acct";
@@ -2220,5 +2220,79 @@ describe("backtest_runs metrics_json", () => {
 
     const without = insertBacktestRun(base);
     expect(getBacktestRunById(without)!.metrics_json).toBeNull();
+  });
+});
+
+// v126: paper cumulative-USD windows. The paper twins of dailyUsdVolume /
+// usdSpentUnderStrategy must value rows by the SAME convention (value_usd ??
+// quote_amount via sumUsdRows) so the daily cap + strategy budget reject in
+// paper exactly where they would live, valuing non-stablecoin quotes correctly.
+describe("sumUsdRows (shared USD-summing convention, v126)", () => {
+  it("prefers value_usd when present, folds quote_amount otherwise", () => {
+    expect(
+      sumUsdRows([
+        { value_usd: 1500, quote_amount: "0.5" }, // WETH-quoted: $1500, not 0.5
+        { value_usd: null, quote_amount: "250" }, // legacy: $250
+      ]),
+    ).toBe(1750);
+  });
+
+  it("skips NaN/unparseable rows rather than poisoning the sum", () => {
+    expect(
+      sumUsdRows([
+        { value_usd: 100, quote_amount: "x" },
+        { value_usd: null, quote_amount: "not-a-number" }, // contributes 0
+        { value_usd: null, quote_amount: "50" },
+      ]),
+    ).toBe(150);
+  });
+});
+
+describe("paperDailyUsdVolume / paperUsdSpentUnderStrategy (v126)", () => {
+  function paperRow(overrides: Partial<Parameters<typeof recordPaperTrade>[0]> = {}) {
+    return recordPaperTrade({
+      timestamp: new Date().toISOString(),
+      source_type: "manual",
+      source_id: null,
+      chain: "base",
+      account: "p126",
+      direction: "buy",
+      base_token: "0xbase",
+      base_symbol: "WETH",
+      base_amount: "1",
+      quote_token: "0xquote",
+      quote_symbol: "WETH",
+      quote_amount: "0.5",
+      price: "1",
+      slippage_bps: null,
+      strategy: null,
+      notes: null,
+      value_usd: null,
+      ...overrides,
+    });
+  }
+
+  it("paperDailyUsdVolume sums value_usd (WETH-quoted counts USD, not raw 0.5)", () => {
+    paperRow({ account: "vol-a", value_usd: 1500, quote_amount: "0.5" });
+    paperRow({ account: "vol-a", value_usd: 900, quote_amount: "0.3" });
+    expect(paperDailyUsdVolume("vol-a", "base")).toBe(2400); // not 0.8
+  });
+
+  it("paperDailyUsdVolume falls back to quote_amount for unpriced rows + filters by chain", () => {
+    paperRow({ account: "vol-b", chain: "base", value_usd: null, quote_amount: "250" });
+    paperRow({ account: "vol-b", chain: "arbitrum", value_usd: null, quote_amount: "777" });
+    expect(paperDailyUsdVolume("vol-b", "base")).toBe(250);
+    expect(paperDailyUsdVolume("vol-b")).toBe(250 + 777); // no chain → all chains
+  });
+
+  it("paperUsdSpentUnderStrategy: lifetime (no since) vs 24h-rolling window", () => {
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(); // 2 days ago
+    paperRow({ strategy: "dca", value_usd: 1000, timestamp: old });
+    paperRow({ strategy: "dca", value_usd: 500 }); // now (within 24h)
+    // Lifetime sums both.
+    expect(paperUsdSpentUnderStrategy("dca")).toBe(1500);
+    // 24h window excludes the 2-day-old fill.
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    expect(paperUsdSpentUnderStrategy("dca", since)).toBe(500);
   });
 });

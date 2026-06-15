@@ -53,9 +53,12 @@ const {
   listPaperTrades,
   listPaperBalances,
   resetPaperState,
+  paperDailyUsdVolume,
+  paperUsdSpentUnderStrategy,
 } = await import("./db.js");
 const { getCurrentPrice } = await import("./price.js");
 const { getToken } = await import("./tokens.js");
+const { enforceDailyUsdLimit } = await import("./safety.js");
 
 beforeAll(() => {
   openDb();
@@ -165,6 +168,7 @@ describe("summarizePaperPnl", () => {
       slippage_bps: 50,
       strategy: null,
       notes: null,
+      value_usd: null,
       ...over,
     };
   }
@@ -657,6 +661,163 @@ describe("executePaperTrade — guardrail parity (v125)", () => {
       ctxWith({ ...(fakeConfig as object), safety: { enabled: false, maxSlippageBps: 50, perTxUsdLimit: 1 } } as never),
     );
     expect(r.status).toBe("success");
+  });
+});
+
+// ── v126: cumulative-USD parity — daily-USD cap + strategy budget ──
+//
+// Closes the two windows deferred in v125. The dry-run must reject exactly where
+// live's daily-USD cap (enforceSafety) and strategy budget (enforceStrategyBudget)
+// would — valued off the paper_trades.value_usd column so non-stablecoin quotes
+// are priced correctly, not under-counted ~1000× by the raw quote_amount.
+describe("executePaperTrade — cumulative-USD parity (v126)", () => {
+  beforeEach(() => {
+    (getToken as ReturnType<typeof vi.fn>).mockImplementation(async (_pc, _profile, addr: Address) => {
+      if (addr.toLowerCase() === WETH.toLowerCase()) return mockToken(WETH, "WETH", 18);
+      if (addr.toLowerCase() === USDC.toLowerCase()) return mockToken(USDC, "USDC", 6);
+      throw new Error(`unknown token ${addr}`);
+    });
+    (getCurrentPrice as ReturnType<typeof vi.fn>).mockImplementation(async (addr: string) => {
+      if (addr.toLowerCase() === WETH.toLowerCase()) return 2_500;
+      if (addr.toLowerCase() === USDC.toLowerCase()) return 1;
+      return null;
+    });
+  });
+
+  const cfgSafe = (safety: Record<string, unknown>) =>
+    ({ ...(fakeConfig as object), safety: { enabled: true, maxSlippageBps: 5000, ...safety } }) as never;
+  const ctxWith = (config: never) => ({
+    publicClient: fakePublicClient, profile: fakeProfile, config, logger: fakeLogger, accountLabel: "default",
+  });
+  const buy = (quoteAmount: string, extra: Record<string, unknown> = {}) =>
+    ({ direction: "buy" as const, base: WETH, quote: USDC, quoteAmount, source: { type: "manual" as const, id: null }, ...extra });
+
+  // ── persistence: value_usd lands (and is NULL when unpriceable) ──
+
+  it("persists value_usd ≈ baseUsd × baseAmount on the journal row", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "10000" });
+    // buy 5000 USDC of WETH @ spot 2500, slippage 0 → exactly 2 WETH, value $5000.
+    await executePaperTrade(buy("5000", { slippageBps: 0 }), ctxWith(cfgSafe({})));
+    const rows = listPaperTrades({});
+    expect(rows).toHaveLength(1);
+    expect(rows[0].value_usd).not.toBeNull();
+    // value_usd is quote-token-independent: baseUsd(2500) × baseAmount(2.0).
+    expect(rows[0].value_usd!).toBeCloseTo(2_500 * parseFloat(rows[0].base_amount), 6);
+    expect(rows[0].value_usd!).toBeCloseTo(5_000, 2);
+  });
+
+  it("records value_usd = NULL for legacy/backfill rows (omitted on insert)", () => {
+    // executePaperTrade always has a priced base (resolveSpotPrice requires it),
+    // so the unpriceable path is reached only by non-pricing callers (backfill /
+    // import) that omit value_usd. The column stores NULL there, and consumers
+    // fall back to quote_amount via sumUsdRows — symmetric with live legacy rows.
+    const id = recordPaperTrade(samplePaperRow({ value_usd: undefined as unknown as null }));
+    const row = listPaperTrades({}).find((r) => r.id === id)!;
+    expect(row.value_usd).toBeNull();
+    // And paperDailyUsdVolume folds it back to quote_amount (2500 here).
+    expect(paperDailyUsdVolume("default", "base")).toBeCloseTo(2_500, 6);
+  });
+
+  // ── daily-USD cap boundary ──
+
+  it("daily cap: cumulative + this trade == cap is ALLOWED", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    // Pre-seed $9000 of paper volume in the 24h window.
+    recordPaperTrade(samplePaperRow({ value_usd: 9_000, quote_amount: "9000" }));
+    // This trade ≈ $1000 → total exactly $10000 == cap → allowed.
+    const r = await executePaperTrade(buy("1000"), ctxWith(cfgSafe({ dailyUsdLimit: 10_000 })));
+    expect(r.status).toBe("success");
+  });
+
+  it("daily cap: one cent over the cap is REJECTED (AMOUNT_EXCEEDS_LIMIT, like live)", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    recordPaperTrade(samplePaperRow({ value_usd: 9_999.99, quote_amount: "9999.99" }));
+    // This trade ≈ $1000 → total ≈ $10999.99 > $10000 cap → rejects.
+    await expect(
+      executePaperTrade(buy("1000"), ctxWith(cfgSafe({ dailyUsdLimit: 10_000 }))),
+    ).rejects.toMatchObject({ code: "AMOUNT_EXCEEDS_LIMIT" });
+    expect(listPaperTrades({})).toHaveLength(1); // only the pre-seeded row; no new fill
+  });
+
+  // ── non-stablecoin quote: the core regression guard ──
+
+  it("REGRESSION: a WETH-quote fill is valued in USD, not by raw quote_amount", async () => {
+    // Buy USDC with WETH as the quote token. base=USDC ($1), quote=WETH ($2500).
+    // Spend 2 WETH (~$5000 of true value) → raw quote_amount ≈ 2, but value_usd
+    // ≈ baseUsd(1) × baseAmount(~5000) ≈ $5000. A daily cap of $4000 must REJECT.
+    // Pre-fix (summing raw quote_amount ≈ 2) this would have been ALLOWED.
+    setPaperBalance({ account: "default", chain: "base", token: WETH, decimals: 18, amount: "100" });
+    await expect(
+      executePaperTrade(
+        { direction: "buy", base: USDC, quote: WETH, quoteAmount: "2", slippageBps: 0, source: { type: "manual", id: null } },
+        ctxWith(cfgSafe({ dailyUsdLimit: 4_000 })),
+      ),
+    ).rejects.toMatchObject({ code: "AMOUNT_EXCEEDS_LIMIT" });
+    expect(listPaperTrades({})).toHaveLength(0);
+
+    // Same fill under a $6000 cap → allowed, and the recorded value_usd ≈ $5000
+    // (NOT ≈ 2, which is what a raw-quote_amount accounting would have stored).
+    const r = await executePaperTrade(
+      { direction: "buy", base: USDC, quote: WETH, quoteAmount: "2", slippageBps: 0, source: { type: "manual", id: null } },
+      ctxWith(cfgSafe({ dailyUsdLimit: 6_000 })),
+    );
+    expect(r.status).toBe("success");
+    const row = listPaperTrades({})[0];
+    expect(row.value_usd!).toBeCloseTo(5_000, 0);
+    expect(parseFloat(row.quote_amount)).toBeCloseTo(2, 3); // raw quote stays small
+  });
+
+  // ── strategy budget: routed through the shared enforcer + paper spentLookup ──
+
+  it("strategy budget: per-fire cap rejects (no DB lookup needed)", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    // perFire $1000; this trade ≈ $5000 → rejects without consulting the book.
+    await expect(
+      executePaperTrade(
+        buy("5000", { strategy: "dca" }),
+        ctxWith(cfgSafe({ strategyBudgets: [{ tag: "dca", perFireUsd: 1_000 }] })),
+      ),
+    ).rejects.toMatchObject({ code: "STRATEGY_BUDGET_EXCEEDED" });
+  });
+
+  it("strategy budget: lifetime cap counts prior paper fills via paperUsdSpentUnderStrategy", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    // Prior $9000 lifetime spend under "dca"; lifetime cap $10000.
+    recordPaperTrade(samplePaperRow({ strategy: "dca", value_usd: 9_000, quote_amount: "9000" }));
+    // This trade ≈ $5000 → lifetime would be ~$14000 > $10000 → rejects.
+    await expect(
+      executePaperTrade(
+        buy("5000", { strategy: "dca" }),
+        ctxWith(cfgSafe({ strategyBudgets: [{ tag: "dca", lifetimeUsd: 10_000 }] })),
+      ),
+    ).rejects.toMatchObject({ code: "STRATEGY_BUDGET_EXCEEDED" });
+  });
+
+  it("strategy budget: untagged trade is a no-op (no rule matches)", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    // No strategy tag → budget short-circuits even with a tiny cap configured.
+    const r = await executePaperTrade(
+      buy("5000"),
+      ctxWith(cfgSafe({ strategyBudgets: [{ tag: "dca", perFireUsd: 1 }] })),
+    );
+    expect(r.status).toBe("success");
+  });
+
+  // ── parity: same params reject in both eras ──
+
+  it("parity: a trade over the daily cap rejects in paper exactly as live's enforceDailyUsdLimit does", async () => {
+    setPaperBalance({ account: "default", chain: "base", token: USDC, decimals: 6, amount: "100000" });
+    recordPaperTrade(samplePaperRow({ value_usd: 9_000, quote_amount: "9000" }));
+    const cfg = cfgSafe({ dailyUsdLimit: 10_000 });
+    // Paper path rejects.
+    await expect(
+      executePaperTrade(buy("5000"), ctxWith(cfg)),
+    ).rejects.toMatchObject({ code: "AMOUNT_EXCEEDS_LIMIT" });
+    // Live ENFORCEMENT (same function executePaperTrade calls), driven directly
+    // with the paper book's 24h volume, rejects on the same numbers → invariant
+    // locked: dry-run rejects exactly where real would.
+    const usedToday = paperDailyUsdVolume("default", "base");
+    expect(() => enforceDailyUsdLimit(5_000, cfg, () => usedToday)).toThrow(/24h volume/);
   });
 });
 

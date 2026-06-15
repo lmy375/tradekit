@@ -1062,6 +1062,10 @@ export function toMtmRows(trades: readonly TradeRow[]): PaperTradeRow[] {
       slippage_bps: null,
       strategy: t.strategy ?? null,
       notes: null,
+      // v126: the MTM walker already folds USD into quote_amount above; carry the
+      // real fill's value_usd through too so the synthesized row satisfies
+      // PaperTradeRow's column shape.
+      value_usd: t.value_usd ?? null,
     }));
 }
 

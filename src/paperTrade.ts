@@ -61,7 +61,7 @@ import {
   type Chain,
 } from "viem";
 import { ToolError } from "./errors.js";
-import { enforcePreflightSafety, enforcePerTxUsdLimit } from "./safety.js";
+import { enforcePreflightSafety, enforcePerTxUsdLimit, enforceDailyUsdLimit } from "./safety.js";
 import { getCurrentPrice } from "./price.js";
 import { getToken, isNativeSentinel, NATIVE_TOKEN } from "./tokens.js";
 import { parseSizingSentinel, applyFractionBig, describeSentinel } from "./sizing.js";
@@ -72,6 +72,8 @@ import {
   recordPaperTrade,
   getPaperBalance,
   upsertPaperBalance,
+  paperDailyUsdVolume,
+  paperUsdSpentUnderStrategy,
   type PaperTradeRow,
 } from "./db.js";
 
@@ -354,17 +356,20 @@ export async function executePaperTrade(
   const slipBps =
     req.slippageBps ?? ctx.config.defaultSlippageBps ?? DEFAULT_PAPER_SLIPPAGE_BPS;
 
-  // v125: paper-enforcement parity — the dry-run must reject exactly where a
-  // real trade would, or paper overstates what the strategy could do live and
+  // v125/v126: paper-enforcement parity — the dry-run must reject exactly where
+  // a real trade would, or paper overstates what the strategy could do live and
   // promote-outcome later mistakes paper/live divergence (cadence, sizing) for
   // a strategy fault. enforcePreflightSafety is PURE config-vs-input (slippage
   // cap + token whitelist/blacklist), so paper shares it verbatim with the live
-  // path. (Per-tx USD cap + strategy loss breaker run below, once the trade is
-  // priced/sized.) The contract whitelist, daily-USD cap, strategy budget, and
-  // drawdown breaker are NOT applied here: a paper fill has no router contract;
-  // the cumulative-USD guards need a paper value_usd column to value
-  // non-stablecoin quotes correctly (deferred); drawdown needs paper-equity
-  // wiring. Position caps already enforce below (v38).
+  // path. (Per-tx USD cap + daily-USD cap + strategy budget + strategy loss
+  // breaker all run below, once the trade is priced/sized.) v126 closed the last
+  // deferred gap: the two CUMULATIVE-USD windows (daily cap + strategy budget)
+  // now enforce in paper too, valued off the paper_trades.value_usd column (the
+  // same value_usd ?? quote_amount convention as live, via sumUsdRows) so
+  // non-stablecoin quotes are valued correctly rather than under-counted ~1000×.
+  // Still NOT applied here, with the reason in each case: the contract whitelist
+  // (a paper fill has no router contract), the drawdown breaker (needs
+  // paper-equity wiring), and position caps which already enforce below (v38).
   enforcePreflightSafety(
     { chain: ctx.profile.name, tokenIn: baseAddr, tokenOut: quoteAddr, slippageBps: slipBps },
     ctx.config,
@@ -427,6 +432,31 @@ export async function executePaperTrade(
   // (unlike a raw quote_amount). Applies to buys AND sells, like the live cap.
   const paperEstimatedUsd = baseUsd != null && baseUsd > 0 ? baseUsd * parseFloat(amounts.baseAmount) : null;
   enforcePerTxUsdLimit(paperEstimatedUsd, ctx.config);
+
+  // v126: cumulative-USD parity — the two windows live deferred since v125 now
+  // enforce in paper too, valued off paper_trades.value_usd (correct for
+  // non-stablecoin quotes, not a raw quote_amount ~1000× under-count). Same
+  // time-order/gating as live (trade.ts: daily cap in enforceSafety, then
+  // strategy budget). Both share the live ENFORCEMENT definition verbatim — only
+  // the volume/spend lookup is swapped to a paper-scoped query (paper has no
+  // status; a paper fill IS the trade), so the dry-run rejects exactly where
+  // real would.
+  enforceDailyUsdLimit(paperEstimatedUsd, ctx.config, () =>
+    paperDailyUsdVolume(ctx.accountLabel, ctx.profile.name),
+  );
+  if (
+    ctx.config.safety.strategyBudgets &&
+    ctx.config.safety.strategyBudgets.length > 0 &&
+    req.strategy
+  ) {
+    const { enforceStrategyBudget } = await import("./strategyBudget.js");
+    enforceStrategyBudget({
+      strategyTag: req.strategy,
+      predictedUsd: paperEstimatedUsd ?? 0,
+      budgets: ctx.config.safety.strategyBudgets,
+      spentLookup: paperUsdSpentUnderStrategy,
+    });
+  }
 
   // v38: per-strategy position caps — paper twin of executeTrade's
   // enforcement (the dry-run must reject exactly where real would).
@@ -549,6 +579,11 @@ export async function executePaperTrade(
     slippage_bps: slipBps,
     strategy: req.strategy ?? null,
     notes: req.note ?? null,
+    // v126: persist the trade-time USD value so the cumulative-USD windows
+    // (daily-USD cap + strategy budget) value non-stablecoin quotes correctly.
+    // baseUsd × baseAmount is quote-token-independent; null when unpriceable,
+    // symmetric with live trade.ts (estimatedUsd ?? null).
+    value_usd: paperEstimatedUsd,
   });
 
   const txHash = `paper:${paperTradeId}:${Date.parse(timestamp)}`;
